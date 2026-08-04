@@ -73,14 +73,25 @@ ARG TARGETARCH
 # The trade-off: no symbolised stack traces from a core dump. Acceptable because we get
 # stack traces from our panic handler instead. Drop these flags if you need to attach
 # a debugger to a production binary.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-arm64} \
+# GOARCH IS PASSED ONLY IF TARGETARCH IS ACTUALLY SET.
+#
+# `${TARGETARCH:+GOARCH=$TARGETARCH}` expands to nothing when the variable is empty, so Go
+# falls back to the build container's native architecture -- which is always correct.
+#
+# An earlier version wrote `GOARCH=${TARGETARCH:-arm64}`. TARGETARCH is only populated by
+# BuildKit, and we build with the legacy builder (see the caching note above), so it was
+# ALWAYS empty and the image was ALWAYS built for arm64. Correct by accident on an Apple
+# Silicon Mac, and silently broken for anyone on an amd64 machine: the image builds, pushes
+# and then fails to start with "exec format error", which names neither the cause nor this
+# file.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} ${TARGETARCH:+GOARCH=$TARGETARCH} \
     go build -trimpath \
       -ldflags "-s -w \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Version=${VERSION} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Commit=${COMMIT} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.BuildTime=${BUILD_TIME}" \
       -o /out/api ./cmd/api \
- && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH:-arm64} \
+ && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} ${TARGETARCH:+GOARCH=$TARGETARCH} \
     go build -trimpath \
       -ldflags "-s -w \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Version=${VERSION} \

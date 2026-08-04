@@ -34,6 +34,7 @@ package config
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -228,8 +229,8 @@ func Load() (*Config, error) {
 			// guessing localhost would let a production deployment start up
 			// pointed at nothing.
 			URL:             l.required("DATABASE_URL"),
-			MaxOpenConns:    int32(l.integer("DB_MAX_OPEN_CONNS", 20)),
-			MinIdleConns:    int32(l.integer("DB_MIN_IDLE_CONNS", 5)),
+			MaxOpenConns:    l.int32("DB_MAX_OPEN_CONNS", 20),
+			MinIdleConns:    l.int32("DB_MIN_IDLE_CONNS", 5),
 			ConnMaxLifetime: l.duration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
 		},
 
@@ -238,7 +239,7 @@ func Load() (*Config, error) {
 			Context:          l.str("KUBE_CONTEXT", ""),
 			ResyncInterval:   l.duration("KUBE_RESYNC_INTERVAL", 0),
 			CacheSyncTimeout: l.duration("KUBE_CACHE_SYNC_TIMEOUT", 60*time.Second),
-			QPS:              float32(l.float("KUBE_QPS", 50)),
+			QPS:              l.float32("KUBE_QPS", 50),
 			Burst:            l.integer("KUBE_BURST", 100),
 		},
 
@@ -307,9 +308,32 @@ func (c *Config) Validate() error {
 	if strings.TrimSpace(c.API.Addr) == "" {
 		errs = append(errs, fmt.Errorf("API_HTTP_ADDR: %w (must not be blank)", ErrInvalid))
 	}
-	if c.API.ShutdownTimeout <= 0 {
-		errs = append(errs, fmt.Errorf("API_SHUTDOWN_TIMEOUT=%s: %w (must be positive)",
-			c.API.ShutdownTimeout, ErrInvalid))
+	// EVERY server timeout must be positive, not just the shutdown one.
+	//
+	// net/http treats a ZERO OR NEGATIVE timeout as NO TIMEOUT AT ALL. So
+	// API_READ_TIMEOUT=0s does not mean "instant", it silently removes the bound --
+	// and with it the Slowloris protection that internal/httpapi/server.go claims to
+	// provide. A config value that quietly disables a security control while the code
+	// comments promise it is enforced is worse than no comment at all.
+	//
+	// An operator who genuinely wants an effectively unbounded read can set a large
+	// duration; they cannot accidentally get one from a typo or an empty ConfigMap
+	// value that parsed as 0.
+	for _, t := range []struct {
+		name  string
+		value time.Duration
+	}{
+		{"API_READ_TIMEOUT", c.API.ReadTimeout},
+		{"API_WRITE_TIMEOUT", c.API.WriteTimeout},
+		{"API_IDLE_TIMEOUT", c.API.IdleTimeout},
+		{"API_SHUTDOWN_TIMEOUT", c.API.ShutdownTimeout},
+		{"PROMETHEUS_TIMEOUT", c.Prometheus.Timeout},
+		{"DB_CONN_MAX_LIFETIME", c.Database.ConnMaxLifetime},
+	} {
+		if t.value <= 0 {
+			errs = append(errs, fmt.Errorf("%s=%s: %w (must be positive; zero or negative "+
+				"disables the timeout entirely)", t.name, t.value, ErrInvalid))
+		}
 	}
 
 	if c.Database.MaxOpenConns <= 0 {
@@ -429,6 +453,55 @@ func (l *loader) integer(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// int32 parses an integer and REJECTS anything outside int32's range.
+//
+// WHY A DEDICATED HELPER INSTEAD OF int32(l.integer(...))
+// ------------------------------------------------------
+// A plain conversion narrows SILENTLY by discarding high bits, and the result can look
+// perfectly valid. DB_MAX_OPEN_CONNS=4294967297 (2^32 + 1) narrows to 1, so instead of
+// an error the service starts with a one-connection pool and mysteriously serialises
+// every query. DB_MAX_OPEN_CONNS=2147483648 narrows to -2147483648, which the range
+// check below at least catches -- but only by luck.
+//
+// Silent wrongness is the worst class of config bug, because nothing points at the
+// config. Rejecting out-of-range values makes it a startup error naming the variable.
+func (l *loader) int32(key string, def int32) int32 {
+	n := l.integer64(key, int64(def))
+	if n < math.MinInt32 || n > math.MaxInt32 {
+		l.errs = append(l.errs, fmt.Errorf("%s=%d: %w (out of range for int32)", key, n, ErrInvalid))
+		return def
+	}
+	return int32(n)
+}
+
+// integer64 parses a base-10 int64.
+func (l *loader) integer64(key string, def int64) int64 {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s=%q: %w", key, raw, err))
+		return def
+	}
+	return n
+}
+
+// float32 parses a float and rejects values float32 cannot represent.
+//
+// Narrowing a float64 beyond float32's range yields +Inf rather than wrapping, and
+// +Inf passes a naive "must be positive" check. A QPS of +Inf then disables client-side
+// rate limiting altogether, which is the opposite of what a large number implies.
+func (l *loader) float32(key string, def float32) float32 {
+	f := l.float(key, float64(def))
+	if math.IsInf(f, 0) || math.IsNaN(f) || f > math.MaxFloat32 || f < -math.MaxFloat32 {
+		l.errs = append(l.errs, fmt.Errorf("%s=%v: %w (out of range for float32)", key, f, ErrInvalid))
+		return def
+	}
+	return float32(f)
 }
 
 // float parses a base-10 floating point value.

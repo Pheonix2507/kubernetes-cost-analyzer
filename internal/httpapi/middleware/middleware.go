@@ -160,6 +160,22 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	return n, err
 }
 
+// probePaths are the endpoints Kubernetes polls continuously.
+//
+// They need different log treatment from real traffic. A readiness probe fires every few
+// seconds, on every replica, forever. During a database outage /readyz correctly returns
+// 503 every single time -- and at ERROR level that is hundreds of error lines per minute
+// for a condition the system is ALREADY HANDLING CORRECTLY by draining traffic.
+//
+// That is how error-log alerting gets switched off, and then it cannot warn about the
+// next real problem either. So probes are demoted: DEBUG when passing (available if you
+// need them, invisible otherwise) and WARN when failing (a genuine signal, but not the
+// same severity as a 500 on a user request).
+var probePaths = map[string]struct{}{
+	"/healthz": {},
+	"/readyz":  {},
+}
+
 // RequestLogger logs one structured line per completed request and puts a
 // request-scoped logger into the context.
 //
@@ -194,6 +210,17 @@ func RequestLogger(base *slog.Logger) Middleware {
 				level = slog.LevelError
 			case rec.status >= 400:
 				level = slog.LevelWarn
+			}
+
+			// Probe endpoints are demoted -- see the comment on probePaths. A failing
+			// probe still surfaces at WARN, so readiness flapping remains visible
+			// without drowning the log at ERROR.
+			if _, isProbe := probePaths[r.URL.Path]; isProbe {
+				if rec.status >= 400 {
+					level = slog.LevelWarn
+				} else {
+					level = slog.LevelDebug
+				}
 			}
 
 			reqLogger.LogAttrs(r.Context(), level, "http request",

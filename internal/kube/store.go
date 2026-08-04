@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -20,6 +21,11 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/config"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 )
+
+// ErrCachesNotSynced means the informer caches have not finished their initial List, so
+// any answer we gave would describe an empty cluster. A sentinel so /readyz can be
+// tested for the specific condition rather than by matching on message text.
+var ErrCachesNotSynced = errors.New("informer caches not yet synced")
 
 // Compile-time proof that *Store can be a readiness dependency. See the same pattern
 // in internal/store/postgres: it declares intent where the type lives, so a renamed
@@ -150,7 +156,30 @@ func (s *Store) Start(ctx context.Context) error {
 	started := time.Now()
 	// WaitForCacheSync returns a map of reflector type -> synced bool. Any false entry
 	// means that informer never completed its initial List.
-	for typ, ok := range s.factory.WaitForCacheSync(syncCtx.Done()) {
+	syncResults := s.factory.WaitForCacheSync(syncCtx.Done())
+
+	// DISTINGUISH "ASKED TO STOP" FROM "COULD NOT SYNC" BEFORE TRUSTING THE RESULT.
+	//
+	// WaitForCacheSync returns all-false whenever its stop channel closes, and it cannot
+	// tell you WHY. Cancellation of the parent context looks exactly like an API server
+	// that never answered.
+	//
+	// An earlier version of this treated both as a failure, so pressing Ctrl-C -- or the
+	// kubelet sending SIGTERM during a rollout or a node drain -- while caches were
+	// still warming made run() return an error and the process exit 1. Kubernetes records
+	// that as a crash rather than a normal termination, and it counts towards
+	// CrashLoopBackOff. A shutdown request is not a failure.
+	//
+	// ctx.Err() (the PARENT, not syncCtx) is the discriminator: it is non-nil only when
+	// the caller cancelled, whereas a genuine timeout shows up on syncCtx alone.
+	if err := ctx.Err(); err != nil {
+		s.log.Info("informer sync aborted by shutdown request",
+			"waited_ms", time.Since(started).Milliseconds())
+		// Deliberately NOT marking synced: readiness must stay honest on the way down.
+		return nil
+	}
+
+	for typ, ok := range syncResults {
 		if !ok {
 			return fmt.Errorf("informer cache for %s did not sync within %s "+
 				"(check RBAC: list and watch are required)", typ, s.cacheSyncTimeout)
@@ -182,7 +211,7 @@ func (s *Store) Name() string { return "kubernetes" }
 // answer with an empty cluster.
 func (s *Store) Check(_ context.Context) error {
 	if !s.synced.Load() {
-		return fmt.Errorf("informer caches not yet synced")
+		return ErrCachesNotSynced
 	}
 	// A cluster with zero nodes is impossible while our watch is healthy, so this
 	// almost certainly means the cache was emptied or never really populated. Better

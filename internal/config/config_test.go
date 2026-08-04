@@ -206,6 +206,54 @@ func TestLoad_InvalidValues(t *testing.T) {
 			wantInMsg: "API_SHUTDOWN_TIMEOUT",
 		},
 		{
+			// REGRESSION: net/http treats a zero timeout as NO timeout, silently
+			// removing the Slowloris protection server.go claims to provide.
+			name:      "zero read timeout",
+			env:       map[string]string{"API_READ_TIMEOUT": "0s"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "API_READ_TIMEOUT",
+		},
+		{
+			name:      "negative write timeout",
+			env:       map[string]string{"API_WRITE_TIMEOUT": "-5s"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "API_WRITE_TIMEOUT",
+		},
+		{
+			name:      "zero idle timeout",
+			env:       map[string]string{"API_IDLE_TIMEOUT": "0s"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "API_IDLE_TIMEOUT",
+		},
+		{
+			name:      "zero prometheus timeout",
+			env:       map[string]string{"PROMETHEUS_TIMEOUT": "0s"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "PROMETHEUS_TIMEOUT",
+		},
+		{
+			// REGRESSION: int32(l.integer(...)) narrowed SILENTLY. 2^32+1 became 1, so
+			// the service started with a one-connection pool and no error anywhere.
+			name:      "pool size beyond int32 must not wrap silently",
+			env:       map[string]string{"DB_MAX_OPEN_CONNS": "4294967297"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "DB_MAX_OPEN_CONNS",
+		},
+		{
+			name:      "pool size at the int32 boundary",
+			env:       map[string]string{"DB_MAX_OPEN_CONNS": "2147483648"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "DB_MAX_OPEN_CONNS",
+		},
+		{
+			// REGRESSION: float32(huge float64) becomes +Inf, which passes a naive
+			// "must be positive" check and then disables rate limiting entirely.
+			name:      "qps beyond float32 must not become +Inf",
+			env:       map[string]string{"KUBE_QPS": "1e40", "KUBE_BURST": "100"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "KUBE_QPS",
+		},
+		{
 			// Burst below QPS makes the QPS setting meaningless.
 			name: "kube burst below qps",
 			env: map[string]string{

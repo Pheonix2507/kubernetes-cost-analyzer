@@ -33,9 +33,25 @@ package health
 
 import (
 	"context"
+	"fmt"
+	"io"
+	"os"
+	"runtime/debug"
 	"sync"
 	"time"
 )
+
+// panicWriter is where a panicking check's stack trace is written.
+//
+// A package-level variable rather than a logger on Aggregator, deliberately: this
+// package has no logging dependency (it is consumed by internal/httpapi, which does the
+// logging), and threading a *slog.Logger through NewAggregator's variadic signature for
+// one diagnostic sink is not worth the awkwardness. Tests swap it to capture output --
+// the same pattern as log.SetOutput.
+//
+// Mutable package state is normally a smell. It is tolerable here because nothing reads
+// it for behaviour: it is a write-only diagnostic channel.
+var panicWriter io.Writer = os.Stderr
 
 // Checker is a dependency that can report whether it is currently usable.
 //
@@ -180,8 +196,24 @@ func (a *Aggregator) Run(ctx context.Context) Report {
 	return Report{Status: overall, Checks: results}
 }
 
-// runOne executes a single check under its own timeout.
-func (a *Aggregator) runOne(ctx context.Context, c Checker) CheckResult {
+// runOne executes a single check under its own timeout, and CONTAINS ITS PANICS.
+//
+// WHY THE recover HERE IS NOT OPTIONAL
+// -----------------------------------
+// An unrecovered panic in ANY goroutine terminates the entire process, and these checks
+// run in goroutines that Run spawns. The Recover middleware in internal/httpapi only
+// wraps the HTTP handler's own goroutine -- it cannot catch a panic raised in a child.
+//
+// So without this, a Checker with a nil-pointer bug turns every readiness probe into a
+// process kill. The failure mode is spectacular: the kubelet probes /readyz, the process
+// dies, the container restarts, the probe fires again, and the service is in
+// CrashLoopBackOff caused entirely by its own health check. The dependency it was
+// checking may have been perfectly healthy.
+//
+// A health check is diagnostic machinery. It must never be able to take down the thing
+// it is diagnosing, so a panicking check is reported as a FAILED check -- which is
+// honest, since a check that panics genuinely cannot tell us the dependency is usable.
+func (a *Aggregator) runOne(ctx context.Context, c Checker) (result CheckResult) {
 	// A child context per check. Cancelling it does not affect siblings, and the
 	// deferred cancel releases the timer immediately when the check finishes early
 	// -- omitting that defer leaks a timer per check, per probe, forever. `go vet`
@@ -193,9 +225,38 @@ func (a *Aggregator) runOne(ctx context.Context, c Checker) CheckResult {
 	// time.Time, so it stays correct across wall-clock adjustments (NTP steps, DST).
 	// Subtracting two wall-clock readings can produce negative durations.
 	start := time.Now()
+
+	// The name is resolved BEFORE the check runs and captured for the recover path, so a
+	// failed check is still attributable. Name() is called inside the protected region
+	// too, in case an implementation panics there.
+	name := "unknown"
+
+	defer func() {
+		rec := recover()
+		if rec == nil {
+			return
+		}
+		// The stack goes to stderr rather than into the response: a readiness body is
+		// reachable by anything that can hit the endpoint, and a stack trace names
+		// internal packages and file paths. The message keeps enough to know WHICH
+		// dependency misbehaved.
+		// Explicitly ignored: this is a best-effort diagnostic write to stderr, and
+		// there is nothing useful to do if stderr itself is broken -- certainly not
+		// panic again from inside a panic handler.
+		_, _ = fmt.Fprintf(panicWriter, "health check %q panicked: %v\n%s\n", name, rec, debug.Stack())
+		result = CheckResult{
+			Name:      name,
+			Status:    StatusDown,
+			Error:     fmt.Sprintf("health check panicked: %v", rec),
+			LatencyMS: time.Since(start).Milliseconds(),
+		}
+	}()
+
+	name = c.Name()
 	err := c.Check(ctx)
-	result := CheckResult{
-		Name:      c.Name(),
+
+	result = CheckResult{
+		Name:      name,
 		Status:    StatusUp,
 		LatencyMS: time.Since(start).Milliseconds(),
 	}

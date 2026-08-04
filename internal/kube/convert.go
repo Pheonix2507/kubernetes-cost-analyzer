@@ -90,9 +90,11 @@ func toNamespace(ns *corev1.Namespace) Namespace {
 		Team:        ns.Labels[labelTeam],
 		CostCentre:  ns.Labels[labelCostCentre],
 		Environment: ns.Labels[labelEnvironment],
-		Labels:      ns.Labels,
-		Phase:       string(ns.Status.Phase),
-		CreatedAt:   ns.CreationTimestamp.Time,
+		// COPIED, not assigned. See copyLabels: assigning ns.Labels directly would hand
+		// the caller a map that lives inside the shared informer cache.
+		Labels:    copyLabels(ns.Labels),
+		Phase:     string(ns.Status.Phase),
+		CreatedAt: ns.CreationTimestamp.Time,
 	}
 }
 
@@ -114,7 +116,7 @@ func toPod(p *corev1.Pod, resolveOwner ownerResolver) Pod {
 		QoSClass:       string(p.Status.QOSClass),
 		Workload:       resolveWorkload(p, resolveOwner),
 		ContainerCount: len(p.Spec.Containers),
-		Labels:         p.Labels,
+		Labels:         copyLabels(p.Labels),
 		CreatedAt:      p.CreationTimestamp.Time,
 	}
 
@@ -234,6 +236,39 @@ func resolveWorkload(p *corev1.Pod, resolveOwner ownerResolver) Workload {
 		// IS the workload.
 		return Workload{Kind: ref.Kind, Name: ref.Name}
 	}
+}
+
+// copyLabels returns an independent copy of a label map.
+//
+// WHY THIS IS NOT PARANOIA
+// -----------------------
+// Listers return POINTERS INTO THE SHARED INFORMER CACHE, and a map field on such an
+// object is a reference, so `Labels: p.Labels` hands the caller a map that lives inside
+// the cache. Two things then go wrong:
+//
+//  1. Any caller that mutates the map it was given -- a handler adding a computed label,
+//     a future aggregation step normalising keys -- silently corrupts the cache for every
+//     other reader in the process.
+//  2. It is a genuine DATA RACE. The informer writes to the cache from its own
+//     goroutine while HTTP handlers read; nothing locks it, so `go test -race` would
+//     eventually flag it, and on a weak memory model the reader can observe a torn map.
+//
+// The whole justification for translating Kubernetes objects into our own types was that
+// the translation is a SAFETY boundary. Copying the scalar fields and then aliasing the
+// maps defeated that while looking entirely harmless -- which is exactly why
+// TestStore_DoesNotAliasCacheMaps exists.
+//
+// Returning nil for an empty input keeps `omitempty` working, so a pod with no labels
+// serialises without the field rather than as an empty object.
+func copyLabels(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 // stripForCache removes fields we never read before an object enters the informer

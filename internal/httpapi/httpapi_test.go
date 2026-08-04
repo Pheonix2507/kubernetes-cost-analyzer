@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -245,5 +246,87 @@ func TestRecover_TurnsPanicIntoResponse(t *testing.T) {
 		if strings.Contains(got, leak) {
 			t.Errorf("response leaks internal detail %q: %s", leak, got)
 		}
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Log volume from probes
+// -----------------------------------------------------------------------------
+
+// TestProbeLogging is a REGRESSION TEST for an operational bug rather than a functional
+// one, which makes it easy to miss in review and expensive in production.
+//
+// THE BUG: the access logger mapped any 5xx to ERROR, uniformly. /readyz correctly
+// returns 503 while a dependency is down, and the kubelet polls it every few seconds on
+// every replica. So a database blip produced hundreds of ERROR lines per minute for a
+// condition the system was already handling correctly by draining traffic.
+//
+// That is how error-log alerting gets muted, and a muted alert cannot warn you about the
+// next real problem. Probes are therefore DEBUG when passing and WARN when failing.
+func TestProbeLogging(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name        string
+		path        string
+		failing     bool
+		wantLevel   string // "" means nothing should be logged at info level
+		description string
+	}{
+		{
+			name: "passing probe is silent at info level", path: "/readyz", failing: false,
+			wantLevel:   "",
+			description: "polled every few seconds forever; at INFO it is pure noise",
+		},
+		{
+			name: "failing probe warns, does not error", path: "/readyz", failing: true,
+			wantLevel:   "WARN",
+			description: "a real signal, but the system is handling it as designed",
+		},
+		{
+			name: "passing liveness is silent too", path: "/healthz", failing: false,
+			wantLevel: "",
+		},
+		{
+			name: "real traffic is still logged at info", path: "/api/v1/nodes", failing: false,
+			wantLevel:   "INFO",
+			description: "the demotion must apply ONLY to probe paths",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			var buf bytes.Buffer
+			// Info level, as production runs. A DEBUG line must therefore not appear.
+			log := logging.New(logging.Options{Level: "info", Output: &buf})
+
+			var checkers []health.Checker
+			if tt.failing {
+				checkers = append(checkers, stubChecker{name: "postgres", err: errors.New("down")})
+			}
+			srv := NewRouter(log, health.NewAggregator(time.Second, checkers...), &stubInventory{})
+
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tt.path, nil))
+
+			out := buf.String()
+			if tt.wantLevel == "" {
+				if strings.Contains(out, "http request") {
+					t.Errorf("probe %s produced an access log line at info level: %s\nwhy: %s",
+						tt.path, out, tt.description)
+				}
+				return
+			}
+			if !strings.Contains(out, "level="+tt.wantLevel) {
+				t.Errorf("%s logged at the wrong level; want %s, got: %s\nwhy: %s",
+					tt.path, tt.wantLevel, out, tt.description)
+			}
+			// The specific regression: a failing probe must NOT be ERROR.
+			if tt.wantLevel == "WARN" && strings.Contains(out, "level=ERROR") {
+				t.Errorf("failing probe logged at ERROR; this is the log-spam bug: %s", out)
+			}
+		})
 	}
 }

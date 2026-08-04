@@ -1,8 +1,10 @@
 package health
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -194,5 +196,112 @@ func TestAggregator_NoCheckers(t *testing.T) {
 	}
 	if len(report.Checks) != 0 {
 		t.Errorf("got %d checks, want 0", len(report.Checks))
+	}
+}
+
+// -----------------------------------------------------------------------------
+// Panic containment
+// -----------------------------------------------------------------------------
+
+// panickingChecker models a Checker with a bug -- a nil pointer, a bad type assertion,
+// a closed channel. All of these are ordinary Go mistakes.
+type panickingChecker struct {
+	name   string
+	inName bool // panic from Name() rather than Check()
+}
+
+func (p panickingChecker) Name() string {
+	if p.inName {
+		panic("boom in Name()")
+	}
+	return p.name
+}
+
+func (p panickingChecker) Check(context.Context) error {
+	panic("boom in Check()")
+}
+
+// TestAggregator_ContainsPanickingCheck is a REGRESSION TEST for a real bug.
+//
+// THE BUG: runOne called c.Check(ctx) inside a goroutine with no recover. An unrecovered
+// panic in ANY goroutine kills the whole process, and the Recover middleware in
+// internal/httpapi only wraps the handler's own goroutine -- it cannot catch a panic in a
+// child it spawned.
+//
+// So a Checker with a nil-pointer bug turned every readiness probe into a process kill:
+// kubelet probes /readyz, process dies, container restarts, probe fires again. The
+// service would sit in CrashLoopBackOff caused entirely by its own health check, while
+// the dependency being checked was perfectly healthy.
+//
+// If this test ever fails, it does not fail politely -- the test binary crashes.
+func TestAggregator_ContainsPanickingCheck(t *testing.T) {
+	// Not parallel: it swaps the package-level panicWriter.
+	var buf bytes.Buffer
+	original := panicWriter
+	panicWriter = &buf
+	t.Cleanup(func() { panicWriter = original })
+
+	agg := NewAggregator(time.Second,
+		panickingChecker{name: "buggy"},
+		stubChecker{name: "healthy"}, // must still be reported correctly
+	)
+
+	// Without the recover, this call terminates the test process.
+	report := agg.Run(context.Background())
+
+	if report.Status != StatusDown {
+		t.Errorf("Status = %q, want %q when a check panics", report.Status, StatusDown)
+	}
+
+	byName := map[string]CheckResult{}
+	for _, c := range report.Checks {
+		byName[c.Name] = c
+	}
+
+	buggy, found := byName["buggy"]
+	if !found {
+		t.Fatalf("the panicking check is missing from the report: %+v", report.Checks)
+	}
+	if buggy.Status != StatusDown {
+		t.Errorf("panicking check status = %q, want %q", buggy.Status, StatusDown)
+	}
+	if buggy.Error == "" {
+		t.Error("panicking check carried no error message")
+	}
+
+	// A panic in one dependency must not lose the verdict on the others.
+	if healthy, found := byName["healthy"]; !found || healthy.Status != StatusUp {
+		t.Errorf("healthy check = %+v, want it still reported as up", healthy)
+	}
+
+	// The stack must be written somewhere an engineer can find it...
+	if !strings.Contains(buf.String(), "boom in Check()") {
+		t.Errorf("panic stack was not written to panicWriter; got %q", buf.String())
+	}
+	// ...but NOT returned to the client, where it would leak internal paths.
+	if strings.Contains(buggy.Error, ".go:") || strings.Contains(buggy.Error, "goroutine") {
+		t.Errorf("stack trace leaked into the response body: %q", buggy.Error)
+	}
+}
+
+// TestAggregator_ContainsPanicFromName covers the same protection when Name() itself
+// panics, which happens before we know what to call the failing dependency.
+func TestAggregator_ContainsPanicFromName(t *testing.T) {
+	var buf bytes.Buffer
+	original := panicWriter
+	panicWriter = &buf
+	t.Cleanup(func() { panicWriter = original })
+
+	report := NewAggregator(time.Second, panickingChecker{inName: true}).Run(context.Background())
+
+	if report.Status != StatusDown {
+		t.Errorf("Status = %q, want %q", report.Status, StatusDown)
+	}
+	if len(report.Checks) != 1 {
+		t.Fatalf("got %d checks, want 1", len(report.Checks))
+	}
+	// It cannot be named, but it must still appear rather than vanishing.
+	if report.Checks[0].Name != "unknown" {
+		t.Errorf("Name = %q, want %q as the fallback", report.Checks[0].Name, "unknown")
 	}
 }
