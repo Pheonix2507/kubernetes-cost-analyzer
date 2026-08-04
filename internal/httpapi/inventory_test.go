@@ -8,17 +8,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
-	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/kube"
 )
 
 // stubInventory is the payoff for defining Inventory as an interface in this package:
 // these tests exercise the real routing, middleware, validation and JSON encoding with
 // no informer, no API server and no Docker.
 type stubInventory struct {
-	nodes      []kube.Node
-	namespaces []kube.Namespace
-	pods       []kube.Pod
+	nodes      []domain.Node
+	namespaces []domain.Namespace
+	pods       []domain.Pod
 	err        error
 
 	// gotNamespace records what the handler passed down, so we can assert the query
@@ -26,9 +26,9 @@ type stubInventory struct {
 	gotNamespace string
 }
 
-func (s *stubInventory) Nodes() ([]kube.Node, error)           { return s.nodes, s.err }
-func (s *stubInventory) Namespaces() ([]kube.Namespace, error) { return s.namespaces, s.err }
-func (s *stubInventory) Pods(namespace string) ([]kube.Pod, error) {
+func (s *stubInventory) Nodes() ([]domain.Node, error)           { return s.nodes, s.err }
+func (s *stubInventory) Namespaces() ([]domain.Namespace, error) { return s.namespaces, s.err }
+func (s *stubInventory) Pods(namespace string) ([]domain.Pod, error) {
 	s.gotNamespace = namespace
 	return s.pods, s.err
 }
@@ -40,7 +40,7 @@ func newTestRouter(inv Inventory) http.Handler {
 func TestListNodes(t *testing.T) {
 	t.Parallel()
 
-	inv := &stubInventory{nodes: []kube.Node{
+	inv := &stubInventory{nodes: []domain.Node{
 		{Name: "worker-1", InstanceType: "m5.large", Zone: "ap-south-1a",
 			CapacityType: "on-demand", CapacityCPUMillicores: 2000, AllocatableCPUMillicores: 1900},
 		{Name: "worker-2", InstanceType: "m5.xlarge", Zone: "ap-south-1b",
@@ -54,7 +54,7 @@ func TestListNodes(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 	}
 
-	var got listResponse[kube.Node]
+	var got listResponse[domain.Node]
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
@@ -76,9 +76,9 @@ func TestListNodes(t *testing.T) {
 func TestListPods_PassesNamespaceFilter(t *testing.T) {
 	t.Parallel()
 
-	inv := &stubInventory{pods: []kube.Pod{{
+	inv := &stubInventory{pods: []domain.Pod{{
 		UID: "abc", Name: "api-1", Namespace: "team-payments", QoSClass: "Burstable",
-		Workload:              kube.Workload{Kind: "Deployment", Name: "api"},
+		Workload:              domain.Workload{Kind: "Deployment", Name: "api"},
 		RequestsCPUMillicores: 500, RequestsMemoryBytes: 536870912,
 	}}}
 
@@ -93,7 +93,7 @@ func TestListPods_PassesNamespaceFilter(t *testing.T) {
 		t.Errorf("handler passed namespace %q down, want %q", inv.gotNamespace, "team-payments")
 	}
 
-	var got listResponse[kube.Pod]
+	var got listResponse[domain.Pod]
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}

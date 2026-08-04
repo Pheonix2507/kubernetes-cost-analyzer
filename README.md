@@ -15,10 +15,11 @@ waste = requested - used
 Everything else in this repository is data collection, aggregation and presentation on
 top of that.
 
-## Status: Phase 1 complete
+## Status: Phase 2 complete
 
-A reproducible local environment, a production-shaped Go skeleton, and live cluster
-topology served over a read-only API. **No pricing yet** — that is Phase 3.
+A reproducible local environment, a production-shaped Go skeleton, live cluster topology
+over a read-only API, and a partitioned Postgres schema with repositories.
+**No pricing yet** — that is Phase 3, so cost columns exist but nothing populates them.
 
 What works today:
 
@@ -36,7 +37,10 @@ What works today:
   denied
 - Two Go binaries with config validation, structured logging, dependency injection,
   liveness/readiness split and graceful shutdown
-- A 17 MB non-root, shell-less container image
+- A partitioned star-schema in Postgres: normalised dimensions, an immutable
+  container-grain fact table, monthly RANGE partitions, and idempotent upserts
+- Exact decimal money end to end (`decimal.Decimal` ↔ `numeric(20,10)`), never float
+- A non-root, shell-less container image
 
 ### Endpoints
 
@@ -129,8 +133,10 @@ internal/
   health         Checker interface + concurrent readiness aggregator
   httpapi        server, router, JSON responses, health handlers
     middleware   request ID, structured access log, panic recovery
+  domain         the vocabulary all three layers share; stdlib imports only
   kube           client-go: dual-mode client, shared informers, pure translation
-  store/postgres pgx pool; repositories from Phase 2
+  store/postgres pgx pool, Querier seam, dimension + fact repositories
+migrations       numbered SQL, applied with golang-migrate
 deploy/
   kind           cluster definition
   monitoring     Helm values
@@ -166,9 +172,49 @@ The fake instance-type labels on the kind nodes (`m5.large`, `m5.xlarge`, one sp
 two zones) use the same well-known label keys a cloud provider sets, so the pricing engine
 will work unchanged against a real EKS cluster.
 
+## The data model
+
+A star schema: normalised dimensions for mutable current state, one denormalised,
+immutable fact table for history.
+
+```
+   nodes ──┐
+namespaces ─┤
+ workloads ─┼──►  container_allocations   (one row per container per window)
+     pods ──┘         partitioned by month on window_start
+```
+
+Three decisions drive it, and each exists to prevent a specific way of being wrong:
+
+**Container grain, not pod grain.** A pod with a bloated sidecar and a well-sized app
+container averages out to "fine" at pod grain. That is the commonest real waste pattern on
+any service-mesh cluster, and it is invisible unless the grain is per container. Pod and
+workload figures are `SUM`s over this; the reverse is not recoverable.
+
+**Attribution is denormalised onto the fact row.** `team`, `cost_centre`, `instance_type`
+and the rates used are copied onto each row at collection time. If `team` were joined from
+`namespaces`, relabelling a namespace would silently rewrite every historical report — last
+month's reconciled figure would change after the fact. Normalise mutable state, denormalise
+immutable history.
+
+**Money is `numeric(20,10)` and `decimal.Decimal`, never float.** `float64` cannot represent
+`0.1`, and the error compounds under `SUM` across millions of rows in a number someone
+reconciles against a cloud invoice. Worse, the drift depends on summation order, which the
+planner may change between runs — so the report disagrees with itself.
+
+Two properties the schema enforces rather than trusts:
+
+- **Idempotency.** The primary key `(window_start, pod_id, container_name)` plus
+  `ON CONFLICT DO UPDATE` means a retried collection window converges instead of
+  double-counting. A bare `INSERT` would inflate the bill on every retry.
+- **The billing rule.** A `CHECK` constraint asserts the stored billable amount really is
+  `max(requested, used)`, so even SQL written outside this repo cannot break it.
+
 ## Development
 
 ```bash
+make migrate-up    # apply migrations
+make migrate-reset # drop and re-apply from scratch
 make check         # fmt + vet + lint + test — everything CI runs
 make test          # go test -race
 make docker-build  # container image
@@ -194,7 +240,7 @@ that least privilege holds. Same reasoning as the `right-sized-worker` fixture.
 |---|---|
 | **0** ✅ | Reproducible environment + Go skeleton |
 | **1** ✅ | Live inventory via client-go informers + RBAC |
-| 2 | Postgres schema, migrations, repositories |
+| **2** ✅ | Postgres schema, migrations, repositories |
 | 3 | Pricing engine behind a provider interface |
 | 4 | Cost engine + Prometheus collector (worker pools, channels, context) |
 | 5 | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |

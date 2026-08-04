@@ -4,6 +4,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	resourcehelper "k8s.io/component-helpers/resource"
+
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 )
 
 // Everything in this file is a PURE FUNCTION: Kubernetes object in, our type out. No
@@ -36,8 +38,8 @@ const (
 )
 
 // toNode translates a Kubernetes Node.
-func toNode(n *corev1.Node) Node {
-	out := Node{
+func toNode(n *corev1.Node) domain.Node {
+	out := domain.Node{
 		Name:           n.Name,
 		InstanceType:   n.Labels[labelInstanceType],
 		Region:         n.Labels[labelRegion],
@@ -84,8 +86,8 @@ func toNode(n *corev1.Node) Node {
 }
 
 // toNamespace translates a Kubernetes Namespace.
-func toNamespace(ns *corev1.Namespace) Namespace {
-	return Namespace{
+func toNamespace(ns *corev1.Namespace) domain.Namespace {
+	return domain.Namespace{
 		Name:        ns.Name,
 		Team:        ns.Labels[labelTeam],
 		CostCentre:  ns.Labels[labelCostCentre],
@@ -104,10 +106,10 @@ func toNamespace(ns *corev1.Namespace) Namespace {
 // testable: the tests pass a closure over a map instead of standing up a ReplicaSet
 // informer. It is also honest about the dependency -- resolving ownership needs a
 // second lookup, and hiding that inside the function would obscure a real API call.
-func toPod(p *corev1.Pod, resolveOwner ownerResolver) Pod {
+func toPod(p *corev1.Pod, resolveOwner ownerResolver) domain.Pod {
 	requests, limits := podResources(p)
 
-	out := Pod{
+	out := domain.Pod{
 		UID:            string(p.UID),
 		Name:           p.Name,
 		Namespace:      p.Namespace,
@@ -206,7 +208,7 @@ type ownerResolver func(namespace, kind, name string) *metav1.OwnerReference
 // So for ReplicaSets and Jobs we take a second hop. That is what makes the
 // over-replicated fixture legible: its waste is only visible once six pods aggregate
 // to one Deployment.
-func resolveWorkload(p *corev1.Pod, resolveOwner ownerResolver) Workload {
+func resolveWorkload(p *corev1.Pod, resolveOwner ownerResolver) domain.Workload {
 	// GetControllerOf returns the owner reference with controller: true. A pod can
 	// carry several owner references but at most one CONTROLLER, and only the
 	// controller represents the managing workload -- the rest are for garbage
@@ -216,7 +218,7 @@ func resolveWorkload(p *corev1.Pod, resolveOwner ownerResolver) Workload {
 		// A bare pod, created directly with no controller. Legitimate but unusual, and
 		// worth surfacing: nothing will recreate it, so it is often a leftover from
 		// manual debugging that has been quietly billing for months.
-		return Workload{}
+		return domain.Workload{}
 	}
 
 	switch ref.Kind {
@@ -227,14 +229,14 @@ func resolveWorkload(p *corev1.Pod, resolveOwner ownerResolver) Workload {
 		// none.
 		if resolveOwner != nil {
 			if grandparent := resolveOwner(p.Namespace, ref.Kind, ref.Name); grandparent != nil {
-				return Workload{Kind: grandparent.Kind, Name: grandparent.Name}
+				return domain.Workload{Kind: grandparent.Kind, Name: grandparent.Name}
 			}
 		}
-		return Workload{Kind: ref.Kind, Name: ref.Name}
+		return domain.Workload{Kind: ref.Kind, Name: ref.Name}
 	default:
 		// StatefulSet, DaemonSet, or a custom controller: the immediate owner already
 		// IS the workload.
-		return Workload{Kind: ref.Kind, Name: ref.Name}
+		return domain.Workload{Kind: ref.Kind, Name: ref.Name}
 	}
 }
 

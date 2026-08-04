@@ -210,6 +210,37 @@ db-nuke: db-down ## Remove the Postgres container AND destroy its data volume
 db-psql: ## Open a psql shell against the local database
 	@docker exec -it $(PG_CONTAINER) psql -U $(POSTGRES_USER) -d $(POSTGRES_DB)
 
+# -----------------------------------------------------------------------------
+# Migrations
+# -----------------------------------------------------------------------------
+# golang-migrate tracks the applied version in a schema_migrations table, so `up` is
+# idempotent and only applies what is missing.
+#
+# THE RULE THIS TOOLING CANNOT ENFORCE: never edit a migration that has been applied
+# anywhere. The version number is all migrate compares, so an edited file leaves the
+# database and the repository silently disagreeing. Always add a new migration.
+.PHONY: migrate-up
+migrate-up: ## Apply all pending migrations
+	migrate -path migrations -database "$(DATABASE_URL)" up
+
+.PHONY: migrate-down
+migrate-down: ## Roll back the most recent migration
+	migrate -path migrations -database "$(DATABASE_URL)" down 1
+
+.PHONY: migrate-reset
+migrate-reset: ## Drop everything and re-apply from scratch (local only)
+	migrate -path migrations -database "$(DATABASE_URL)" drop -f
+	$(MAKE) --no-print-directory migrate-up
+
+.PHONY: migrate-version
+migrate-version: ## Show the current schema version
+	@migrate -path migrations -database "$(DATABASE_URL)" version
+
+.PHONY: migrate-create
+migrate-create: ## Create a new migration pair: make migrate-create NAME=add_foo
+	@test -n "$(NAME)" || (echo "usage: make migrate-create NAME=add_something" && exit 1)
+	migrate create -ext sql -dir migrations -seq $(NAME)
+
 # =============================================================================
 # Go
 # =============================================================================

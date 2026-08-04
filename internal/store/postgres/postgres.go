@@ -31,6 +31,8 @@ import (
 	"context"
 	"fmt"
 
+	pgxdecimal "github.com/jackc/pgx-shopspring-decimal"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/config"
@@ -105,6 +107,23 @@ func New(ctx context.Context, cfg config.Database) (*DB, error) {
 	// period, and one of those "mysterious latency spike every 30 minutes" problems
 	// that is very hard to attribute after the fact.
 	poolCfg.MaxConnLifetimeJitter = cfg.ConnMaxLifetime / 10
+
+	// Teach every connection how to map Postgres `numeric` to decimal.Decimal.
+	//
+	// WHY AfterConnect AND NOT ONCE AT POOL LEVEL: pgx's type map is PER CONNECTION, so a
+	// registration done once on the pool would apply to whichever connection happened to
+	// exist at the time and silently not to any opened later. The bug that produces is
+	// horrible to diagnose -- money columns scan correctly for a while and then start
+	// failing under load, when the pool grows past its initial size.
+	//
+	// Without this, scanning numeric into a decimal.Decimal fails outright, and the
+	// tempting fix is to change the Go field to float64. That would compile, pass tests,
+	// and quietly corrupt every financial total under SUM. See the note on
+	// ContainerAllocation.
+	poolCfg.AfterConnect = func(_ context.Context, conn *pgx.Conn) error {
+		pgxdecimal.Register(conn.TypeMap())
+		return nil
+	}
 
 	pool, err := pgxpool.NewWithConfig(ctx, poolCfg)
 	if err != nil {

@@ -3,7 +3,7 @@ package httpapi
 import (
 	"net/http"
 
-	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/kube"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 )
 
 // Inventory is the read-only cluster topology this API serves.
@@ -18,14 +18,14 @@ import (
 //  2. It states exactly what the HTTP layer needs. Three read methods. *kube.Store also
 //     has Start and Check, and a handler has no business calling either.
 //
-// Note that it still returns kube types. That is honest for now: kube is their only
-// producer. When Phase 2 makes Postgres a second source of the same concepts, THAT is
-// the moment these move to an internal/domain package -- extracted from two real
-// implementations rather than guessed at in advance.
+// It returns internal/domain types rather than internal/kube ones. Those types lived in
+// kube until Phase 2, when Postgres became a third package speaking the same concepts and
+// a persistence layer importing a Kubernetes client package stopped making sense. See the
+// package comment on internal/domain.
 type Inventory interface {
-	Nodes() ([]kube.Node, error)
-	Namespaces() ([]kube.Namespace, error)
-	Pods(namespace string) ([]kube.Pod, error)
+	Nodes() ([]domain.Node, error)
+	Namespaces() ([]domain.Namespace, error)
+	Pods(namespace string) ([]domain.Pod, error)
 }
 
 // listResponse wraps every collection response.

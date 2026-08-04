@@ -1,0 +1,368 @@
+package postgres
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/shopspring/decimal"
+)
+
+// ContainerAllocation is one immutable cost sample: what a single container reserved and
+// used over one time window, and what that cost.
+//
+// WHY MONEY IS decimal.Decimal AND NOT float64
+// --------------------------------------------
+// float64 cannot represent 0.1 exactly, and the error compounds under SUM. Adding
+// 0.0000267 eleven million times -- one row per container per window per month -- drifts
+// from the true total, and the drift is not reproducible because it depends on summation
+// order, which the query planner is free to change between runs.
+//
+// A cost report that disagrees with itself between two runs, or with the cloud invoice it
+// is reconciled against, is not a rounding curiosity. It is the end of anyone trusting the
+// tool. decimal.Decimal is exact base-10 arithmetic and maps directly onto Postgres
+// numeric, which is why the schema uses numeric(20,10) rather than double precision.
+//
+// The trade-off is real and worth stating: decimal arithmetic is roughly an order of
+// magnitude slower than float64 and allocates. That is irrelevant here, because every one
+// of these values crosses a network and a disk, and the I/O dominates by orders of
+// magnitude.
+type ContainerAllocation struct {
+	// The window is HALF-OPEN: [WindowStart, WindowEnd).
+	//
+	// With closed intervals, consecutive windows share an endpoint and every range query
+	// double-counts the boundary sample. Essentially every time-bucketing bug in cost
+	// reporting traces back to this choice.
+	WindowStart time.Time
+	WindowEnd   time.Time
+
+	PodID         int64
+	ContainerName string
+
+	// --- Attribution: an immutable snapshot of ownership at collection time ---------
+	// Denormalised on purpose. If team were joined from the namespaces table, relabelling
+	// a namespace would silently rewrite every historical report, so last month's
+	// finalised figure would change after the fact.
+	ClusterName   string
+	NamespaceName string
+	PodName       string
+	WorkloadKind  string
+	WorkloadName  string
+	NodeName      string
+	Team          string
+	CostCentre    string
+	Environment   string
+	InstanceType  string
+	CapacityType  string
+	Zone          string
+	QoSClass      string
+
+	// --- Measurements, in the same integer units internal/kube uses ---------------
+	CPUMillicoresRequested int64
+	MemoryBytesRequested   int64
+	CPUMillicoresUsed      int64
+	MemoryBytesUsed        int64
+
+	// --- Rates in effect for THIS window -----------------------------------------
+	CPUCostPerCoreHour   decimal.Decimal
+	MemoryCostPerGiBHour decimal.Decimal
+
+	CPUCost    decimal.Decimal
+	MemoryCost decimal.Decimal
+}
+
+// Billable returns the quantities cost is actually charged on: max(requested, used).
+//
+// WHY max AND NOT requested
+// -------------------------
+// Requests alone are the obvious basis, and they miss an entire class of workload. A
+// BestEffort container declares no requests at all, so a request-only formula prices it at
+// exactly ZERO while it consumes real CPU and memory on a real node. That cost does not
+// disappear -- it is silently smeared across every other team's share, so everyone else is
+// over-billed to hide it.
+//
+// This is why the no-requests-at-all fixture exists in deploy/demo-workloads, and why the
+// database has a CHECK constraint asserting the stored billable value really is the max:
+// the rule is the product's definition and must not drift between the three layers that
+// would otherwise each reimplement it.
+//
+// A method on the struct rather than a field the caller sets, so it cannot be filled in
+// wrongly. The database constraint then catches anyone bypassing this by writing SQL
+// directly.
+func (a ContainerAllocation) Billable() (cpuMillicores, memoryBytes int64) {
+	return max(a.CPUMillicoresRequested, a.CPUMillicoresUsed),
+		max(a.MemoryBytesRequested, a.MemoryBytesUsed)
+}
+
+// Validate checks the invariants that the database also enforces.
+//
+// WHY CHECK IN BOTH PLACES
+// ------------------------
+// The CHECK constraints are the real guarantee -- they hold against psql, a migration, and
+// any future service. But a constraint violation surfaces as an opaque Postgres error
+// naming a constraint, arriving after a network round trip, and if it happens mid-batch it
+// aborts the whole transaction including every valid row alongside it.
+//
+// Validating first turns that into a precise, local error naming the field and the pod, and
+// keeps one malformed sample from discarding the other 4,999 in the batch. The database
+// remains the backstop; this is the useful error message.
+func (a ContainerAllocation) Validate() error {
+	var errs []error
+
+	if a.WindowStart.IsZero() || a.WindowEnd.IsZero() {
+		errs = append(errs, errors.New("window_start and window_end must both be set"))
+	} else if !a.WindowEnd.After(a.WindowStart) {
+		errs = append(errs, fmt.Errorf("window_end (%s) must be after window_start (%s)",
+			a.WindowEnd.Format(time.RFC3339), a.WindowStart.Format(time.RFC3339)))
+	}
+	if a.PodID == 0 {
+		errs = append(errs, errors.New("pod_id must be set"))
+	}
+	if a.ContainerName == "" {
+		// Part of the primary key, so an empty name would silently collide with any other
+		// unnamed container in the same pod and window -- one would overwrite the other.
+		errs = append(errs, errors.New("container_name must not be empty"))
+	}
+	if a.ClusterName == "" || a.NamespaceName == "" {
+		errs = append(errs, errors.New("cluster_name and namespace_name must be set for attribution"))
+	}
+	if a.CPUMillicoresRequested < 0 || a.MemoryBytesRequested < 0 ||
+		a.CPUMillicoresUsed < 0 || a.MemoryBytesUsed < 0 {
+		errs = append(errs, errors.New("resource amounts must not be negative"))
+	}
+	if a.CPUCost.IsNegative() || a.MemoryCost.IsNegative() {
+		errs = append(errs, errors.New("costs must not be negative"))
+	}
+
+	return errors.Join(errs...)
+}
+
+// AllocationRepository writes and reads the fact table.
+type AllocationRepository struct {
+	db Querier
+}
+
+// NewAllocationRepository returns a repository bound to db.
+func NewAllocationRepository(db Querier) *AllocationRepository {
+	return &AllocationRepository{db: db}
+}
+
+// insertAllocation is shared by the single and batch paths so the column list and the
+// conflict behaviour can never diverge between them.
+//
+// ON CONFLICT DO UPDATE is what makes collection IDEMPOTENT. The collector runs on a
+// timer; if it crashes after writing half a window and then retries, a bare INSERT would
+// fail on the primary key -- or worse, if the key were incomplete, would insert duplicates
+// and inflate the bill on every retry. Re-running a window must be safe and must converge
+// on the same numbers.
+//
+// total_cost is absent from the column list because it is a GENERATED column: Postgres
+// rejects any attempt to write it, which is precisely the guarantee we want.
+const insertAllocation = `
+	INSERT INTO container_allocations (
+		window_start, window_end, pod_id, container_name,
+		cluster_name, namespace_name, pod_name, workload_kind, workload_name,
+		node_name, team, cost_centre, environment, instance_type, capacity_type,
+		zone, qos_class,
+		cpu_millicores_requested, memory_bytes_requested,
+		cpu_millicores_used, memory_bytes_used,
+		cpu_millicores_billable, memory_bytes_billable,
+		cpu_cost_per_core_hour, memory_cost_per_gib_hour,
+		cpu_cost, memory_cost, collected_at
+	) VALUES (
+		$1, $2, $3, $4,
+		$5, $6, $7, $8, $9,
+		$10, $11, $12, $13, $14, $15,
+		$16, $17,
+		$18, $19,
+		$20, $21,
+		$22, $23,
+		$24, $25,
+		$26, $27, now()
+	)
+	ON CONFLICT (window_start, pod_id, container_name) DO UPDATE
+	SET cluster_name             = EXCLUDED.cluster_name,
+	    namespace_name           = EXCLUDED.namespace_name,
+	    pod_name                 = EXCLUDED.pod_name,
+	    workload_kind            = EXCLUDED.workload_kind,
+	    workload_name            = EXCLUDED.workload_name,
+	    node_name                = EXCLUDED.node_name,
+	    team                     = EXCLUDED.team,
+	    cost_centre              = EXCLUDED.cost_centre,
+	    environment              = EXCLUDED.environment,
+	    instance_type            = EXCLUDED.instance_type,
+	    capacity_type            = EXCLUDED.capacity_type,
+	    zone                     = EXCLUDED.zone,
+	    qos_class                = EXCLUDED.qos_class,
+	    window_end               = EXCLUDED.window_end,
+	    cpu_millicores_requested = EXCLUDED.cpu_millicores_requested,
+	    memory_bytes_requested   = EXCLUDED.memory_bytes_requested,
+	    cpu_millicores_used      = EXCLUDED.cpu_millicores_used,
+	    memory_bytes_used        = EXCLUDED.memory_bytes_used,
+	    cpu_millicores_billable  = EXCLUDED.cpu_millicores_billable,
+	    memory_bytes_billable    = EXCLUDED.memory_bytes_billable,
+	    cpu_cost_per_core_hour   = EXCLUDED.cpu_cost_per_core_hour,
+	    memory_cost_per_gib_hour = EXCLUDED.memory_cost_per_gib_hour,
+	    cpu_cost                 = EXCLUDED.cpu_cost,
+	    memory_cost              = EXCLUDED.memory_cost,
+	    collected_at             = now()`
+
+// allocationArgs flattens one allocation into the placeholder order above.
+func allocationArgs(a ContainerAllocation) []any {
+	cpuBillable, memBillable := a.Billable()
+	return []any{
+		a.WindowStart, a.WindowEnd, a.PodID, a.ContainerName,
+		a.ClusterName, a.NamespaceName, a.PodName, a.WorkloadKind, a.WorkloadName,
+		a.NodeName, a.Team, a.CostCentre, a.Environment, a.InstanceType, a.CapacityType,
+		a.Zone, a.QoSClass,
+		a.CPUMillicoresRequested, a.MemoryBytesRequested,
+		a.CPUMillicoresUsed, a.MemoryBytesUsed,
+		cpuBillable, memBillable,
+		a.CPUCostPerCoreHour, a.MemoryCostPerGiBHour,
+		a.CPUCost, a.MemoryCost,
+	}
+}
+
+// Insert writes a single allocation. Mostly for tests; the collector uses InsertBatch.
+func (r *AllocationRepository) Insert(ctx context.Context, a ContainerAllocation) error {
+	if err := a.Validate(); err != nil {
+		return fmt.Errorf("invalid allocation for pod %d container %q: %w", a.PodID, a.ContainerName, err)
+	}
+	if _, err := r.db.Exec(ctx, insertAllocation, allocationArgs(a)...); err != nil {
+		return fmt.Errorf("insert allocation for pod %d container %q: %w", a.PodID, a.ContainerName, err)
+	}
+	return nil
+}
+
+// InsertBatch writes many allocations in a single network round trip.
+//
+// WHY BATCHING RATHER THAN A LOOP OVER Insert
+// -------------------------------------------
+// Each Exec is a full round trip. At 0.5ms of latency and 10,000 containers that is five
+// seconds of pure waiting before Postgres does any work at all, every collection cycle.
+// pgx.Batch pipelines the statements and reads the results back in order, so the latency
+// is paid once.
+//
+// WHY NOT CopyFrom, WHICH IS FASTER STILL
+// COPY cannot express ON CONFLICT, and idempotency is not negotiable here -- a retried
+// window must converge rather than duplicate. The standard way to get both is COPY into a
+// temporary table followed by INSERT ... SELECT ... ON CONFLICT, which is worth doing when
+// profiling says this is the bottleneck. It is not yet, and the complexity would be
+// unjustified.
+//
+// EVERY allocation is validated BEFORE anything is sent. One malformed row inside a batch
+// aborts the enclosing transaction, taking every valid row with it, so failing early with a
+// precise message beats discovering it halfway through.
+func (r *AllocationRepository) InsertBatch(ctx context.Context, allocations []ContainerAllocation) error {
+	if len(allocations) == 0 {
+		// Not an error. An empty cluster, or a window where every pod was Pending, is a
+		// legitimate outcome and the caller should not have to special-case it.
+		return nil
+	}
+
+	for i, a := range allocations {
+		if err := a.Validate(); err != nil {
+			return fmt.Errorf("allocation %d of %d (pod %d container %q) is invalid: %w",
+				i, len(allocations), a.PodID, a.ContainerName, err)
+		}
+	}
+
+	batch := &pgx.Batch{}
+	for _, a := range allocations {
+		batch.Queue(insertAllocation, allocationArgs(a)...)
+	}
+
+	results := r.db.SendBatch(ctx, batch)
+	// Close MUST be called, and its error MUST be checked.
+	//
+	// pgx reads batch results lazily. Abandoning them without Close leaves unread
+	// responses in the connection's buffer, and the connection is then returned to the
+	// pool in a corrupt state -- the NEXT user of that connection reads our leftover
+	// results and fails with a wildly misleading error. A defer alone is not enough
+	// either, because a deferred Close's error would be discarded.
+	var firstErr error
+	for i := range allocations {
+		if _, err := results.Exec(); err != nil && firstErr == nil {
+			firstErr = fmt.Errorf("batch item %d (pod %d container %q): %w",
+				i, allocations[i].PodID, allocations[i].ContainerName, err)
+		}
+	}
+	if closeErr := results.Close(); closeErr != nil && firstErr == nil {
+		firstErr = fmt.Errorf("close batch: %w", closeErr)
+	}
+	if firstErr != nil {
+		return fmt.Errorf("insert %d allocations: %w", len(allocations), firstErr)
+	}
+	return nil
+}
+
+// NamespaceCost is one row of a cost-by-namespace report.
+type NamespaceCost struct {
+	NamespaceName  string          `json:"namespace"`
+	Team           string          `json:"team,omitempty"`
+	CPUCoreHours   decimal.Decimal `json:"cpu_core_hours"`
+	MemoryGiBHours decimal.Decimal `json:"memory_gib_hours"`
+	TotalCost      decimal.Decimal `json:"total_cost"`
+}
+
+// CostByNamespace aggregates cost over a half-open time range.
+//
+// This is the query the dashboard runs most, and the reason for the
+// (namespace_name, window_start DESC) index.
+func (r *AllocationRepository) CostByNamespace(ctx context.Context, from, to time.Time) ([]NamespaceCost, error) {
+	// >= from AND < to -- half-open, matching the window semantics. Using BETWEEN here
+	// would be closed on both ends and would double-count the boundary window in any two
+	// adjacent reports.
+	const q = `
+		SELECT namespace_name,
+		       -- max() rather than any(): team is denormalised and constant per namespace
+		       -- within a window, but GROUP BY still requires an aggregate. Postgres has no
+		       -- any_value() before 16, and max() over identical strings is exact.
+		       max(team) AS team,
+		       -- Millicore-minutes to core-hours: /1000 for cores, /3600 for hours. Done in
+		       -- SQL rather than Go so the database can do it during aggregation instead of
+		       -- shipping every row over the wire.
+		       COALESCE(sum(
+		           cpu_millicores_billable::numeric / 1000
+		           * EXTRACT(EPOCH FROM (window_end - window_start)) / 3600
+		       ), 0) AS cpu_core_hours,
+		       COALESCE(sum(
+		           memory_bytes_billable::numeric / (1024*1024*1024)
+		           * EXTRACT(EPOCH FROM (window_end - window_start)) / 3600
+		       ), 0) AS memory_gib_hours,
+		       COALESCE(sum(total_cost), 0) AS total_cost
+		FROM container_allocations
+		WHERE window_start >= $1 AND window_start < $2
+		GROUP BY namespace_name
+		ORDER BY total_cost DESC, namespace_name`
+
+	rows, err := r.db.Query(ctx, q, from, to)
+	if err != nil {
+		return nil, fmt.Errorf("query cost by namespace: %w", err)
+	}
+	// rows.Close is idempotent and safe to defer even after a full iteration. Omitting it
+	// on an early return leaks the connection back to nothing.
+	defer rows.Close()
+
+	// Non-nil so an empty result marshals as [] rather than null.
+	out := []NamespaceCost{}
+	for rows.Next() {
+		var c NamespaceCost
+		if err := rows.Scan(&c.NamespaceName, &c.Team, &c.CPUCoreHours, &c.MemoryGiBHours, &c.TotalCost); err != nil {
+			return nil, fmt.Errorf("scan namespace cost: %w", err)
+		}
+		out = append(out, c)
+	}
+	// rows.Err() MUST be checked after the loop.
+	//
+	// rows.Next() returns false both for "finished normally" and for "the query failed
+	// mid-stream" -- a broken connection, a cancelled context, a server-side error after
+	// the first row. Skipping this check silently returns a TRUNCATED result set as though
+	// it were complete, and for a cost report that means quietly under-reporting the bill.
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate namespace costs: %w", err)
+	}
+	return out, nil
+}

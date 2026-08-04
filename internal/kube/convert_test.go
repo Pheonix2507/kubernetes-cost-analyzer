@@ -7,6 +7,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 )
 
 // These tests need no cluster, no fake clientset and no Docker, because everything in
@@ -285,39 +287,39 @@ func TestResolveWorkload(t *testing.T) {
 	tests := []struct {
 		name  string
 		owner *metav1.OwnerReference
-		want  Workload
+		want  domain.Workload
 		why   string
 	}{
 		{
 			name:  "deployment-managed pod resolves past its ReplicaSet",
 			owner: &metav1.OwnerReference{Kind: "ReplicaSet", Name: "api-55758c88bb", Controller: ptr(true)},
-			want:  Workload{Kind: "Deployment", Name: "api"},
+			want:  domain.Workload{Kind: "Deployment", Name: "api"},
 			why: "the ReplicaSet hash changes on EVERY rollout. Reporting cost against " +
 				"it makes each deploy look like a new service, so no workload keeps history.",
 		},
 		{
 			name:  "StatefulSet is already the workload",
 			owner: &metav1.OwnerReference{Kind: "StatefulSet", Name: "postgres", Controller: ptr(true)},
-			want:  Workload{Kind: "StatefulSet", Name: "postgres"},
+			want:  domain.Workload{Kind: "StatefulSet", Name: "postgres"},
 			why:   "one hop only; no ReplicaSet in between",
 		},
 		{
 			name:  "DaemonSet is already the workload",
 			owner: &metav1.OwnerReference{Kind: "DaemonSet", Name: "node-exporter", Controller: ptr(true)},
-			want:  Workload{Kind: "DaemonSet", Name: "node-exporter"},
+			want:  domain.Workload{Kind: "DaemonSet", Name: "node-exporter"},
 			why:   "one hop only",
 		},
 		{
 			name:  "unresolvable ReplicaSet degrades to the ReplicaSet itself",
 			owner: &metav1.OwnerReference{Kind: "ReplicaSet", Name: "already-gc-ed", Controller: ptr(true)},
-			want:  Workload{Kind: "ReplicaSet", Name: "already-gc-ed"},
+			want:  domain.Workload{Kind: "ReplicaSet", Name: "already-gc-ed"},
 			why: "a ReplicaSet scaled to zero is garbage collected while its last pod " +
 				"terminates. Degraded attribution beats none at all.",
 		},
 		{
 			name:  "bare pod has no workload",
 			owner: nil,
-			want:  Workload{},
+			want:  domain.Workload{},
 			why: "legitimate but unusual: nothing will recreate it, so it is often a " +
 				"leftover from manual debugging that has been billing quietly for months.",
 		},
@@ -327,7 +329,7 @@ func TestResolveWorkload(t *testing.T) {
 			// one CONTROLLER; the others exist for garbage collection and do not
 			// represent the managing workload.
 			owner: &metav1.OwnerReference{Kind: "Deployment", Name: "not-the-controller", Controller: ptr(false)},
-			want:  Workload{},
+			want:  domain.Workload{},
 			why:   "GetControllerOf must only match the reference with controller: true",
 		},
 	}

@@ -19,6 +19,7 @@ import (
 	"k8s.io/client-go/kubernetes"
 
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/config"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 )
 
@@ -229,13 +230,13 @@ func (s *Store) Check(_ context.Context) error {
 // same request would return the same nodes in a different order every time. That
 // breaks client-side diffing, makes response caching useless, and turns any
 // golden-file test into a flake.
-func (s *Store) Nodes() ([]Node, error) {
+func (s *Store) Nodes() ([]domain.Node, error) {
 	list, err := s.nodes.List(labels.Everything())
 	if err != nil {
 		return nil, fmt.Errorf("listing nodes from cache: %w", err)
 	}
 
-	out := make([]Node, 0, len(list))
+	out := make([]domain.Node, 0, len(list))
 	for _, n := range list {
 		out = append(out, toNode(n))
 	}
@@ -244,13 +245,13 @@ func (s *Store) Nodes() ([]Node, error) {
 }
 
 // Namespaces returns every namespace, sorted by name.
-func (s *Store) Namespaces() ([]Namespace, error) {
+func (s *Store) Namespaces() ([]domain.Namespace, error) {
 	list, err := s.namespaces.List(labels.Everything())
 	if err != nil {
 		return nil, fmt.Errorf("listing namespaces from cache: %w", err)
 	}
 
-	out := make([]Namespace, 0, len(list))
+	out := make([]domain.Namespace, 0, len(list))
 	for _, ns := range list {
 		out = append(out, toNamespace(ns))
 	}
@@ -264,7 +265,7 @@ func (s *Store) Namespaces() ([]Namespace, error) {
 // An empty namespace means all namespaces. Using the namespace-scoped lister when one
 // is given is not just tidier -- PodLister.Pods(ns).List() reads a namespace INDEX
 // maintained by the informer, so it does not scan every pod in the cluster.
-func (s *Store) Pods(namespace string) ([]Pod, error) {
+func (s *Store) Pods(namespace string) ([]domain.Pod, error) {
 	var (
 		list []*corev1.Pod
 		err  error
@@ -278,7 +279,7 @@ func (s *Store) Pods(namespace string) ([]Pod, error) {
 		return nil, fmt.Errorf("listing pods from cache: %w", err)
 	}
 
-	out := make([]Pod, 0, len(list))
+	out := make([]domain.Pod, 0, len(list))
 	for _, p := range list {
 		out = append(out, toPod(p, s.resolveOwner))
 	}

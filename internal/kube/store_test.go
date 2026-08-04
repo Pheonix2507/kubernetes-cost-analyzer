@@ -18,6 +18,7 @@ import (
 	k8stesting "k8s.io/client-go/testing"
 
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/config"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 )
 
 // These tests use k8s.io/client-go/kubernetes/fake, which implements the full
@@ -219,7 +220,7 @@ func TestStore_ResolvesPodToDeployment(t *testing.T) {
 	}
 	// The hash-suffixed ReplicaSet must NOT be the reported workload: its name changes
 	// on every rollout, which would reset each workload's cost history.
-	want := Workload{Kind: "Deployment", Name: "api"}
+	want := domain.Workload{Kind: "Deployment", Name: "api"}
 	if pods[0].Workload != want {
 		t.Errorf("Workload = %+v, want %+v", pods[0].Workload, want)
 	}
@@ -373,7 +374,7 @@ func TestStore_PodsNamespaceFilter(t *testing.T) {
 	}
 }
 
-func names(nodes []Node) []string {
+func names(nodes []domain.Node) []string {
 	out := make([]string, 0, len(nodes))
 	for _, n := range nodes {
 		out = append(out, n.Name)

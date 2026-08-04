@@ -1,4 +1,29 @@
-package kube
+// Package domain holds the vocabulary the whole application shares.
+//
+// WHY THIS PACKAGE EXISTS NOW AND NOT IN PHASE 1
+// ---------------------------------------------
+// These types started in internal/kube, which was correct while kube was their only
+// producer AND only consumer. Inventing a domain package before that would have been
+// architecture on speculation.
+//
+// Phase 2 changed the facts. There are now three packages that speak these concepts:
+//
+//	internal/kube            produces them from the Kubernetes API
+//	internal/httpapi         serves them over HTTP
+//	internal/store/postgres  persists them
+//
+// Leaving them in internal/kube would mean the PERSISTENCE layer imports a Kubernetes
+// CLIENT package, which inverts the dependency direction: storing a row has nothing to do
+// with client-go, and that import would drag informers and REST config into a package
+// whose job is SQL.
+//
+// So the shared vocabulary moves to the middle, and everything points inward at it. This
+// package imports nothing but the standard library, which is what makes that possible --
+// it can never introduce a cycle.
+//
+// Extracted from three real implementations rather than designed up front. That ordering
+// is the point: the shape of the abstraction was discovered, not guessed.
+package domain
 
 import "time"
 
