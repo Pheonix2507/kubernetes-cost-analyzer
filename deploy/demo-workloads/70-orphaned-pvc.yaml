@@ -1,0 +1,106 @@
+# FIXTURE 7 -- ORPHANED PERSISTENT VOLUME (the waste nobody is looking for)
+#
+# Detection target: Phase 6 "orphaned storage" recommendation.
+# Expected verdict:  FLAG. A provisioned, billed disk with no consumer.
+#
+# WHY STORAGE WASTE IS DIFFERENT AND WORSE
+# ----------------------------------------
+# Compute waste is at least visible: `kubectl get pods` shows you the pod, and
+# somebody owns it. An orphaned disk has no pod, appears in no dashboard, shows up in
+# no `kubectl top`, and nothing in Kubernetes will ever tell you it is there. It just
+# sits on the bill.
+#
+# It is also unbounded: a deleted pod stops costing money immediately, but a
+# PersistentVolume with `persistentVolumeReclaimPolicy: Retain` (the norm for
+# anything holding data anyone cares about) survives the deletion of everything that
+# referenced it -- and keeps billing forever. Clusters that are a few years old
+# routinely carry double-digit percentages of their storage spend as orphans.
+#
+# HOW THIS FIXTURE MANUFACTURES A GENUINE ORPHAN
+# ---------------------------------------------
+# A PVC on its own is not enough. kind's default StorageClass is
+# WaitForFirstConsumer, so an unconsumed PVC stays Pending forever and NO disk is
+# ever provisioned -- it costs nothing and is therefore a poor fixture.
+#
+# So we reproduce the way orphans actually happen: a one-shot migration Job mounts
+# the volume, does its work, and finishes. That first consumer triggers provisioning,
+# and the PVC becomes Bound to a real PV. `ttlSecondsAfterFinished` then has the Job
+# and its pod garbage-collected, leaving behind a Bound PVC, a provisioned PV, and
+# absolutely nothing referencing either.
+#
+# That is not a contrived scenario. It is the single most common origin of orphaned
+# storage in production: a data migration ran once, eighteen months ago, and nobody
+# cleaned up after it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: abandoned-migration-data
+  namespace: team-payments
+  labels:
+    team: payments
+    app.kubernetes.io/part-of: kca-fixtures
+    kca.io/expected-verdict: orphaned-storage
+  annotations:
+    kca.io/note: >-
+      Left behind by the one-shot migration Job in this same manifest. Bound to a
+      real PV with no consumer. This is what Phase 6 must detect.
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: standard
+  resources:
+    requests:
+      storage: 2Gi
+---
+# The Job that creates the orphan, then deletes itself.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: one-shot-migration
+  namespace: team-payments
+  labels:
+    team: payments
+    app.kubernetes.io/part-of: kca-fixtures
+spec:
+  # Deletes the Job AND its pod 30 seconds after completion, leaving the PVC bound
+  # and unreferenced. Without this the completed pod lingers and still looks like a
+  # consumer, which would mask the orphan we are trying to create.
+  ttlSecondsAfterFinished: 30
+  backoffLimit: 2
+  template:
+    metadata:
+      labels:
+        team: payments
+        app.kubernetes.io/part-of: kca-fixtures
+        # NOTE: deliberately NOT labelled component=long-running. `make demo-up`
+        # waits on that label for pod readiness, and a Job pod runs to Completion
+        # and never becomes Ready -- the wait would time out on it.
+        app.kubernetes.io/component: run-once
+    spec:
+      # Never restart a completed migration; a failed one should surface, not loop.
+      restartPolicy: Never
+      containers:
+        - name: migrate
+          image: busybox:1.37
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              echo "pretending to migrate data..."
+              dd if=/dev/zero of=/data/migrated.bin bs=1M count=64 2>/dev/null
+              echo "migration complete. exiting and leaving this 2Gi volume behind."
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 100m
+              memory: 64Mi
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: abandoned-migration-data

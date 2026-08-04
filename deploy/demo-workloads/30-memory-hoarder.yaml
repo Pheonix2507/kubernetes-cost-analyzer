@@ -1,0 +1,84 @@
+# FIXTURE 3 -- UNDER-REQUESTED (waste's dangerous twin)
+#
+# Detection target: Phase 6 "increase requests / OOM risk" recommendation.
+# Expected verdict:  FLAG -- but as a RELIABILITY risk, not a cost saving.
+#
+# WHY A COST TOOL MUST REPORT THIS
+# --------------------------------
+# Every other fixture wastes money. This one saves money and is dangerous, which is
+# why a tool that only ever says "reduce your requests" is professionally negligent.
+#
+# This container requests 64Mi and uses ~210Mi. Consequences:
+#
+#   1. The scheduler places it using the 64Mi figure, so it believes the node has far
+#      more free memory than it really does. It will happily overcommit that node.
+#   2. Memory is INCOMPRESSIBLE. A container over its CPU request just gets
+#      throttled and slows down. A node under memory pressure must kill something --
+#      and the kubelet evicts pods exceeding their requests FIRST.
+#   3. So this pod is both likely to be killed, and likely to get innocent
+#      neighbours killed alongside it.
+#
+# The recommendation here is "raise the request to ~256Mi", which INCREASES the
+# bill. That is the correct advice. A cost tool whose recommendations are all
+# one-directional is a tool nobody trusts with production.
+#
+# QoS class: Burstable -- and specifically the eviction-vulnerable kind, because
+# usage sits above the request.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-hoarder
+  namespace: team-search
+  labels:
+    app: memory-hoarder
+    team: search
+    app.kubernetes.io/part-of: kca-fixtures
+    kca.io/expected-verdict: under-requested
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: memory-hoarder
+  template:
+    metadata:
+      labels:
+        app: memory-hoarder
+        team: search
+        app.kubernetes.io/part-of: kca-fixtures
+        app.kubernetes.io/component: long-running
+        kca.io/expected-verdict: under-requested
+    spec:
+      containers:
+        - name: hoarder
+          image: busybox:1.37
+          # Allocates ~200Mi into a tmpfs, which is charged to this container's
+          # memory cgroup, then idles. Working set stays high for the pod's life --
+          # the steady-state memory profile of a service with an oversized cache.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              dd if=/dev/zero of=/ramdisk/cache bs=1M count=200 2>/dev/null
+              echo "allocated 200Mi, now idling"
+              sleep infinity
+          volumeMounts:
+            - name: ramdisk
+              mountPath: /ramdisk
+          resources:
+            requests:
+              cpu: 50m
+              # THE BUG: honest-looking, and wrong by more than 3x.
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              # Limit set high enough that it is NOT OOMKilled. We want a pod that
+              # runs while lying about its footprint -- a crashlooping pod is an
+              # obvious problem that monitoring already catches. This one is
+              # invisible until the node it lands on runs out of memory.
+              memory: 512Mi
+      volumes:
+        - name: ramdisk
+          emptyDir:
+            medium: Memory
+            sizeLimit: 256Mi

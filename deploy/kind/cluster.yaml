@@ -1,0 +1,86 @@
+# kind cluster definition for local development.
+#
+# Recreate the entire cluster with:  make cluster-up
+#
+# WHY THE NODE LABELS MATTER
+# --------------------------
+# A kind "node" is just a Docker container. It has no instance type, no region and
+# no price. Cost analysis is meaningless without those, so we label each node with
+# fake cloud metadata using the *real* well-known label keys that AWS, GCP and Azure
+# set on their own nodes:
+#
+#   node.kubernetes.io/instance-type   -> the pricing key (m5.large, m5.xlarge, ...)
+#   topology.kubernetes.io/region      -> regional price differences
+#   topology.kubernetes.io/zone        -> cross-zone traffic cost (later phase)
+#   kca.io/capacity-type               -> our own label: on-demand vs spot
+#
+# Because we use the same keys a cloud provider would, the Phase 3 pricing engine
+# reads node labels and works UNCHANGED against a real EKS/GKE cluster. Nothing in
+# our Go code will know or care that these nodes are fake.
+#
+# Kubelet is not allowed to self-assign arbitrary kubernetes.io labels: the
+# NodeRestriction admission plugin (enabled by default in kubeadm, so also in kind)
+# permits only a fixed allow-list. The three keys above are on that allow-list, and
+# kca.io/ is a non-kubernetes.io namespace so it is permitted too. This is why we can
+# get away with this at all.
+#
+# NOTE ON CAPACITY: every kind node reports the *host's* CPU and memory, so this
+# cluster's nodes will all report ~6 CPU / ~8Gi regardless of the instance type we
+# label them with. That is expected and does not matter, because a cost engine must
+# price what you *rented* (the instance type's spec, from a pricing catalogue), not
+# what the kubelet reports as allocatable. Phase 3's pricing profile declares the
+# vCPU/RAM/price for each instance type. See also: capacity vs allocatable.
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+name: kca-dev
+
+nodes:
+  # ---------------------------------------------------------------------------
+  # Control plane. Labelled t3.medium and carries the host port mappings.
+  # InitConfiguration is used for the first node; workers use JoinConfiguration.
+  # ---------------------------------------------------------------------------
+  - role: control-plane
+    kubeadmConfigPatches:
+      - |
+        kind: InitConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "node.kubernetes.io/instance-type=t3.medium,topology.kubernetes.io/region=ap-south-1,topology.kubernetes.io/zone=ap-south-1a,kca.io/capacity-type=on-demand"
+    # Host ports chosen to avoid collisions with things we run later:
+    #   13000 -> Grafana     (NOT 3000: the Next.js dev server owns that)
+    #   19090 -> Prometheus  (NOT 9090: avoids any local Prometheus install)
+    # A NodePort Service is reachable on EVERY node, so mapping only the
+    # control plane is enough to reach a pod scheduled on either worker.
+    extraPortMappings:
+      - containerPort: 30300
+        hostPort: 13000
+        protocol: TCP
+      - containerPort: 30090
+        hostPort: 19090
+        protocol: TCP
+
+  # ---------------------------------------------------------------------------
+  # Worker 1: on-demand m5.large in zone a.
+  # ---------------------------------------------------------------------------
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "node.kubernetes.io/instance-type=m5.large,topology.kubernetes.io/region=ap-south-1,topology.kubernetes.io/zone=ap-south-1a,kca.io/capacity-type=on-demand"
+
+  # ---------------------------------------------------------------------------
+  # Worker 2: SPOT m5.xlarge in a DIFFERENT zone.
+  # Deliberately different on all three axes (size, zone, capacity type) so that
+  # "why is namespace X more expensive than namespace Y" has a real answer that
+  # depends on where its pods landed. A single uniform node pool would make every
+  # cost identical and every recommendation untestable.
+  # ---------------------------------------------------------------------------
+  - role: worker
+    kubeadmConfigPatches:
+      - |
+        kind: JoinConfiguration
+        nodeRegistration:
+          kubeletExtraArgs:
+            node-labels: "node.kubernetes.io/instance-type=m5.xlarge,topology.kubernetes.io/region=ap-south-1,topology.kubernetes.io/zone=ap-south-1b,kca.io/capacity-type=spot"

@@ -1,0 +1,39 @@
+# Helm values for metrics-server on kind.
+#
+# WHAT METRICS-SERVER IS FOR
+# --------------------------
+# It serves the Metrics API (metrics.k8s.io) which powers `kubectl top` and the
+# Horizontal Pod Autoscaler. It holds ONLY the latest scrape in memory -- roughly a
+# 15-second window, no history at all.
+#
+# So it is NOT our cost data source. We install it because:
+#   1. `kubectl top` is how we sanity-check that our Prometheus numbers are sane.
+#   2. HPA behaviour becomes observable, which matters for right-sizing advice later.
+#
+# Historical usage comes from Prometheus. See deploy/monitoring/kps-values.yaml.
+
+args:
+  # REQUIRED ON KIND. metrics-server scrapes each kubelet over HTTPS and verifies
+  # the certificate against the cluster CA. kind's kubelets serve certificates that
+  # are self-signed for their internal name, so verification fails and every node
+  # reports as unavailable. This flag skips that verification.
+  #
+  # Never do this on a real cluster: it makes the kubelet connection vulnerable to
+  # interception. The correct production fix is to enable kubelet serving
+  # certificate rotation so the cluster CA signs them properly.
+  - --kubelet-insecure-tls
+  # Prefer the node's InternalIP. kind node hostnames are not resolvable from
+  # inside the cluster, so hostname-first ordering fails.
+  - --kubelet-preferred-address-types=InternalIP,Hostname,InternalDNS,ExternalDNS,ExternalIP
+  # Match our Prometheus scrape interval to keep the two roughly comparable.
+  - --metric-resolution=30s
+
+resources:
+  requests:
+    cpu: 25m
+    memory: 64Mi
+  limits:
+    # No CPU limit deliberately: CPU limits cause throttling, and a throttled
+    # metrics-server reports stale data. Memory is capped because a leak there
+    # should be killed, not allowed to pressure the node.
+    memory: 192Mi

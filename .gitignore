@@ -1,0 +1,31 @@
+# Build output
+/bin/
+/dist/
+*.exe
+
+# Go test / coverage artefacts
+*.test
+*.out
+coverage.html
+
+# Local configuration. NEVER commit this: it holds real connection strings and
+# passwords. Commit .env.example instead and let each engineer copy it.
+.env
+.env.local
+
+# Node / Next.js (from Phase 8 onwards)
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.pnpm-store/
+
+# Editors and OS noise
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/settings.json.example
+
+# Local scratch space
+/tmp/
+/scratch/

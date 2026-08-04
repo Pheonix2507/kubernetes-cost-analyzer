@@ -1,0 +1,85 @@
+# FIXTURE 5 -- IDLE / ABANDONED
+#
+# Detection target: Phase 6 "idle resource" recommendation.
+# Expected verdict:  FLAG -- and the recommendation must be DELETE, not RESIZE.
+#
+# WHY THIS IS A SEPARATE FIXTURE FROM over-provisioned-api
+# -------------------------------------------------------
+# Both reserve far more than they use, so a crude "usage << request" rule flags them
+# identically. But the correct ACTION differs completely:
+#
+#   over-provisioned-api  -> does real work, is merely oversized. RIGHT-SIZE it.
+#                            Saving: the difference. Risk of acting: low.
+#   idle-service          -> does NOTHING. Zero CPU, no traffic, no endpoints hit.
+#                            DELETE it. Saving: 100%. Risk of acting: it might be a
+#                            disaster-recovery standby or a quarterly batch job.
+#
+# A recommendation engine that cannot tell these apart gives dangerous advice. So
+# the signal is not utilisation alone -- it is utilisation PLUS evidence of traffic.
+# This fixture has a Service with no traffic reaching it, which is why the Service
+# object below is part of the fixture and not decoration: Phase 6 should correlate
+# workload idleness with request-rate metrics before recommending deletion.
+#
+# THE HARDEST PART OF IDLE DETECTION IS SOCIAL, NOT TECHNICAL: nobody will let you
+# delete anything on the strength of a 24-hour window. Real recommendations need
+# weeks of history and an owner to confirm -- which is exactly why we persist
+# history in Postgres (Phase 7) instead of reading a live gauge.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: idle-service
+  namespace: team-search
+  labels:
+    app: idle-service
+    team: search
+    app.kubernetes.io/part-of: kca-fixtures
+    kca.io/expected-verdict: idle
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: idle-service
+  template:
+    metadata:
+      labels:
+        app: idle-service
+        team: search
+        app.kubernetes.io/part-of: kca-fixtures
+        app.kubernetes.io/component: long-running
+        kca.io/expected-verdict: idle
+    spec:
+      containers:
+        - name: idle
+          image: busybox:1.37
+          # `sleep infinity` is as close to zero CPU as a running container gets:
+          # the process blocks in a syscall and is never scheduled again. Memory is
+          # a couple of hundred KiB of busybox. This is what an abandoned service
+          # looks like -- alive, healthy, and completely pointless.
+          command: ["/bin/sh", "-c", "sleep infinity"]
+          resources:
+            # Someone provisioned this generously, then the project was cancelled.
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+---
+# The Service is part of the fixture: it gives Phase 6 something to check for
+# traffic against. An idle Deployment BEHIND a Service that receives no requests is
+# a far stronger deletion signal than low CPU alone.
+apiVersion: v1
+kind: Service
+metadata:
+  name: idle-service
+  namespace: team-search
+  labels:
+    app: idle-service
+    app.kubernetes.io/part-of: kca-fixtures
+spec:
+  selector:
+    app: idle-service
+  ports:
+    - port: 80
+      targetPort: 80
+      protocol: TCP

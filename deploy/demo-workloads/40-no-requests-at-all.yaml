@@ -1,0 +1,70 @@
+# FIXTURE 4 -- NO REQUESTS AT ALL (the fixture that breaks naive cost engines)
+#
+# Detection target: Phase 6 "unattributable cost / set requests" recommendation.
+# Expected verdict:  FLAG. This pod consumes real resources and can be billed zero.
+#
+# WHY THIS FIXTURE EXISTS: IT IS A TRAP FOR OUR OWN ENGINE
+# -------------------------------------------------------
+# The obvious way to compute pod cost is:
+#
+#     cost = requested_cpu * cpu_price + requested_memory * memory_price
+#
+# Run that against this pod and you get EXACTLY ZERO, because it requests nothing.
+# The pod is real, it occupies a node, it consumes CPU and memory, and a naive
+# engine reports it as free. Worse, the cost is not lost -- it is silently smeared
+# across every other team's allocation, so everyone else is over-billed to hide it.
+#
+# This is why OpenCost and Kubecost bill on:
+#
+#     max(request, usage)
+#
+# not on request alone. That formula is the whole reason this fixture is here, and
+# Phase 4 must produce a NON-ZERO cost for this pod. If it reports zero, the cost
+# engine is wrong -- and without this fixture, every test would still pass.
+#
+# QoS class: BestEffort -- the FIRST thing the kubelet evicts under node pressure,
+# and the last thing anyone notices is missing.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: no-requests-at-all
+  namespace: team-search
+  labels:
+    app: no-requests-at-all
+    team: search
+    app.kubernetes.io/part-of: kca-fixtures
+    kca.io/expected-verdict: unattributable
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: no-requests-at-all
+  template:
+    metadata:
+      labels:
+        app: no-requests-at-all
+        team: search
+        app.kubernetes.io/part-of: kca-fixtures
+        app.kubernetes.io/component: long-running
+        kca.io/expected-verdict: unattributable
+    spec:
+      containers:
+        - name: freeloader
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          # DELIBERATELY ABSENT: no `resources:` block whatsoever.
+          #
+          # This is not a mistake in the fixture -- it is the single most common
+          # real-world configuration in clusters that have never been cost-audited,
+          # because Kubernetes does not require requests and nothing complains.
+          #
+          # Note there is also no LimitRange in this namespace. A LimitRange with
+          # defaultRequest would inject requests automatically, which is the usual
+          # production fix. Phase 6 should recommend exactly that.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 10

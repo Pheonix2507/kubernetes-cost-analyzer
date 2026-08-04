@@ -1,0 +1,98 @@
+# FIXTURE 2 -- RIGHT-SIZED  *** THE CONTROL CASE ***
+#
+# Detection target: Phase 6 "right-size requests" recommendation.
+# Expected verdict:  DO NOT FLAG.
+#
+# WHY THIS FIXTURE IS THE MOST IMPORTANT ONE IN THIS DIRECTORY
+# -----------------------------------------------------------
+# Every other fixture here is wasteful in some way. If our recommendation engine
+# only ever sees wasteful workloads, then a rule that returns "everything is
+# wasteful" -- or one that ignores its inputs entirely and always returns true --
+# looks perfectly correct on every input we test it against.
+#
+# This workload exists solely to be a negative case. A cost analyser that flags a
+# genuinely well-tuned service is worse than useless: engineers learn to ignore its
+# output, and then it cannot help them with the real waste either. False positives
+# are the failure mode that kills adoption of tools like this.
+#
+# So: Phase 6 is not "done" when it finds the waste. It is done when it finds the
+# waste AND stays silent about this one.
+#
+# Unlike the others, this container does REAL work: a calibrated CPU loop and a
+# real memory allocation, tuned so usage lands at roughly 70-85% of its requests --
+# which is what a properly sized production service actually looks like.
+#
+# QoS class: Burstable (limits set above requests, leaving burst headroom).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: right-sized-worker
+  namespace: team-platform
+  labels:
+    app: right-sized-worker
+    team: platform
+    app.kubernetes.io/part-of: kca-fixtures
+    kca.io/expected-verdict: right-sized
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: right-sized-worker
+  template:
+    metadata:
+      labels:
+        app: right-sized-worker
+        team: platform
+        app.kubernetes.io/part-of: kca-fixtures
+        app.kubernetes.io/component: long-running
+        kca.io/expected-verdict: right-sized
+    spec:
+      containers:
+        - name: worker
+          image: busybox:1.37
+          # Two things happen here:
+          #
+          # 1. MEMORY: dd fills a memory-backed volume with 20Mi of zeroes. A
+          #    tmpfs (emptyDir medium: Memory) is charged to the container's own
+          #    cgroup, so this shows up as ~20Mi of genuine working set -- unlike a
+          #    normal disk write, which would not count as memory usage at all.
+          #
+          # 2. CPU: a busy loop of shell arithmetic followed by a sleep. The
+          #    ITERATIONS/SLEEP ratio is the duty cycle, and therefore the CPU
+          #    usage. These values are calibrated by measurement (kubectl top),
+          #    not guessed -- adjust ITERATIONS if you change the base image, since
+          #    shell arithmetic speed differs between busybox and alpine.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              dd if=/dev/zero of=/ramdisk/ballast bs=1M count=20 2>/dev/null
+              ITERATIONS=12000
+              SLEEP=0.35
+              while true; do
+                i=0
+                while [ "$i" -lt "$ITERATIONS" ]; do i=$((i+1)); done
+                sleep "$SLEEP"
+              done
+          volumeMounts:
+            - name: ramdisk
+              mountPath: /ramdisk
+          resources:
+            requests:
+              cpu: 50m
+              memory: 32Mi
+            limits:
+              # Headroom above the request, not equal to it. Setting cpu limit ==
+              # request would make this pod Guaranteed but would also throttle it
+              # to exactly the request, producing a suspiciously perfect 100%
+              # utilisation. Real right-sized services burst.
+              cpu: 200m
+              memory: 64Mi
+      volumes:
+        - name: ramdisk
+          emptyDir:
+            medium: Memory
+            # sizeLimit is important: a memory-backed emptyDir with no limit can
+            # consume all node memory and evict unrelated pods on the node.
+            sizeLimit: 48Mi

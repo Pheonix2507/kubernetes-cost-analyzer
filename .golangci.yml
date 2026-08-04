@@ -1,0 +1,111 @@
+# golangci-lint v2 configuration.
+#
+# WHY A LINTER AT ALL: `go build` only proves the code compiles. It says nothing
+# about unchecked errors, lost error context, or accidentally shadowed variables --
+# the three things that actually cause production incidents in Go services.
+#
+# Run with: make lint
+version: "2"
+
+run:
+  timeout: 5m
+  tests: true
+
+linters:
+  # "standard" = errcheck, govet, ineffassign, staticcheck, unused.
+  default: standard
+  enable:
+    # Forces http.Response.Body.Close(). Leaking response bodies leaks TCP
+    # connections; this bites hard once the collector starts querying Prometheus
+    # on a loop.
+    - bodyclose
+    # Catches errors compared with == instead of errors.Is, and %v where %w was
+    # meant. Directly protects the error-wrapping discipline we rely on.
+    - errorlint
+    # DELIBERATELY NOT ENABLED: contextcheck.
+    #
+    # Its intent is good (catch a request path that silently swaps to
+    # context.Background()), but on this codebase it was wrong on all three of its
+    # findings: two were plain false positives on calls that DO pass r.Context(),
+    # and the third flagged the context.Background() in httpapi.(*Server).shutdown
+    # -- which is not a mistake but the ONE place it must be Background, because a
+    # cancelled parent cannot grant a shutdown deadline (see the long comment there).
+    #
+    # A linter that is wrong on its first run teaches you to ignore lint output, and
+    # then it cannot help you with the real findings either. Suppressing three
+    # false positives with //nolint would be worse: it hides the reasoning at the
+    # call sites and still leaves the noise. Revisit if the tool improves.
+    #
+    # Flags loop-variable capture, shadowed err, and similar sharp edges.
+    - copyloopvar
+    # log/slog misuse: odd numbers of key/value args, non-constant keys. We build
+    # the whole observability story on slog, so this is worth enforcing.
+    - sloglint
+    - misspell
+    - unconvert
+    - wastedassign
+    - nilerr
+    - revive
+
+  settings:
+    errcheck:
+      # A type assertion without the ok form panics on the wrong type. Always check.
+      check-type-assertions: true
+      # check-blank stays FALSE on purpose.
+      #
+      # Turning it on flags `_, _ = w.Write(...)`, but that explicit blank assignment
+      # is the idiomatic Go way to say "I have considered this error and am ignoring
+      # it deliberately" -- distinct from a bare `w.Write(...)` which errcheck still
+      # catches. Flagging the explicit form leaves no way to express the intent
+      # except a //nolint on every line, which is pure noise.
+      #
+      # Where we ignore a Write error, the reason is documented at the call site: the
+      # body is already fully buffered, so a failure means the client disconnected
+      # and there is nothing left to do about it.
+      check-blank: false
+    govet:
+      enable-all: true
+      disable:
+        # Struct field alignment micro-optimisation. Noisy and rarely worth it;
+        # we care about readable structs more than a few padding bytes.
+        - fieldalignment
+    sloglint:
+      # kv-only is NOT set. An earlier version set it true to force key-value pairs
+      # everywhere, which flagged the slog.Int/slog.Float64 attributes in the request
+      # logger -- but typed attributes are the BETTER form there: they avoid boxing
+      # every value into an `any` and they catch a type mistake at compile time. On a
+      # per-request hot path that is the right call, so the config was wrong, not the
+      # code.
+      #
+      # Mixing the two styles is allowed: key-value for ordinary call sites where
+      # readability wins, typed attributes on hot paths where allocations matter.
+      #
+      # What IS worth enforcing is that a key is never built by string concatenation,
+      # since dynamic keys make logs unqueryable in Grafana or Loki.
+      no-raw-keys: false
+      static-msg: false
+    revive:
+      rules:
+        - name: exported
+          # Exported identifiers in a package used across the codebase should say
+          # what they are for.
+          arguments: ["checkPrivateReceivers", "disableStutteringCheck"]
+
+  exclusions:
+    rules:
+      # Test files legitimately ignore errors in setup and use long functions.
+      - path: _test\.go
+        linters:
+          - errcheck
+          - bodyclose
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        # Groups our own imports into their own block, separate from stdlib and
+        # third-party. Makes dependency direction visible at a glance.
+        - github.com/Pheonix2507/kubernetes-cost-analyzer

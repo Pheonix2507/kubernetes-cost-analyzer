@@ -1,0 +1,25 @@
+# Keeps whitespace consistent across editors so diffs stay clean.
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# Go is gofmt-formatted: tabs, and gofmt decides the width.
+[*.go]
+indent_style = tab
+
+# Make is tab-sensitive by design; spaces here cause "missing separator" errors.
+[Makefile]
+indent_style = tab
+
+[*.{yaml,yml,json,ts,tsx,js,jsx,css}]
+indent_style = space
+indent_size = 2
+
+[*.md]
+trim_trailing_whitespace = false

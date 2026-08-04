@@ -1,0 +1,35 @@
+# Keep the Docker build context small and the build cache stable.
+#
+# WHY THIS MATTERS: every file in the build context is sent to the Docker daemon
+# and any change to it can invalidate cache layers. Shipping node_modules or .git
+# into a Go build makes builds slower and images fatter for zero benefit. It is
+# also a security control: without this, a stray .env would be copied into the
+# image by a careless `COPY . .`.
+
+.git/
+.gitignore
+.github/
+
+# Never let local secrets into an image layer.
+.env
+.env.local
+
+# Not needed to compile Go.
+node_modules/
+.next/
+web/
+deploy/
+docs/
+*.md
+Makefile
+.golangci.yml
+.editorconfig
+
+# Build output and test artefacts.
+bin/
+dist/
+*.test
+*.out
+coverage.html
+
+.DS_Store

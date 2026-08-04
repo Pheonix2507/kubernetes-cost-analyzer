@@ -1,0 +1,49 @@
+# Fixture namespaces.
+#
+# Files in this directory are numbered because `kubectl apply -f <dir>` processes
+# them in alphabetical order, and namespaces must exist before anything is created
+# inside them.
+#
+# WHY THE NAMESPACE LABELS MATTER
+# -------------------------------
+# A namespace name alone is a poor cost dimension. Real organisations need to answer
+# "what does the Payments TEAM spend?" and "how much of our bill is non-production?"
+# -- questions that cut across namespaces. So the allocation dimensions live in
+# labels, not in the name:
+#
+#   team         -> who to bill (the cost centre owner)
+#   cost-centre  -> the finance code the bill rolls up to
+#   environment  -> lets us separate prod spend from dev waste
+#
+# Phase 5's API will group cost by any of these. This is why kps-values.yaml sets
+# kube-state-metrics' metricLabelsAllowlist -- without it these labels never reach
+# Prometheus and none of these groupings are possible.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-payments
+  labels:
+    team: payments
+    cost-centre: cc-1001
+    environment: production
+    app.kubernetes.io/part-of: kca-fixtures
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-platform
+  labels:
+    team: platform
+    cost-centre: cc-2002
+    environment: production
+    app.kubernetes.io/part-of: kca-fixtures
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: team-search
+  labels:
+    team: search
+    cost-centre: cc-3003
+    environment: staging
+    app.kubernetes.io/part-of: kca-fixtures

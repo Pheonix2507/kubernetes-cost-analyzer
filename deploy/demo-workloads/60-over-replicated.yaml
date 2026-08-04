@@ -1,0 +1,110 @@
+# FIXTURE 6 -- OVER-REPLICATED (waste on the axis most tools ignore)
+#
+# Detection target: Phase 6 "reduce replica count" recommendation.
+# Expected verdict:  FLAG -- reduce replicas, do NOT shrink the per-pod requests.
+#
+# WHY THIS AXIS MATTERS
+# ---------------------
+# Every other fixture is wasteful VERTICALLY: one pod reserving too much. This one
+# is perfectly sized per pod -- the requests genuinely match what each pod uses --
+# and wasteful HORIZONTALLY: there are six of them and two would do.
+#
+# This is important because a right-sizing engine that only inspects per-container
+# requests will examine this workload and correctly report "no action needed" on
+# every single pod, while the Deployment as a whole wastes 4x its useful spend.
+# Per-pod analysis is a local optimum; the waste is only visible at the controller
+# level. So Phase 6 must aggregate to the OWNER (Deployment/StatefulSet), not just
+# evaluate pods in isolation -- which in turn is why Phase 1's informers need to
+# resolve pod -> ReplicaSet -> Deployment ownership chains.
+#
+# QoS class: GUARANTEED -- requests == limits for every resource. The strongest
+# scheduling class Kubernetes offers, and note what that buys us here: absolutely
+# nothing, because the problem is the replica count. A pod can be perfectly
+# configured and still be pure waste.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: over-replicated
+  namespace: team-platform
+  labels:
+    app: over-replicated
+    team: platform
+    app.kubernetes.io/part-of: kca-fixtures
+    kca.io/expected-verdict: over-replicated
+spec:
+  # Six replicas of a service that would be comfortably served by two.
+  replicas: 6
+  selector:
+    matchLabels:
+      app: over-replicated
+  template:
+    metadata:
+      labels:
+        app: over-replicated
+        team: platform
+        app.kubernetes.io/part-of: kca-fixtures
+        app.kubernetes.io/component: long-running
+        kca.io/expected-verdict: over-replicated
+    spec:
+      containers:
+        - name: replica
+          image: busybox:1.37
+          # This container MUST do real work, or the fixture defeats its own purpose.
+          #
+          # An earlier version of this file just ran `sleep infinity`, which measured
+          # 1-2m CPU and 0Mi against a 25m/32Mi request -- only 4-8% utilised. That
+          # made it indistinguishable from over-provisioned-api: a per-pod rule would
+          # have flagged it, and the "waste is only visible in aggregate" lesson would
+          # have been untestable.
+          #
+          # So it carries a ~20Mi ballast and a CPU loop whose request was fitted to
+          # its MEASURED usage (see the calibration note below). Now every per-pod
+          # rule correctly finds nothing wrong, and the only detectable waste is the
+          # replica count.
+          command:
+            - /bin/sh
+            - -c
+            - |
+              set -eu
+              dd if=/dev/zero of=/ramdisk/ballast bs=1M count=20 2>/dev/null
+              # CALIBRATION NOTE -- MEASURED, NOT GUESSED, AND IT TOOK THREE TRIES
+              #
+              # This pod is Guaranteed (requests == limits), so its CPU limit is a hard
+              # cgroup quota. That makes usage a function of the LIMIT as much as of
+              # the duty cycle, and the relationship is not linear:
+              #
+              #   SLEEP=0.8,  limit 25m -> measured 12m (50% of request). AMBIGUOUS:
+              #               a 60%-threshold right-sizing rule would flag it.
+              #   SLEEP=0.15, limit 25m -> measured 29m (116%). WORSE: now pinned at
+              #               the quota and throttled, so a rule could flag it as
+              #               UNDER-provisioned -- the opposite category.
+              #   SLEEP=0.8,  limit 15m -> sits in a healthy band, not throttled.
+              #
+              # The lesson generalises: for a Guaranteed pod, do not tune the workload
+              # to hit the request -- set the request to fit the measured workload.
+              # That is exactly the advice Phase 6 will give real users.
+              ITERATIONS=12000
+              SLEEP=0.8
+              while true; do
+                i=0
+                while [ "$i" -lt "$ITERATIONS" ]; do i=$((i+1)); done
+                sleep "$SLEEP"
+              done
+          volumeMounts:
+            - name: ramdisk
+              mountPath: /ramdisk
+          resources:
+            # requests == limits on BOTH cpu and memory => Guaranteed QoS.
+            # Sized to genuinely fit the workload, so no per-pod rule has anything
+            # legitimate to complain about.
+            requests:
+              cpu: 15m
+              memory: 32Mi
+            limits:
+              cpu: 15m
+              memory: 32Mi
+      volumes:
+        - name: ramdisk
+          emptyDir:
+            medium: Memory
+            sizeLimit: 28Mi

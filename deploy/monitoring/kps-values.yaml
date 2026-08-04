@@ -1,0 +1,194 @@
+# Helm values for kube-prometheus-stack -- our actual cost data source.
+#
+# Sized deliberately for a 6 CPU / 8 GiB Docker VM running a 3-node kind cluster
+# plus fixture workloads plus our own two binaries. The upstream chart defaults
+# assume a real cluster and will make this machine swap.
+#
+# THE TWO METRIC FAMILIES THAT MATTER
+# -----------------------------------
+# Everything the cost engine computes comes from two sources this chart installs:
+#
+#   kube-state-metrics -> what was REQUESTED
+#       kube_pod_container_resource_requests{resource="cpu"|"memory"}
+#       This is what you are billed for, because the scheduler reserves it on a node
+#       whether or not the container ever touches it.
+#
+#   kubelet / cAdvisor -> what was USED
+#       container_cpu_usage_seconds_total   (a counter -- needs rate())
+#       container_memory_working_set_bytes  (a gauge  -- read directly)
+#
+#   waste = requested - used
+#
+# That subtraction is the entire product. Everything else is aggregation and
+# presentation.
+
+# -----------------------------------------------------------------------------
+# Alertmanager: off.
+# We have no alert routing destination yet, and it costs ~100 MiB for nothing.
+# Prometheus still EVALUATES alert rules, so we can see them firing in the UI --
+# we just cannot route them anywhere. Re-enable in Phase 9.
+# -----------------------------------------------------------------------------
+alertmanager:
+  enabled: false
+
+# -----------------------------------------------------------------------------
+# Components that do not exist as scrapable Services on kind.
+#
+# On a kubeadm cluster (which kind is), the controller-manager, scheduler and etcd
+# run as static pods bound to 127.0.0.1 inside the control-plane container. The
+# chart's ServiceMonitors cannot reach them, so they would sit permanently as
+# "down" targets and fire constant alerts. Disabling them keeps the target list
+# honest -- a monitoring stack full of known-broken targets trains you to ignore
+# real failures.
+# -----------------------------------------------------------------------------
+kubeControllerManager:
+  enabled: false
+kubeScheduler:
+  enabled: false
+kubeEtcd:
+  enabled: false
+kubeProxy:
+  enabled: false
+
+defaultRules:
+  create: true
+  rules:
+    # Match the disabled components above, or these rule groups reference metrics
+    # that will never exist.
+    etcd: false
+    kubeControllerManager: false
+    kubeProxy: false
+    kubeSchedulerAlerting: false
+    kubeSchedulerRecording: false
+
+# -----------------------------------------------------------------------------
+# Prometheus
+# -----------------------------------------------------------------------------
+prometheus:
+  service:
+    # NodePort + the kind extraPortMapping in deploy/kind/cluster.yaml gives us a
+    # stable http://localhost:19090 with no long-running `kubectl port-forward`
+    # process to babysit. A NodePort Service answers on EVERY node, which is why
+    # mapping only the control-plane container is sufficient.
+    type: NodePort
+    nodePort: 30090
+
+  prometheusSpec:
+    # 30s is a deliberate trade-off. Cost is computed over hours and days, so
+    # sub-minute resolution buys us nothing but doubles storage and CPU. Tighten
+    # this only if you need fine-grained spike detection.
+    scrapeInterval: 30s
+    evaluationInterval: 30s
+
+    # 7 days is enough to develop and test trend queries. Real deployments keep
+    # 15-90 days locally and push older blocks to object storage via Thanos or
+    # Mimir -- which is exactly why we roll cost data up into Postgres rather than
+    # relying on Prometheus retention for historical reporting.
+    retention: 7d
+    # Belt and braces: stop before the 5Gi volume fills, whichever limit hits first.
+    retentionSize: 4GiB
+
+    resources:
+      requests:
+        cpu: 200m
+        memory: 512Mi
+      limits:
+        memory: 1536Mi
+
+    # CRITICAL: without these four lines, Prometheus only discovers ServiceMonitors
+    # carrying this Helm release's labels. Our own ServiceMonitor in Phase 9 would
+    # be silently ignored -- the target simply never appears and nothing tells you
+    # why. Setting them false means "discover across the whole cluster".
+    serviceMonitorSelectorNilUsesHelmValues: false
+    podMonitorSelectorNilUsesHelmValues: false
+    ruleSelectorNilUsesHelmValues: false
+    scrapeConfigSelectorNilUsesHelmValues: false
+
+    storageSpec:
+      volumeClaimTemplate:
+        spec:
+          # kind ships the rancher local-path provisioner as the default
+          # StorageClass. It is WaitForFirstConsumer, so the PV is not created
+          # until the pod is scheduled -- worth knowing when a PVC sits Pending.
+          storageClassName: standard
+          accessModes: ["ReadWriteOnce"]
+          resources:
+            requests:
+              storage: 5Gi
+
+# -----------------------------------------------------------------------------
+# kube-state-metrics -- the source of everything "requested"
+# -----------------------------------------------------------------------------
+kube-state-metrics:
+  # THIS IS THE MOST IMPORTANT SETTING IN THE FILE for cost allocation.
+  #
+  # By default kube-state-metrics does NOT expose object labels as metric labels.
+  # Without this, kube_pod_labels does not carry your `team`, `app` or
+  # `cost-centre` labels, and you cannot answer "what does the payments team
+  # spend?" -- only "what does the payments namespace spend?", which breaks down
+  # the moment one namespace serves several teams.
+  #
+  # TRADE-OFF -- CARDINALITY: `[*]` means "expose every label". Each distinct label
+  # combination is a new time series. On a large cluster with churning pods and
+  # generated labels (pod-template-hash, controller-revision-hash) this is a
+  # classic way to OOM Prometheus. In production you allow-list the specific keys
+  # you allocate cost by, never `[*]`. We use `[*]` here because this cluster has
+  # ~10 pods and being able to explore freely is worth more than the cardinality.
+  metricLabelsAllowlist:
+    - pods=[*]
+    - namespaces=[*]
+    - nodes=[*]
+    - deployments=[*]
+    - persistentvolumeclaims=[*]
+  resources:
+    requests:
+      cpu: 20m
+      memory: 64Mi
+    limits:
+      memory: 192Mi
+
+# -----------------------------------------------------------------------------
+# node-exporter -- node-level capacity and utilisation (a DaemonSet: one pod per
+# node, which is the correct pattern for anything that measures a host)
+# -----------------------------------------------------------------------------
+prometheus-node-exporter:
+  resources:
+    requests:
+      cpu: 10m
+      memory: 32Mi
+    limits:
+      memory: 96Mi
+
+prometheusOperator:
+  resources:
+    requests:
+      cpu: 25m
+      memory: 96Mi
+    limits:
+      memory: 256Mi
+
+# -----------------------------------------------------------------------------
+# Grafana
+# -----------------------------------------------------------------------------
+grafana:
+  enabled: true
+  # Chart default login is admin / prom-operator. Left as the default on purpose:
+  # this is a throwaway local cluster, and hardcoding a password here would put a
+  # credential in git for no security benefit. Phase 9 wires it to a Secret.
+  service:
+    type: NodePort
+    nodePort: 30300
+  # Charts render timestamps in the browser timezone by default; pinning it keeps
+  # dashboard screenshots consistent with our Asia/Kolkata reporting boundaries.
+  defaultDashboardsTimezone: Asia/Kolkata
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 256Mi
+  # Persistence off: dashboards are code (Phase 9 ships them as ConfigMaps), so
+  # there is nothing worth persisting. Anything you hand-draw in the UI SHOULD be
+  # lost -- that is what stops dashboards becoming undocumented production assets.
+  persistence:
+    enabled: false

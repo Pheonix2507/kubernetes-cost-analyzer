@@ -1,0 +1,67 @@
+# FIXTURE 1 -- OVER-PROVISIONED (the single most common real-world waste pattern)
+#
+# Detection target: Phase 6 "right-size requests" recommendation.
+# Expected verdict:  FLAG. Reduce CPU request ~500m -> ~10m, memory ~512Mi -> ~32Mi.
+#
+# THE SCENARIO THIS IMITATES
+# --------------------------
+# Someone copied a resources block from another service two years ago, and nobody
+# has looked since. The service works perfectly, so nothing ever prompts a review.
+# This is the bulk of wasted spend in almost every real cluster: not broken things,
+# but working things that reserve far more than they use.
+#
+# WHY IT COSTS MONEY EVEN THOUGH IT IS IDLE
+# -----------------------------------------
+# The scheduler subtracts the REQUEST from a node's allocatable capacity when it
+# places the pod, whether or not the container ever touches it. 2 replicas x 500m
+# = 1 full core permanently reserved and unusable by anything else. You pay for the
+# node that reservation forced you to run. Usage is irrelevant to the bill --
+# requests are what you are billed for.
+#
+# QoS class: Burstable (requests set, limits differ from requests).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: over-provisioned-api
+  namespace: team-payments
+  labels:
+    app: over-provisioned-api
+    team: payments
+    app.kubernetes.io/part-of: kca-fixtures
+    kca.io/expected-verdict: over-provisioned
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: over-provisioned-api
+  template:
+    metadata:
+      labels:
+        app: over-provisioned-api
+        team: payments
+        app.kubernetes.io/part-of: kca-fixtures
+        app.kubernetes.io/component: long-running
+        kca.io/expected-verdict: over-provisioned
+    spec:
+      containers:
+        - name: api
+          # An idle nginx: a genuinely working service that consumes almost nothing.
+          image: nginx:1.27-alpine
+          ports:
+            - containerPort: 80
+          resources:
+            # Reserves half a core and half a gig...
+            requests:
+              cpu: 500m
+              memory: 512Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          # ...while actually using roughly 1m CPU and 10Mi memory.
+          # That is ~0.2% of the CPU reservation and ~2% of the memory reservation.
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 80
+            initialDelaySeconds: 2
+            periodSeconds: 10
