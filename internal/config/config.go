@@ -76,6 +76,7 @@ type Config struct {
 
 	API        API
 	Database   Database
+	Kube       Kube
 	Prometheus Prometheus
 	Collector  Collector
 }
@@ -136,6 +137,50 @@ type Database struct {
 	ConnMaxLifetime time.Duration
 }
 
+// Kube holds settings for talking to the Kubernetes API server.
+type Kube struct {
+	// ConfigPath is an explicit kubeconfig path. Empty means: try in-cluster
+	// credentials first, then fall back to the standard kubeconfig discovery
+	// (the KUBECONFIG env var, else ~/.kube/config). See internal/kube.RESTConfig.
+	ConfigPath string
+
+	// Context selects a kubeconfig context. Empty uses the current-context.
+	//
+	// Worth setting explicitly for anything destructive. It is not destructive here
+	// -- we only ever read -- but "which cluster am I pointed at" is the question
+	// behind most self-inflicted production incidents.
+	Context string
+
+	// ResyncInterval makes every informer re-deliver its entire cache to event
+	// handlers on a timer. ZERO (the default) disables it.
+	//
+	// Resync is NOT a refresh: the watch already keeps the cache current, and a
+	// resync re-sends objects that have not changed. It exists for CONTROLLERS,
+	// which use it to re-reconcile drift between desired and actual state that
+	// happened outside Kubernetes. We only read the cache, so a resync would burn
+	// CPU re-processing identical objects to no effect.
+	ResyncInterval time.Duration
+
+	// CacheSyncTimeout bounds the initial List-and-populate on startup. Exceeding it
+	// is fatal: an informer that never syncs would serve empty inventory and report
+	// a cluster with no cost, which is worse than not starting.
+	CacheSyncTimeout time.Duration
+
+	// QPS and Burst are CLIENT-SIDE rate limits, and the defaults are a trap.
+	//
+	// client-go ships with QPS=5 and Burst=10. Those are per-process limits on
+	// requests to the API server, enforced locally before anything leaves the
+	// process. Exceed them and client-go SILENTLY QUEUES your calls -- no error, no
+	// log, just latency that looks like a slow API server.
+	//
+	// It is the classic "why is my controller so slow" bug, and the answer is never
+	// in the API server's metrics because the requests never arrived. Informers make
+	// few calls once synced, but the initial List burst across several resource types
+	// can brush against 5 QPS, so we raise it deliberately.
+	QPS   float32
+	Burst int
+}
+
 // Prometheus holds settings for querying Prometheus (our usage data source).
 type Prometheus struct {
 	URL     string
@@ -186,6 +231,15 @@ func Load() (*Config, error) {
 			MaxOpenConns:    int32(l.integer("DB_MAX_OPEN_CONNS", 20)),
 			MinIdleConns:    int32(l.integer("DB_MIN_IDLE_CONNS", 5)),
 			ConnMaxLifetime: l.duration("DB_CONN_MAX_LIFETIME", 30*time.Minute),
+		},
+
+		Kube: Kube{
+			ConfigPath:       l.str("KUBECONFIG", ""),
+			Context:          l.str("KUBE_CONTEXT", ""),
+			ResyncInterval:   l.duration("KUBE_RESYNC_INTERVAL", 0),
+			CacheSyncTimeout: l.duration("KUBE_CACHE_SYNC_TIMEOUT", 60*time.Second),
+			QPS:              float32(l.float("KUBE_QPS", 50)),
+			Burst:            l.integer("KUBE_BURST", 100),
 		},
 
 		Prometheus: Prometheus{
@@ -274,6 +328,26 @@ func (c *Config) Validate() error {
 			c.Database.MinIdleConns, ErrInvalid))
 	}
 
+	if c.Kube.CacheSyncTimeout <= 0 {
+		errs = append(errs, fmt.Errorf("KUBE_CACHE_SYNC_TIMEOUT=%s: %w (must be positive)",
+			c.Kube.CacheSyncTimeout, ErrInvalid))
+	}
+	if c.Kube.QPS <= 0 {
+		errs = append(errs, fmt.Errorf("KUBE_QPS=%v: %w (must be positive)", c.Kube.QPS, ErrInvalid))
+	}
+	// Burst below QPS makes the burst allowance the real ceiling and the QPS setting a
+	// lie, which is exactly the kind of misconfiguration that presents as unexplained
+	// latency rather than as an error.
+	if c.Kube.Burst < int(c.Kube.QPS) {
+		errs = append(errs, fmt.Errorf("KUBE_BURST=%d: %w (must be >= KUBE_QPS=%v)",
+			c.Kube.Burst, ErrInvalid, c.Kube.QPS))
+	}
+	// A negative resync is nonsense; zero is the meaningful "disabled" value.
+	if c.Kube.ResyncInterval < 0 {
+		errs = append(errs, fmt.Errorf("KUBE_RESYNC_INTERVAL=%s: %w (must not be negative)",
+			c.Kube.ResyncInterval, ErrInvalid))
+	}
+
 	if c.Collector.Workers <= 0 {
 		errs = append(errs, fmt.Errorf("COLLECTOR_WORKERS=%d: %w (must be positive)",
 			c.Collector.Workers, ErrInvalid))
@@ -355,6 +429,20 @@ func (l *loader) integer(key string, def int) int {
 		return def
 	}
 	return n
+}
+
+// float parses a base-10 floating point value.
+func (l *loader) float(key string, def float64) float64 {
+	raw, ok := os.LookupEnv(key)
+	if !ok || strings.TrimSpace(raw) == "" {
+		return def
+	}
+	f, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+	if err != nil {
+		l.errs = append(l.errs, fmt.Errorf("%s=%q: %w", key, raw, err))
+		return def
+	}
+	return f
 }
 
 // err returns all accumulated errors joined together, or nil if there were none.

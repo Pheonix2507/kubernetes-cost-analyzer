@@ -142,6 +142,22 @@ demo-up: ## Apply the demo fixture workloads
 demo-down: ## Remove the demo fixture workloads
 	@kubectl delete -f deploy/demo-workloads/ --ignore-not-found=true
 
+.PHONY: rbac-up
+rbac-up: ## Apply the ServiceAccount, ClusterRole and ClusterRoleBinding
+	kubectl apply -f deploy/rbac/
+
+.PHONY: rbac-verify
+rbac-verify: ## Prove the RBAC grants exactly what is needed and nothing more
+	# `kubectl auth can-i --as=` impersonates the ServiceAccount and asks the API
+	# server's authoriser directly. This tests the REAL RBAC without deploying anything,
+	# which is why we can keep the fast local dev loop and still know the ClusterRole is
+	# correct before Phase 10 ever builds a Deployment.
+	#
+	# The NEGATIVE assertions matter more than the positive ones. Any ClusterRole that
+	# is too permissive still passes every "can I read?" check -- only "can I delete?"
+	# returning no proves least privilege actually holds.
+	@bash deploy/rbac/verify.sh
+
 # =============================================================================
 # Database
 # =============================================================================

@@ -77,6 +77,20 @@ func writeJSON(w http.ResponseWriter, r *http.Request, status int, payload any) 
 	_, _ = w.Write(buf.Bytes())
 }
 
+// logError records a handler failure against the request-scoped logger.
+//
+// Separating this from writeError is deliberate: the LOG gets the full error, and the
+// CLIENT gets a generic message. Returning err.Error() to the caller is the easy path
+// and it leaks internal hostnames, SQL fragments and cache internals to whoever can
+// reach the endpoint. The request ID appears in both, which is what lets an engineer
+// tie a user's complaint to the exact log line without ever exposing the detail.
+func logError(r *http.Request, action string, err error) {
+	logging.FromContext(r.Context()).Error("request failed",
+		"action", action,
+		"error", err,
+	)
+}
+
 // writeError sends a structured error response, attaching the request ID
 // automatically so every error is traceable back to its log line.
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {

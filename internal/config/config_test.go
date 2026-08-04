@@ -15,6 +15,8 @@ var allKeys = []string{
 	"API_HTTP_ADDR", "API_READ_TIMEOUT", "API_WRITE_TIMEOUT",
 	"API_IDLE_TIMEOUT", "API_SHUTDOWN_TIMEOUT",
 	"DATABASE_URL", "DB_MAX_OPEN_CONNS", "DB_MIN_IDLE_CONNS", "DB_CONN_MAX_LIFETIME",
+	"KUBECONFIG", "KUBE_CONTEXT", "KUBE_RESYNC_INTERVAL", "KUBE_CACHE_SYNC_TIMEOUT",
+	"KUBE_QPS", "KUBE_BURST",
 	"PROMETHEUS_URL", "PROMETHEUS_TIMEOUT",
 	"COLLECTOR_INTERVAL", "COLLECTOR_WORKERS",
 }
@@ -76,6 +78,10 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 		{"Database.MaxOpenConns", cfg.Database.MaxOpenConns, int32(20)},
 		{"Database.MinIdleConns", cfg.Database.MinIdleConns, int32(5)},
 		{"Database.ConnMaxLifetime", cfg.Database.ConnMaxLifetime, 30 * time.Minute},
+		{"Kube.CacheSyncTimeout", cfg.Kube.CacheSyncTimeout, 60 * time.Second},
+		{"Kube.ResyncInterval", cfg.Kube.ResyncInterval, time.Duration(0)},
+		{"Kube.QPS", cfg.Kube.QPS, float32(50)},
+		{"Kube.Burst", cfg.Kube.Burst, 100},
 		{"Prometheus.URL", cfg.Prometheus.URL, "http://localhost:19090"},
 		{"Prometheus.Timeout", cfg.Prometheus.Timeout, 30 * time.Second},
 		{"Collector.Interval", cfg.Collector.Interval, 5 * time.Minute},
@@ -198,6 +204,21 @@ func TestLoad_InvalidValues(t *testing.T) {
 			env:       map[string]string{"API_SHUTDOWN_TIMEOUT": "0s"},
 			wantIs:    ErrInvalid,
 			wantInMsg: "API_SHUTDOWN_TIMEOUT",
+		},
+		{
+			// Burst below QPS makes the QPS setting meaningless.
+			name: "kube burst below qps",
+			env: map[string]string{
+				"KUBE_QPS":   "50",
+				"KUBE_BURST": "10",
+			},
+			wantIs:    ErrInvalid,
+			wantInMsg: "KUBE_BURST",
+		},
+		{
+			name:      "unparseable float",
+			env:       map[string]string{"KUBE_QPS": "fast"},
+			wantInMsg: "KUBE_QPS",
 		},
 		{
 			// Nonsensical pool sizing that pgx would silently clamp instead of

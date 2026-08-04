@@ -28,10 +28,13 @@ import (
 	"syscall"
 	"time"
 
+	"golang.org/x/sync/errgroup"
+
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/config"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/kube"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/logging"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
 )
@@ -127,20 +130,76 @@ func run() error {
 		db.Close()
 	}()
 
-	// The readiness aggregator receives db as a health.Checker. It has no idea it is
-	// talking to Postgres, which is why adding the Kubernetes and Prometheus checks
-	// in later phases will be a change to THIS LINE ONLY.
-	readiness := health.NewAggregator(2*time.Second, db)
+	// Kubernetes client. Dual-mode: in-cluster credentials when running as a pod,
+	// kubeconfig on a laptop. See internal/kube.RESTConfig.
+	restCfg, err := kube.RESTConfig(cfg.Kube)
+	if err != nil {
+		return fmt.Errorf("building kubernetes rest config: %w", err)
+	}
+	clientset, err := kube.NewClientset(restCfg)
+	if err != nil {
+		return fmt.Errorf("building kubernetes clientset: %w", err)
+	}
+	// Constructed here, STARTED below. Registering informers is cheap and cannot fail;
+	// starting them opens watches and spawns goroutines, which we only want to do once
+	// every dependency has been constructed successfully.
+	store := kube.NewStore(clientset, cfg.Kube, logger)
+	logger.Info("kubernetes client configured", "host", restCfg.Host, "qps", cfg.Kube.QPS)
+
+	// The aggregator receives db and store as health.Checkers. It has no idea one is
+	// Postgres and the other an informer cache -- which is exactly why adding the
+	// Prometheus check in Phase 4 will be a change to THIS LINE ONLY.
+	readiness := health.NewAggregator(2*time.Second, db, store)
 
 	// -------------------------------------------------------------------------
-	// 5. Wire and run the HTTP server.
+	// 5. Run the HTTP server and the informers together.
 	// -------------------------------------------------------------------------
-	router := httpapi.NewRouter(logger, readiness)
+	router := httpapi.NewRouter(logger, readiness, store)
 	srv := httpapi.NewServer(cfg.API, logger, router)
 
-	// Blocks until ctx is cancelled by a signal, or the listener fails.
-	if err := srv.Run(ctx); err != nil {
-		return fmt.Errorf("running api server: %w", err)
+	// errgroup, not sync.WaitGroup. The difference matters here:
+	//
+	//   - A WaitGroup only tells you when goroutines have FINISHED. It carries no error
+	//     and cannot stop siblings.
+	//   - errgroup.WithContext gives a derived context that is CANCELLED as soon as any
+	//     goroutine returns a non-nil error, and Wait returns that first error.
+	//
+	// So if informer sync fails, gctx is cancelled, the HTTP server shuts down
+	// gracefully, and run() returns the real cause. Without that coupling we would sit
+	// there serving an empty inventory -- reporting a cluster that costs nothing.
+	g, gctx := errgroup.WithContext(ctx)
+
+	// WHY THE SERVER STARTS BEFORE THE CACHES ARE WARM
+	//
+	// The tempting order is: sync informers, then start listening. It is wrong in
+	// Kubernetes. Cache sync on a large cluster can take tens of seconds, and during
+	// that window nothing would be listening on :8080 -- so the LIVENESS probe gets
+	// connection refused, and once it exceeds failureThreshold the kubelet kills the
+	// container. It restarts, starts syncing again, and is killed again: a
+	// CrashLoopBackOff caused entirely by startup ordering.
+	//
+	// Listening immediately means probes get answered from the first moment. Liveness
+	// passes (the process is fine), readiness fails with "informer caches not yet
+	// synced" (we genuinely cannot serve yet), and the pod joins Service endpoints the
+	// instant the caches are warm. This is the liveness/readiness split from
+	// internal/health paying off in the startup path.
+	g.Go(func() error {
+		return srv.Run(gctx)
+	})
+
+	g.Go(func() error {
+		// Blocks until every cache has completed its initial List, or the timeout
+		// expires. A failure here aborts the whole process via gctx.
+		if err := store.Start(gctx); err != nil {
+			return fmt.Errorf("starting kubernetes informers: %w", err)
+		}
+		// Returning nil retires this goroutine without cancelling gctx. The informers
+		// themselves keep running in their own goroutines until gctx is done.
+		return nil
+	})
+
+	if err := g.Wait(); err != nil {
+		return fmt.Errorf("running api: %w", err)
 	}
 
 	// Distinguish a requested shutdown from an unexpected return. context.Canceled

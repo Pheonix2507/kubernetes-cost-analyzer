@@ -15,10 +15,10 @@ waste = requested - used
 Everything else in this repository is data collection, aggregation and presentation on
 top of that.
 
-## Status: Phase 0 complete
+## Status: Phase 1 complete
 
-A reproducible local environment and a production-shaped Go skeleton. **No cost logic
-yet** — that begins in Phase 1.
+A reproducible local environment, a production-shaped Go skeleton, and live cluster
+topology served over a read-only API. **No pricing yet** — that is Phase 3.
 
 What works today:
 
@@ -28,9 +28,26 @@ What works today:
 - kube-prometheus-stack and metrics-server, trimmed to fit an 8 GiB Docker VM
 - Seven fixture workloads engineered so every future detection rule has both a positive
   and a negative case
+- client-go shared informers holding a live cache of nodes, namespaces, pods and
+  ReplicaSets, with pod ownership resolved through to the owning Deployment
+- Effective pod requests computed the way the scheduler computes them — init containers
+  as a max, sidecars additive, pod overhead included
+- A read-only ClusterRole, verified by assertion that every write and secret read is
+  denied
 - Two Go binaries with config validation, structured logging, dependency injection,
   liveness/readiness split and graceful shutdown
 - A 17 MB non-root, shell-less container image
+
+### Endpoints
+
+| Method | Path | Returns |
+|---|---|---|
+| GET | `/healthz` | liveness — checks nothing, by design |
+| GET | `/readyz` | readiness — per-dependency detail for Postgres and the informer cache |
+| GET | `/version` | the build actually running |
+| GET | `/api/v1/nodes` | capacity, allocatable, instance type, zone, spot vs on-demand |
+| GET | `/api/v1/namespaces` | cost-allocation dimensions (team, cost-centre, environment) |
+| GET | `/api/v1/pods` | requests, limits, QoS class, resolved workload. `?namespace=` filters |
 
 ## Prerequisites
 
@@ -112,11 +129,13 @@ internal/
   health         Checker interface + concurrent readiness aggregator
   httpapi        server, router, JSON responses, health handlers
     middleware   request ID, structured access log, panic recovery
+  kube           client-go: dual-mode client, shared informers, pure translation
   store/postgres pgx pool; repositories from Phase 2
 deploy/
   kind           cluster definition
   monitoring     Helm values
   demo-workloads fixture workloads
+  rbac           read-only ClusterRole + a script that proves it
 ```
 
 ## The fixtures are the test data
@@ -154,15 +173,27 @@ make check         # fmt + vet + lint + test — everything CI runs
 make test          # go test -race
 make docker-build  # container image
 make db-psql       # psql shell
+make rbac-up       # apply the ServiceAccount, ClusterRole and binding
+make rbac-verify   # prove the RBAC grants reads and denies every write
 make reset         # tear down and rebuild everything
 ```
+
+### On RBAC verification
+
+`make rbac-verify` impersonates the ServiceAccount via `kubectl auth can-i --as=` and
+asks the API server's own authoriser. It tests the real ClusterRole without deploying
+anything, so the fast local loop stays intact.
+
+The **negative** assertions are the point. A ClusterRole granting cluster-admin passes
+every "can I read?" check; only `delete pods → no` and `list secrets → no` demonstrate
+that least privilege holds. Same reasoning as the `right-sized-worker` fixture.
 
 ## Roadmap
 
 | Phase | Delivers |
 |---|---|
 | **0** ✅ | Reproducible environment + Go skeleton |
-| 1 | Live inventory via client-go informers + RBAC |
+| **1** ✅ | Live inventory via client-go informers + RBAC |
 | 2 | Postgres schema, migrations, repositories |
 | 3 | Pricing engine behind a provider interface |
 | 4 | Cost engine + Prometheus collector (worker pools, channels, context) |

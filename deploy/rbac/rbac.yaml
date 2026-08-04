@@ -1,0 +1,139 @@
+# RBAC for the cost analyzer.
+#
+# Apply with:   kubectl apply -f deploy/rbac/
+# Verify with:  make rbac-verify
+#
+# WHY RBAC EXISTS AT ALL
+# ----------------------
+# Every request to the Kubernetes API server is authenticated (who are you?) and then
+# authorised (may you do this?). RBAC is the authorisation half, and it is deny-by-
+# default: a ServiceAccount with no bindings can do essentially nothing. Permissions are
+# only ever additive -- there is no "deny" rule in RBAC, so you grant precisely what is
+# needed and nothing more.
+#
+# THE FOUR OBJECTS AND WHY EACH IS SEPARATE
+# -----------------------------------------
+#   ServiceAccount      an identity. The kubelet mounts a token for it into the pod.
+#   ClusterRole         a set of permissions. Grants nothing by itself.
+#   ClusterRoleBinding  attaches the ClusterRole to the ServiceAccount.
+#
+# Roles and bindings are deliberately separate so one role can be reused by many
+# identities, and so reviewing "what may this thing do" is reading one document rather
+# than hunting through an identity's inline permissions.
+#
+# CLUSTER-scoped, not namespace-scoped (Role/RoleBinding), for two reasons:
+#   1. Nodes are cluster-scoped objects. A namespaced Role cannot grant access to them
+#      at all, and node capacity is where cost originates.
+#   2. Cost analysis spans every namespace by definition. A per-namespace Role would
+#      need one binding per namespace, maintained forever as namespaces come and go, and
+#      any namespace someone forgot would silently vanish from the bill.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kca-system
+  labels:
+    app.kubernetes.io/name: kubernetes-cost-analyzer
+    # Our own components live outside the team-* namespaces on purpose: the cost tool
+    # should never appear in its own cost reports as if it were a tenant workload.
+    kca.io/system: "true"
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kca-api
+  namespace: kca-system
+  labels:
+    app.kubernetes.io/name: kubernetes-cost-analyzer
+    app.kubernetes.io/component: api
+automountServiceAccountToken: true
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: kca-reader
+  labels:
+    app.kubernetes.io/name: kubernetes-cost-analyzer
+rules:
+  # ---------------------------------------------------------------------------
+  # Core objects: the topology cost is computed from.
+  #
+  # THE VERBS ARE THE WHOLE POINT: get, list, watch. Nothing else.
+  #
+  #   list   -- the informer's initial full fetch
+  #   watch  -- the incremental stream that keeps the cache current
+  #   get    -- single-object reads (resolving a ReplicaSet owner)
+  #
+  # There is no create, update, patch, delete or deletecollection anywhere in this
+  # file. That is not caution for its own sake: it makes the service STRUCTURALLY
+  # incapable of modifying the cluster it observes. A bug in our code, or an attacker
+  # who compromises this pod, still cannot delete a Deployment or drain a node, because
+  # the API server will refuse regardless of what our code asks for.
+  #
+  # A monitoring tool that can only read is one you can deploy to production without a
+  # long argument. One with write access is a change-management problem forever.
+  # ---------------------------------------------------------------------------
+  - apiGroups: [""]
+    resources:
+      - nodes # capacity, allocatable, instance-type labels: the basis of price
+      - namespaces # the cost-allocation dimensions (team, cost-centre, environment)
+      - pods # what reserved what, and where it landed
+      # Below are not read in Phase 1, but are granted now because they are the
+      # remaining pieces of the cost picture and adding them later means a second RBAC
+      # review. Granting a read verb on an object we will read next phase is a
+      # different thing from granting a write verb we will never use.
+      - persistentvolumeclaims # orphaned storage (the Phase 6 fixture)
+      - persistentvolumes # the actual provisioned disks, and their reclaim policy
+      - services # correlating idle workloads with traffic
+    verbs: ["get", "list", "watch"]
+
+  # ---------------------------------------------------------------------------
+  # Workload controllers: needed to resolve pod ownership.
+  #
+  # replicasets is the one Phase 1 genuinely cannot work without. A pod managed by a
+  # Deployment is owned by a ReplicaSet whose name carries a rollout hash, so without
+  # this permission every workload's cost history would reset on every deploy. See
+  # resolveWorkload in internal/kube/convert.go.
+  # ---------------------------------------------------------------------------
+  - apiGroups: ["apps"]
+    resources:
+      - replicasets # the second hop: pod -> ReplicaSet -> Deployment
+      - deployments # replica counts, for the over-replication check
+      - statefulsets
+      - daemonsets
+    verbs: ["get", "list", "watch"]
+
+  - apiGroups: ["batch"]
+    resources:
+      - jobs # a Job-owned pod attributes to its Job
+      - cronjobs # and a Job to its CronJob
+    verbs: ["get", "list", "watch"]
+
+  # ---------------------------------------------------------------------------
+  # The Metrics API, for cross-checking Prometheus.
+  #
+  # metrics.k8s.io is an AGGREGATED API served by metrics-server, not by the API server
+  # itself, which is why it needs its own rule. Read-only by nature -- there is nothing
+  # to write.
+  # ---------------------------------------------------------------------------
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["nodes", "pods"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: kca-reader
+  labels:
+    app.kubernetes.io/name: kubernetes-cost-analyzer
+# roleRef is IMMUTABLE once created: to point a binding at a different role you must
+# delete and recreate it. Kubernetes enforces that deliberately, so a privilege
+# escalation cannot be performed by quietly editing an existing binding in place.
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: kca-reader
+subjects:
+  - kind: ServiceAccount
+    name: kca-api
+    namespace: kca-system

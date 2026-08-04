@@ -29,7 +29,7 @@ import (
 //
 // Adopting a router before that need exists would be choosing a dependency on
 // speculation.
-func NewRouter(log *slog.Logger, readiness *health.Aggregator) http.Handler {
+func NewRouter(log *slog.Logger, readiness *health.Aggregator, inv Inventory) http.Handler {
 	mux := http.NewServeMux()
 
 	// Method-qualified patterns mean a POST to /healthz gets an automatic 405 Method
@@ -37,6 +37,16 @@ func NewRouter(log *slog.Logger, readiness *health.Aggregator) http.Handler {
 	mux.HandleFunc("GET /healthz", handleLive())
 	mux.HandleFunc("GET /readyz", handleReady(readiness))
 	mux.HandleFunc("GET /version", handleVersion())
+
+	// Versioned from the very first endpoint. Adding /v1 later means either breaking
+	// every client or maintaining an unversioned alias forever, and "we will version it
+	// when we need to" is how you end up doing both.
+	//
+	// These are all GET and all read-only, which mirrors the RBAC in deploy/rbac: this
+	// service is structurally incapable of mutating the cluster it observes.
+	mux.HandleFunc("GET /api/v1/nodes", handleListNodes(inv))
+	mux.HandleFunc("GET /api/v1/namespaces", handleListNamespaces(inv))
+	mux.HandleFunc("GET /api/v1/pods", handleListPods(inv))
 
 	// MIDDLEWARE ORDER IS A CORRECTNESS CONCERN, NOT A STYLE CHOICE.
 	// The first entry is outermost; a request travels down the list and back up.
