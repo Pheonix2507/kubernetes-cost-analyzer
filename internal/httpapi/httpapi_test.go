@@ -16,6 +16,7 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi/middleware"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/logging"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 )
 
 // discardLogger builds a real logger that writes nowhere.
@@ -49,7 +50,9 @@ func TestHealthz_AlwaysOK(t *testing.T) {
 	agg := health.NewAggregator(time.Second, stubChecker{name: "postgres", err: errors.New("down")})
 	srv := NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: agg,
-		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -74,7 +77,9 @@ func TestReadyz_AllDependenciesUp(t *testing.T) {
 	agg := health.NewAggregator(time.Second, stubChecker{name: "postgres"})
 	srv := NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: agg,
-		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
@@ -104,7 +109,9 @@ func TestReadyz_DependencyDownReturns503(t *testing.T) {
 	)
 	srv := NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: agg,
-		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
@@ -144,7 +151,9 @@ func TestRouting(t *testing.T) {
 
 	srv := NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
-		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 
 	tests := []struct {
@@ -184,7 +193,9 @@ func TestRequestID_GeneratedWhenAbsent(t *testing.T) {
 
 	srv := NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
-		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 
 	rec := httptest.NewRecorder()
@@ -203,7 +214,9 @@ func TestRequestID_HonoursInboundValue(t *testing.T) {
 	const upstream = "abcdef0123456789"
 	srv := NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
-		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
@@ -326,7 +339,9 @@ func TestProbeLogging(t *testing.T) {
 			}
 			srv := NewRouter(RouterOptions{
 				Log: log, Readiness: health.NewAggregator(time.Second, checkers...),
-				Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+				Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+				Reports: &stubReports{}, Stats: &stubReports{},
+				Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 			})
 
 			rec := httptest.NewRecorder()

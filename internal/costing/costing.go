@@ -466,6 +466,8 @@ func (e *Engine) allocation(
 		MemoryBytesRequested:   c.RequestsMemoryBytes,
 		CPUMillicoresUsed:      observed.CPUMillicores,
 		MemoryBytesUsed:        observed.MemoryBytes,
+		CPUMillicoresMax:       observed.CPUMillicoresMax,
+		MemoryBytesMax:         observed.MemoryBytesMax,
 
 		CPUCostPerCoreHour:   rates.CPUPerCoreHour,
 		MemoryCostPerGiBHour: rates.MemoryPerGiBHour,

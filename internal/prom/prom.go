@@ -122,6 +122,15 @@ func (c *Client) ContainerUsage(ctx context.Context, namespace string, start, en
 		return nil, fmt.Errorf("querying cpu usage: %w", err)
 	}
 
+	cpuPeak := cpuPeakQuery(namespace, window)
+	if err := c.collect(ctx, cpuPeak, end, func(k domain.ContainerKey, v float64) {
+		u := usage[k]
+		u.CPUMillicoresMax = int64(math.Round(v * 1000))
+		usage[k] = u
+	}); err != nil {
+		return nil, fmt.Errorf("querying peak cpu usage: %w", err)
+	}
+
 	memQuery := memoryQuery(namespace, window)
 	if err := c.collect(ctx, memQuery, end, func(k domain.ContainerKey, v float64) {
 		u := usage[k]
@@ -129,6 +138,29 @@ func (c *Client) ContainerUsage(ctx context.Context, namespace string, start, en
 		usage[k] = u
 	}); err != nil {
 		return nil, fmt.Errorf("querying memory usage: %w", err)
+	}
+
+	memPeak := memoryPeakQuery(namespace, window)
+	if err := c.collect(ctx, memPeak, end, func(k domain.ContainerKey, v float64) {
+		u := usage[k]
+		u.MemoryBytesMax = int64(math.Round(v))
+		usage[k] = u
+	}); err != nil {
+		return nil, fmt.Errorf("querying peak memory usage: %w", err)
+	}
+
+	// The peak can never be below the average, and the database enforces that with a CHECK. It can
+	// happen legitimately by a hair: the two queries are separate round trips evaluated a few
+	// milliseconds apart, so a sample can land between them. Clamping here keeps a harmless race
+	// from failing the whole batch insert.
+	for k, u := range usage {
+		if u.CPUMillicoresMax < u.CPUMillicores {
+			u.CPUMillicoresMax = u.CPUMillicores
+		}
+		if u.MemoryBytesMax < u.MemoryBytes {
+			u.MemoryBytesMax = u.MemoryBytes
+		}
+		usage[k] = u
 	}
 
 	return usage, nil
@@ -169,6 +201,52 @@ func memoryQuery(namespace string, window time.Duration) string {
 			`avg_over_time(container_memory_working_set_bytes{container!="",container!="POD"%s}[%s])`+
 			`)`,
 		namespaceSelector(namespace), promDuration(window))
+}
+
+// cpuPeakQuery builds the PEAK CPU query.
+//
+// max_over_time OF A rate, which is a nested range and needs a SUBQUERY -- the `[window:step]`
+// syntax. The inner rate is computed over a short window at each step, and the outer max takes the
+// largest of those.
+//
+// The inner window is deliberately SHORT. A rate over the full collection window would just
+// reproduce the average, defeating the point; a short inner window preserves burst detail. It must
+// still be at least a few scrape intervals or rate() has too few samples and returns nothing.
+func cpuPeakQuery(namespace string, window time.Duration) string {
+	inner := peakInnerWindow(window)
+	return fmt.Sprintf(
+		`max_over_time(`+
+			`sum by (namespace, pod, container) (`+
+			`rate(container_cpu_usage_seconds_total{container!="",container!="POD"%s}[%s])`+
+			`)[%s:%s]`+
+			`)`,
+		namespaceSelector(namespace), promDuration(inner), promDuration(window), promDuration(inner))
+}
+
+// memoryPeakQuery builds the PEAK memory query.
+//
+// max_over_time directly on the gauge -- no subquery needed, because a gauge is already a level and
+// needs no rate. The contrast with the CPU query above is the counter/gauge distinction showing up a
+// second time.
+func memoryPeakQuery(namespace string, window time.Duration) string {
+	return fmt.Sprintf(
+		`max_over_time(`+
+			`sum by (namespace, pod, container) (container_memory_working_set_bytes{container!="",container!="POD"%s})[%s:]`+
+			`)`,
+		namespaceSelector(namespace), promDuration(window))
+}
+
+// peakInnerWindow picks the inner rate window for the CPU peak subquery.
+//
+// A fifth of the collection window, floored at 60s. The floor matters: with a 30-second scrape
+// interval, a rate over anything less than ~60s has fewer than two samples and returns nothing at
+// all -- so a short collection interval would silently produce no peak data rather than an error.
+func peakInnerWindow(window time.Duration) time.Duration {
+	inner := window / 5
+	if inner < time.Minute {
+		inner = time.Minute
+	}
+	return inner
 }
 
 // namespaceSelector adds a namespace matcher, or nothing for a cluster-wide query.

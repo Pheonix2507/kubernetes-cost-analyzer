@@ -37,6 +37,7 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/kube"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/logging"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
 )
 
@@ -189,12 +190,19 @@ func run() error {
 		logger.Info("api authentication enabled", "configured_keys", len(cfg.API.APIKeys))
 	}
 
+	// One repository serving both the Reports and Stats interfaces. Two narrow interfaces over one
+	// implementation: each handler declares only what it needs, and there is still one place that
+	// knows how to talk to the database.
+	reportRepo := postgres.NewReportRepository(db.Pool())
+
 	router := httpapi.NewRouter(httpapi.RouterOptions{
 		Log:                logger,
 		Readiness:          readiness,
 		Inventory:          store,
 		Pricer:             pricer,
-		Reports:            postgres.NewReportRepository(db.Pool()),
+		Reports:            reportRepo,
+		Stats:              reportRepo,
+		Recommender:        recommend.NewEngine(recommend.DefaultThresholds()),
 		APIKeys:            cfg.API.APIKeys,
 		RateLimitPerSecond: cfg.API.RateLimitPerSecond,
 		RateLimitBurst:     cfg.API.RateLimitBurst,

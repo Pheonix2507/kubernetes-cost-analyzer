@@ -44,4 +44,16 @@ type Usage struct {
 	// once looks permanently enormous. Working set is what the kubelet uses for eviction
 	// decisions, which makes it the honest answer to "how much does this actually need".
 	MemoryBytes int64
+
+	// CPUMillicoresMax and MemoryBytesMax are the PEAK within the window.
+	//
+	// Captured at collection time because the resolution only exists then. A percentile computed
+	// later over per-window AVERAGES has already had the peaks smoothed out of it, so it
+	// systematically understates the true peak -- by more, the burstier the workload. Recommending
+	// a request from an understated peak is how a right-sizing tool causes throttling and OOM
+	// kills.
+	//
+	// Cost uses the average; right-sizing uses these. The statistic has to match the question.
+	CPUMillicoresMax int64
+	MemoryBytesMax   int64
 }

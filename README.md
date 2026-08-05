@@ -9,17 +9,25 @@ node whether or not the container ever touches it. The gap between the two is wa
 in most clusters that has never been measured it is the majority of the bill.
 
 ```
-waste = requested - used
+waste = max(requested - used, 0)
 ```
 
 Everything else in this repository is data collection, aggregation and presentation on
 top of that.
 
-## Status: Phase 5 complete — the API is consumable
+The `max(..., 0)` is the part that bites. It has to be applied **per row, inside the sum** — not to
+the aggregate. `GREATEST(sum(requested) - sum(used), 0)` reads as equivalent and is not: the
+cancellation happens inside the two sums, before the subtraction, so an under-requested container
+issues a *credit* against genuine waste elsewhere in the same group. This repo shipped that version.
+Measured on real data, `kube-system` reported **0 GiB-hours** of memory waste while actually holding
+50, and `team-search` was understated by 126%. The more under-requested a team's workloads were, the
+more efficient it looked.
 
-The collector produces cost data and the API serves it: aggregated summaries, cursor-paginated raw
-rows, authentication, rate limiting and an OpenAPI contract. **A frontend could be built against
-this today** — which is Phase 8.
+## Status: Phase 6 complete — it now says what to change
+
+The collector produces cost data, the API serves it, and the recommendation engine turns it into
+advice: right-sizing from p95 peaks, idle detection, under-request warnings, missing requests and
+over-replication. **A frontend could be built against this today** — which is Phase 8.
 
 What works today:
 
@@ -46,6 +54,10 @@ What works today:
 - A cost engine that joins topology, usage and rates: a bounded worker pool over
   namespaces, best-effort per-namespace failure isolation, `max(request, usage)` billing,
   and aligned windows that make re-collection idempotent
+- Per-window peak collection (`max_over_time`) alongside averages, because the two answer
+  different questions: an average for cost, p95-of-peaks for right-sizing
+- A recommendation engine with an evidence gate, headroom on every proposal, and savings
+  that are allowed to be negative when the correct advice costs money
 - A non-root, shell-less container image
 
 ### Endpoints
@@ -60,6 +72,7 @@ What works today:
 | GET | `/api/v1/pods` | requests, limits, QoS class, resolved workload. `?namespace=` filters |
 | GET | `/api/v1/costs/summary` | **aggregated cost** — `?group_by=` any of 10 dimensions, filtered, sorted |
 | GET | `/api/v1/allocations` | raw per-container samples, cursor-paginated |
+| GET | `/api/v1/recommendations` | **what to change** — right-size, idle, under-requested, set-requests, over-replicated |
 
 Full contract in [`api/openapi.yaml`](api/openapi.yaml), kept honest by a test asserting its enums
 match the allow-lists the code enforces.
@@ -67,6 +80,8 @@ match the allow-lists the code enforces.
 ```bash
 curl -H "Authorization: Bearer $KEY" \
   'localhost:8080/api/v1/costs/summary?group_by=workload&sort=wasted_cpu_core_hours'
+
+curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/recommendations
 ```
 
 ## Prerequisites
@@ -178,8 +193,8 @@ proven right *and* proven not to over-fire. Every value was set by measuring wit
 | `memory-hoarder` | team-search | Flag — uses 3x its memory request (a *reliability* risk) |
 | `no-requests-at-all` | team-search | Flag — consumes real resources, bills as zero |
 | `idle-service` | team-search | Flag — zero CPU; recommend **delete**, not resize |
-| `over-replicated` | team-platform | Flag — each pod is fine, six of them is not |
-| `abandoned-migration-data` | team-payments | Flag — 2Gi PVC bound with no consumer |
+| `over-replicated` | team-platform | **Not flagged, and that is correct** — see below |
+| `abandoned-migration-data` | team-payments | Not yet detected — needs a PVC lister |
 
 `right-sized-worker` matters most. Every other fixture is wasteful, so a rule that
 returns "everything is wasteful" — or ignores its input entirely — would look correct on
@@ -188,6 +203,15 @@ all of them. False positives are what kills adoption of a tool like this.
 `no-requests-at-all` is a trap for our own engine: cost computed from requests alone
 reports it as free, and its real cost gets smeared silently across every other team. This
 is why cost must be billed on `max(request, usage)`.
+
+`over-replicated` is the fixture that did not work out, and it is more useful stated plainly than
+quietly re-tuned. It was calibrated until each pod was genuinely well utilised (11m against a 15m
+request, 73%) specifically so no per-container rule would fire — the premise being "six replicas
+where two would do, and per-pod analysis finds nothing". But nothing else can find it either: if
+every pod is 73% utilised, removing replicas overloads the survivors. Whether six busy pods could be
+replaced by two *bigger* ones is a question about **traffic**, and no CPU or memory metric answers
+it. The rule detects six *idle* replicas, which is the common form of the problem; the harder form
+needs request-rate data and is honestly out of reach for now.
 
 The fake instance-type labels on the kind nodes (`m5.large`, `m5.xlarge`, one spot node,
 two zones) use the same well-known label keys a cloud provider sets, so the pricing engine
@@ -311,6 +335,41 @@ first error, which is right for all-or-nothing work and catastrophic here. The c
 return `nil` and record failures separately, so `errgroup` acts purely as a bounded pool.
 Partial coverage that *reports its gaps* beats a total blank.
 
+## Recommendations: turning cost into advice
+
+**The statistic must match the question.** Cost is an integral, so it uses the *average* over each
+window. Right-sizing is a safety question, so it uses **p95 of the per-window peaks**. Sizing a
+request on the average guarantees throttling — an average by definition sits below half the
+observations. Two different questions, two different statistics, both collected.
+
+**Every rule passes an evidence gate first.** A minimum window count, a minimum observation *span*,
+and peak coverage. The span matters more than the count: a hundred windows over one hour still only
+describes that hour, so a batch job that runs on Sundays looks abandoned on a Tuesday. The default
+range for this endpoint is **7 days**, not the 24 hours the cost endpoints use, for exactly that
+reason.
+
+**CPU and memory fail differently, so severity differs.** CPU is compressible — exceeding a request
+means CFS throttling, which is slow. Memory is not — exceeding it means the kernel OOMKills the
+container. So an under-requested memory finding is `critical` even though acting on it *increases*
+cost, while a large CPU saving is merely `info`.
+
+**Savings are allowed to be negative, and are never netted against positives.** The response reports
+`potential_monthly_saving` and `required_monthly_increase` as two separate fields. A single net
+figure would let a large right-sizing win cancel out a memory increase someone *must* make, and the
+page would read "net saving $30" with the reliability fix invisible inside it.
+
+**Headroom rounds up, always.** `p95 x 1.2` was truncated to an integer, which erased the margin
+entirely for p95 values of 1–4 millicores — the band most quiet containers live in. Four of the
+first five values got no headroom at all and the proposal landed exactly *on* p95, which by
+definition 5% of windows exceed. A safety margin rounded down is not a safety margin.
+
+**Over-replication only applies where the replica count is a field someone can set.** The first live
+run advised scaling `kindnet` and `node-exporter` to 2 replicas. Both are DaemonSets: one pod per
+node, no `replicas` field, and acting on it would have left a node with no network plugin in exchange
+for $1.26 a month. The rule read `count(DISTINCT pod_name) = 3` without asking *why* there were
+three. The gate is an **allow-list** of kinds, so an unknown CRD defaults to silence rather than to
+confident advice about someone else's resource.
+
 ## API design decisions
 
 **Cursor pagination, not offset.** `OFFSET 5000` makes Postgres produce and discard 5,000 rows, and
@@ -368,7 +427,12 @@ four the code actually reads. An audit found nine further resources granted on t
 they were "the remaining pieces of the cost picture"; the code read none of them, which
 contradicted the least-privilege argument three paragraphs above it in the same file. They were
 removed, and `verify.sh` now asserts each is **denied**, so the removal is enforced rather than
-claimed. Phase 6 will add PVCs and services when it genuinely needs them.
+claimed.
+
+Phase 6 did not need them after all, and the grant is unchanged as a result. Two findings it would
+have improved are noted honestly instead of quietly added: orphaned-PVC detection needs a PVC
+lister, and reliable idle detection needs traffic data from Services. Both remain ungranted until
+there is code that reads them.
 
 ## Roadmap
 
@@ -380,7 +444,7 @@ claimed. Phase 6 will add PVCs and services when it genuinely needs them.
 | **3** ✅ | Pricing engine behind a provider interface |
 | **4** ✅ | Cost engine + Prometheus collector (worker pools, channels, context) |
 | **5** ✅ | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |
-| 6 | Idle detection + recommendation engine |
+| **6** ✅ | Idle detection + recommendation engine (p95 right-sizing, evidence gates) |
 | 7 | Rollups, historical trends, monthly reports |
 | 8 | Next.js frontend |
 | 9 | Observability — own metrics, recording rules, Grafana dashboards as code |

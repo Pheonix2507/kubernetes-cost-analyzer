@@ -77,6 +77,10 @@ type ContainerAllocation struct {
 	CPUMillicoresUsed      int64
 	MemoryBytesUsed        int64
 
+	// Peaks within the window. Used by right-sizing, never by cost. See domain.Usage.
+	CPUMillicoresMax int64
+	MemoryBytesMax   int64
+
 	// --- Rates in effect for THIS window -----------------------------------------
 	CPUCostPerCoreHour   decimal.Decimal
 	MemoryCostPerGiBHour decimal.Decimal

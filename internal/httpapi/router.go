@@ -7,6 +7,7 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi/middleware"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 )
 
 // RouterOptions carries the router's dependencies.
@@ -20,6 +21,10 @@ type RouterOptions struct {
 	Inventory Inventory
 	Pricer    pricing.Provider
 	Reports   Reports
+	Stats     Stats
+	// Recommender is the rule engine. Injected rather than constructed here, so its thresholds are an
+	// operator's decision made once in main rather than a default buried in the HTTP layer.
+	Recommender *recommend.Engine
 
 	// APIKeys enables authentication. Empty disables it, which config.Validate permits only
 	// outside production.
@@ -73,17 +78,9 @@ func NewRouter(opts RouterOptions) http.Handler {
 	mux.HandleFunc("GET /api/v1/costs/summary", handleCostSummary(opts.Reports))
 	mux.HandleFunc("GET /api/v1/allocations", handleAllocations(opts.Reports))
 
-	// MIDDLEWARE ORDER IS A CORRECTNESS CONCERN, NOT A STYLE CHOICE.
-	// The first entry is outermost; a request travels down the list and back up.
-	//
-	//  1. RequestID     -- must be first so EVERYTHING downstream, including the
-	//                      panic logger, has a correlation ID to attach.
-	//  2. RequestLogger -- outside Recover, so it observes the 500 that Recover
-	//                      writes. Inside Recover, a panicking request would produce
-	//                      no access-log line at all, and the request would vanish
-	//                      from the logs precisely when you most need it.
-	//  3. Recover       -- innermost, wrapping the handler whose panics we are
-	//                      catching.
+	// Advice, as distinct from data. The endpoint that says what to CHANGE.
+	mux.HandleFunc("GET /api/v1/recommendations", handleRecommendations(opts.Stats, opts.Recommender))
+
 	// MIDDLEWARE ORDER IS A CORRECTNESS CONCERN, NOT A STYLE CHOICE.
 	// The first entry is outermost; a request travels down the list and back up.
 	//

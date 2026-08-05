@@ -15,6 +15,7 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 )
 
 // stubInventory is the payoff for defining Inventory as an interface in this package:
@@ -68,14 +69,18 @@ func defaultStubPricer() stubPricer {
 func newTestRouter(inv Inventory) http.Handler {
 	return NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
-		Inventory: inv, Pricer: defaultStubPricer(), Reports: &stubReports{},
+		Inventory: inv, Pricer: defaultStubPricer(),
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 }
 
 func newTestRouterWithPricer(inv Inventory, p pricing.Provider) http.Handler {
 	return NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
-		Inventory: inv, Pricer: p, Reports: &stubReports{},
+		Inventory: inv, Pricer: p,
+		Reports: &stubReports{}, Stats: &stubReports{},
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 }
 

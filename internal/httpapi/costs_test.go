@@ -13,6 +13,7 @@ import (
 	"github.com/shopspring/decimal"
 
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
 )
 
@@ -23,8 +24,11 @@ type stubReports struct {
 	page    postgres.AllocationsPage
 	err     error
 
+	containerStats []postgres.ContainerStats
+
 	gotSummaryParams postgres.CostSummaryParams
 	gotAllocParams   postgres.AllocationsParams
+	gotStatsParams   postgres.ContainerStatsParams
 }
 
 func (s *stubReports) CostSummary(_ context.Context, p postgres.CostSummaryParams) ([]postgres.CostSummaryRow, error) {
@@ -37,10 +41,20 @@ func (s *stubReports) Allocations(_ context.Context, p postgres.AllocationsParam
 	return s.page, s.err
 }
 
-func routerWithReports(reports Reports) http.Handler {
+func (s *stubReports) ContainerStats(_ context.Context, p postgres.ContainerStatsParams) ([]postgres.ContainerStats, error) {
+	s.gotStatsParams = p
+	return s.containerStats, s.err
+}
+
+func routerWithReports(reports interface {
+	Reports
+	Stats
+}) http.Handler {
 	return NewRouter(RouterOptions{
 		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
-		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: reports,
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(),
+		Reports: reports, Stats: reports,
+		Recommender: recommend.NewEngine(recommend.DefaultThresholds()),
 	})
 }
 

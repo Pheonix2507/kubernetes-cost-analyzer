@@ -251,6 +251,54 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/recommendations:
+    get:
+      tags: [cost]
+      summary: What to change, and what it would save
+      description: |
+        Turns observed behaviour into actionable advice. Five rules: right-size, idle, under-requested,
+        set-requests and over-replicated.
+
+        **`estimated_monthly_saving` can be NEGATIVE.** An under-requested container needs a LARGER
+        request, which costs more. A tool whose advice is all one-directional is not trusted with
+        production, so the increase is reported honestly -- and `totals` separates savings from
+        required increases rather than netting them, so a large saving cannot hide a reliability fix.
+
+        **Severity is not ordered by money.** A memory under-request risking an OOM kill is `critical`
+        even though acting on it costs money; a large saving on a batch job is merely `info`.
+
+        **Silence is a valid answer.** Every rule refuses to fire without enough evidence -- a minimum
+        window count, a minimum observation span, and trustworthy peak data. Recommending a deletion
+        from twenty minutes of data collected overnight would be worse than saying nothing.
+
+        The default range is **7 days**, wider than the cost endpoints' 24 hours: a recommendation from
+        one day cannot see a weekly pattern, so a job that runs on Sundays would look abandoned.
+      parameters:
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+        - $ref: "#/components/parameters/Namespace"
+        - $ref: "#/components/parameters/Team"
+        - $ref: "#/components/parameters/Environment"
+        - $ref: "#/components/parameters/CostCentre"
+        - $ref: "#/components/parameters/WorkloadKind"
+        - $ref: "#/components/parameters/WorkloadName"
+        - $ref: "#/components/parameters/Node"
+        - $ref: "#/components/parameters/InstanceType"
+        - $ref: "#/components/parameters/CapacityType"
+      responses:
+        "200":
+          description: The recommendations, most urgent first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/RecommendationsResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/nodes:
     get:
       tags: [inventory]
@@ -469,6 +517,103 @@ components:
           description: |
             **Absent** on the last page, so its presence answers "is there more?". An empty string
             would force every client to check for both absence and emptiness.
+
+    RecommendationsResponse:
+      type: object
+      required: [from, to, items, count, totals, analysed_containers]
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        count: { type: integer }
+        analysed_containers:
+          type: integer
+          description: |
+            How many containers were examined. The denominator for "how much of my estate has
+            findings" -- without it, three recommendations could mean a healthy cluster or a barely
+            collected one.
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Recommendation" }
+        totals:
+          type: object
+          properties:
+            potential_monthly_saving:
+              allOf: [{ $ref: "#/components/schemas/Money" }]
+              description: Sum of the POSITIVE savings only.
+            required_monthly_increase:
+              allOf: [{ $ref: "#/components/schemas/Money" }]
+              description: |
+                Sum of the reliability fixes that COST money, expressed positive. Kept separate from
+                the savings rather than netted, so a large saving cannot hide a change someone must
+                make.
+            critical: { type: integer }
+            warning: { type: integer }
+            info: { type: integer }
+            estimated_rates: { type: boolean }
+
+    Recommendation:
+      type: object
+      properties:
+        kind:
+          type: string
+          enum: [right_size, idle, under_requested, set_requests, over_replicated]
+        severity:
+          type: string
+          enum: [info, warning, critical]
+          description: |
+            Not ordered by money. `critical` is reserved for reliability risk -- a memory
+            under-request that may cause an OOM kill -- even though fixing it increases cost.
+        confidence:
+          type: string
+          enum: [low, medium, high]
+          description: |
+            Based on observation SPAN, not sample count: a hundred windows over one hour still only
+            describes that hour. `medium` covers a day, `high` covers a week.
+        namespace: { type: string }
+        workload_kind: { type: string }
+        workload_name: { type: string }
+        container_name:
+          type: string
+          description: Absent for workload-level findings such as over_replicated.
+        summary: { type: string }
+        rationale:
+          type: string
+          description: |
+            The reasoning, with the numbers. A recommendation nobody understands is one nobody
+            applies -- and one that cannot be argued with cannot be trusted either.
+        current: { type: string, example: "cpu: 500m, memory: 512Mi" }
+        proposed:
+          type: string
+          example: "cpu: 4m, memory: 16Mi"
+          description: Formatted in Kubernetes units so it can be pasted into a manifest unchanged.
+        estimated_monthly_saving:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: NEGATIVE when the recommendation costs money, which under_requested always does.
+        estimated_rates: { type: boolean }
+        evidence:
+          type: object
+          description: The observation behind the recommendation, so it can be checked rather than believed.
+          properties:
+            observed_from: { type: string, format: date-time }
+            observed_to: { type: string, format: date-time }
+            observed_hours: { type: number }
+            windows: { type: integer }
+            replicas: { type: integer }
+            cpu_requested_millicores: { type: integer }
+            cpu_avg_millicores:
+              type: integer
+              description: The cost-relevant statistic. NOT what right-sizing uses.
+            cpu_p95_millicores:
+              type: integer
+              description: |
+                p95 of the per-window PEAKS -- the right-sizing signal. p95 of averages would have the
+                bursts smoothed out of it and would understate the true peak, so a request derived
+                from it throttles the workload.
+            cpu_max_millicores: { type: integer }
+            memory_requested_bytes: { type: integer }
+            memory_avg_bytes: { type: integer }
+            memory_p95_bytes: { type: integer }
+            memory_max_bytes: { type: integer }
 
     AllocationRow:
       type: object

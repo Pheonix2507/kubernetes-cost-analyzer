@@ -1,6 +1,7 @@
 package httpapi
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
 )
 
@@ -78,6 +80,55 @@ func TestOpenAPISpec_MatchesTheCode(t *testing.T) {
 		"a documented sort field the server rejects is a 400 the client could not have predicted")
 }
 
+// TestOpenAPISpec_RecommendationEnumsMatchTheEngine extends the same drift guard to the response
+// body, which the group_by and sort checks do not cover.
+//
+// The failure this prevents is quieter than a rejected parameter. A client writes a switch over the
+// five documented kinds and renders a label for each. We add a sixth rule, the server starts emitting
+// it, and their UI drops those findings on the floor -- no error, no 400, just advice that silently
+// never reaches anybody. Response enums drift more dangerously than request enums, because nothing
+// rejects an undocumented value.
+func TestOpenAPISpec_RecommendationEnumsMatchTheEngine(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("cannot read the spec: %v", err)
+	}
+	var spec map[string]any
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatalf("invalid YAML: %v", err)
+	}
+
+	tests := []struct {
+		field       string
+		implemented []string
+		why         string
+	}{
+		{"kind", recommend.KindOptions(),
+			"a client switching over the documented kinds silently drops any kind we add without documenting"},
+		{"severity", recommend.SeverityOptions(),
+			"severity drives how a finding is displayed and whether it is escalated; an unknown value falls through"},
+		{"confidence", recommend.ConfidenceOptions(),
+			"confidence is what tells a reader whether to apply a recommendation or collect more data first"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.field, func(t *testing.T) {
+			node := navigate(t, spec, "components", "schemas", "Recommendation", "properties", tt.field, "enum")
+			list, ok := node.([]any)
+			if !ok {
+				t.Fatalf("Recommendation.%s has no enum in the spec", tt.field)
+			}
+			documented := make([]string, 0, len(list))
+			for _, v := range list {
+				documented = append(documented, fmt.Sprint(v))
+			}
+			assertSameSet(t, documented, tt.implemented, tt.why)
+		})
+	}
+}
+
 // TestOpenAPISpec_DocumentsEveryRoute catches the commonest drift: a route added to the router and
 // never written down. An undocumented endpoint is one no client can discover and nobody maintains.
 func TestOpenAPISpec_DocumentsEveryRoute(t *testing.T) {
@@ -99,7 +150,7 @@ func TestOpenAPISpec_DocumentsEveryRoute(t *testing.T) {
 	routes := []string{
 		"/healthz", "/readyz", "/version",
 		"/api/v1/nodes", "/api/v1/namespaces", "/api/v1/pods",
-		"/api/v1/costs/summary", "/api/v1/allocations",
+		"/api/v1/costs/summary", "/api/v1/allocations", "/api/v1/recommendations",
 	}
 	for _, route := range routes {
 		if _, documented := spec.Paths[route]; !documented {

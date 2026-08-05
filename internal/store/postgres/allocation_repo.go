@@ -3,10 +3,8 @@ package postgres
 import (
 	"context"
 	"fmt"
-	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/shopspring/decimal"
 
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 )
@@ -40,6 +38,7 @@ const insertAllocation = `
 		zone, qos_class, rate_source,
 		cpu_millicores_requested, memory_bytes_requested,
 		cpu_millicores_used, memory_bytes_used,
+		cpu_millicores_max, memory_bytes_max,
 		cpu_millicores_billable, memory_bytes_billable,
 		cpu_cost_per_core_hour, memory_cost_per_gib_hour,
 		cpu_cost, memory_cost, collected_at
@@ -52,7 +51,8 @@ const insertAllocation = `
 		$21, $22,
 		$23, $24,
 		$25, $26,
-		$27, $28, now()
+		$27, $28,
+		$29, $30, now()
 	)
 	ON CONFLICT (window_start, pod_id, container_name) DO UPDATE
 	SET cluster_name             = EXCLUDED.cluster_name,
@@ -74,6 +74,8 @@ const insertAllocation = `
 	    memory_bytes_requested   = EXCLUDED.memory_bytes_requested,
 	    cpu_millicores_used      = EXCLUDED.cpu_millicores_used,
 	    memory_bytes_used        = EXCLUDED.memory_bytes_used,
+	    cpu_millicores_max       = EXCLUDED.cpu_millicores_max,
+	    memory_bytes_max         = EXCLUDED.memory_bytes_max,
 	    cpu_millicores_billable  = EXCLUDED.cpu_millicores_billable,
 	    memory_bytes_billable    = EXCLUDED.memory_bytes_billable,
 	    cpu_cost_per_core_hour   = EXCLUDED.cpu_cost_per_core_hour,
@@ -92,6 +94,7 @@ func allocationArgs(a domain.ContainerAllocation) []any {
 		a.Zone, a.QoSClass, a.RateSource,
 		a.CPUMillicoresRequested, a.MemoryBytesRequested,
 		a.CPUMillicoresUsed, a.MemoryBytesUsed,
+		a.CPUMillicoresMax, a.MemoryBytesMax,
 		cpuBillable, memBillable,
 		a.CPUCostPerCoreHour, a.MemoryCostPerGiBHour,
 		a.CPUCost, a.MemoryCost,
@@ -169,73 +172,4 @@ func (r *AllocationRepository) InsertBatch(ctx context.Context, allocations []do
 		return fmt.Errorf("insert %d allocations: %w", len(allocations), firstErr)
 	}
 	return nil
-}
-
-// NamespaceCost is one row of a cost-by-namespace report.
-type NamespaceCost struct {
-	NamespaceName  string          `json:"namespace"`
-	Team           string          `json:"team,omitempty"`
-	CPUCoreHours   decimal.Decimal `json:"cpu_core_hours"`
-	MemoryGiBHours decimal.Decimal `json:"memory_gib_hours"`
-	TotalCost      decimal.Decimal `json:"total_cost"`
-}
-
-// CostByNamespace aggregates cost over a half-open time range.
-//
-// This is the query the dashboard runs most, and the reason for the
-// (namespace_name, window_start DESC) index.
-func (r *AllocationRepository) CostByNamespace(ctx context.Context, from, to time.Time) ([]NamespaceCost, error) {
-	// >= from AND < to -- half-open, matching the window semantics. Using BETWEEN here
-	// would be closed on both ends and would double-count the boundary window in any two
-	// adjacent reports.
-	const q = `
-		SELECT namespace_name,
-		       -- max() rather than any(): team is denormalised and constant per namespace
-		       -- within a window, but GROUP BY still requires an aggregate. Postgres has no
-		       -- any_value() before 16, and max() over identical strings is exact.
-		       max(team) AS team,
-		       -- Millicore-minutes to core-hours: /1000 for cores, /3600 for hours. Done in
-		       -- SQL rather than Go so the database can do it during aggregation instead of
-		       -- shipping every row over the wire.
-		       COALESCE(sum(
-		           cpu_millicores_billable::numeric / 1000
-		           * EXTRACT(EPOCH FROM (window_end - window_start)) / 3600
-		       ), 0) AS cpu_core_hours,
-		       COALESCE(sum(
-		           memory_bytes_billable::numeric / (1024*1024*1024)
-		           * EXTRACT(EPOCH FROM (window_end - window_start)) / 3600
-		       ), 0) AS memory_gib_hours,
-		       COALESCE(sum(total_cost), 0) AS total_cost
-		FROM container_allocations
-		WHERE window_start >= $1 AND window_start < $2
-		GROUP BY namespace_name
-		ORDER BY total_cost DESC, namespace_name`
-
-	rows, err := r.db.Query(ctx, q, from, to)
-	if err != nil {
-		return nil, fmt.Errorf("query cost by namespace: %w", err)
-	}
-	// rows.Close is idempotent and safe to defer even after a full iteration. Omitting it
-	// on an early return leaks the connection back to nothing.
-	defer rows.Close()
-
-	// Non-nil so an empty result marshals as [] rather than null.
-	out := []NamespaceCost{}
-	for rows.Next() {
-		var c NamespaceCost
-		if err := rows.Scan(&c.NamespaceName, &c.Team, &c.CPUCoreHours, &c.MemoryGiBHours, &c.TotalCost); err != nil {
-			return nil, fmt.Errorf("scan namespace cost: %w", err)
-		}
-		out = append(out, c)
-	}
-	// rows.Err() MUST be checked after the loop.
-	//
-	// rows.Next() returns false both for "finished normally" and for "the query failed
-	// mid-stream" -- a broken connection, a cancelled context, a server-side error after
-	// the first row. Skipping this check silently returns a TRUNCATED result set as though
-	// it were complete, and for a cost report that means quietly under-reporting the bill.
-	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate namespace costs: %w", err)
-	}
-	return out, nil
 }

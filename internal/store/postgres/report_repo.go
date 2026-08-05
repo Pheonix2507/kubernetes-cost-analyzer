@@ -351,18 +351,17 @@ func (r *ReportRepository) CostSummary(ctx context.Context, p CostSummaryParams)
 			       count(*)                      AS container_windows,
 			       -- bool_or rather than a count: the caller needs to know IF any rate was
 			       -- guessed, not how many were.
-			       bool_or(rate_source = 'fallback') AS estimated_rates
+			       bool_or(rate_source = 'fallback') AS estimated_rates,
+			       -- WASTE IS FLOORED PER ROW, INSIDE THE SUM. See wastedCoreHours.
+			       %[9]s  AS wasted_cpu_core_hours,
+			       %[10]s AS wasted_memory_gib_hours
 			FROM container_allocations
 			WHERE %[8]s
 			GROUP BY %[1]s
 		)
-		SELECT *,
-		       -- GREATEST(x, 0) floors waste at zero. See the note on WastedCPUCoreHours.
-		       GREATEST(cpu_requested_core_hours - cpu_used_core_hours, 0)       AS wasted_cpu_core_hours,
-		       GREATEST(memory_requested_gib_hours - memory_used_gib_hours, 0)   AS wasted_memory_gib_hours
-		FROM aggregated
-		ORDER BY %[9]s %[10]s, %[1]s
-		LIMIT %[11]d`,
+		SELECT * FROM aggregated
+		ORDER BY %[11]s %[12]s, %[1]s
+		LIMIT %[13]d`,
 		strings.Join(cols, ", "),
 		coreHours("cpu_millicores_requested"),
 		coreHours("cpu_millicores_used"),
@@ -371,6 +370,8 @@ func (r *ReportRepository) CostSummary(ctx context.Context, p CostSummaryParams)
 		gibHours("memory_bytes_used"),
 		gibHours("memory_bytes_billable"),
 		strings.Join(where, " AND "),
+		wastedCoreHours("cpu_millicores_requested", "cpu_millicores_used"),
+		wastedGibHours("memory_bytes_requested", "memory_bytes_used"),
 		orderExpr, direction,
 		limit,
 	)
@@ -444,6 +445,39 @@ func gibHours(column string) string {
 	return fmt.Sprintf(
 		`COALESCE(sum(%s::numeric / 1073741824 * EXTRACT(EPOCH FROM (window_end - window_start)) / 3600), 0)`,
 		column)
+}
+
+// wastedCoreHours sums per-row waste, floored at zero BEFORE aggregation.
+//
+// WHY THE FLOOR HAS TO BE INSIDE THE SUM
+// --------------------------------------
+// This was previously GREATEST(sum(requested) - sum(used), 0) applied after the GROUP BY, and that is
+// wrong in a way that reads as correct. The floor stopped the FINAL figure being negative; it did not
+// stop the cancellation, because the cancellation happens inside the two sums before the subtraction.
+//
+// A group with one container wasting 90 millicores and one under-requested by 990 aggregated to
+// 90 - 990 = -900, which floored to 0. So a namespace containing real, reclaimable waste reported
+// ZERO waste -- and the more under-requested a team's workloads were, the more efficient it looked.
+// The metric rewarded the riskier configuration, which is the opposite of the intent written in the
+// comment on WastedCPUCoreHours.
+//
+// sum(GREATEST(per-row, 0)) instead: each row's waste is floored on its own, so an under-requested
+// container contributes zero rather than a credit. This is one of those bugs where the doc comment
+// described the correct behaviour and the SQL beneath it did something else -- worth remembering that
+// a comment asserting a property is not a test of it.
+func wastedCoreHours(requested, used string) string {
+	return fmt.Sprintf(
+		`COALESCE(sum(GREATEST(%s - %s, 0)::numeric / 1000 `+
+			`* EXTRACT(EPOCH FROM (window_end - window_start)) / 3600), 0)`,
+		requested, used)
+}
+
+// wastedGibHours is wastedCoreHours for memory. See there for why the floor is per row.
+func wastedGibHours(requested, used string) string {
+	return fmt.Sprintf(
+		`COALESCE(sum(GREATEST(%s - %s, 0)::numeric / 1073741824 `+
+			`* EXTRACT(EPOCH FROM (window_end - window_start)) / 3600), 0)`,
+		requested, used)
 }
 
 // assignGroupValues copies the scanned grouping values onto their named fields.

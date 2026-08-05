@@ -60,6 +60,12 @@ const defaultRangeHours = 24
 // wrong shifts a whole cost report by a month. One unambiguous format, required to include a
 // timezone, removes the question.
 func timeRange(q url.Values, v *validationError) (from, to time.Time) {
+	return timeRangeDefault(q, v, defaultRangeHours*time.Hour)
+}
+
+// timeRangeDefault is timeRange with a caller-chosen default span, so the recommendations endpoint can
+// default wider than the cost endpoints without duplicating the parsing and validation.
+func timeRangeDefault(q url.Values, v *validationError, defaultSpan time.Duration) (from, to time.Time) {
 	now := time.Now().UTC()
 
 	parse := func(key string) (time.Time, bool) {
@@ -81,11 +87,11 @@ func timeRange(q url.Values, v *validationError) (from, to time.Time) {
 	switch {
 	case !hasFrom && !hasTo:
 		to = now
-		from = now.Add(-defaultRangeHours * time.Hour)
+		from = now.Add(-defaultSpan)
 	case hasFrom && !hasTo:
 		to = now
 	case !hasFrom && hasTo:
-		from = to.Add(-defaultRangeHours * time.Hour)
+		from = to.Add(-defaultSpan)
 	}
 
 	if hasFrom || hasTo {
@@ -236,6 +242,26 @@ func summaryParams(r *http.Request) (postgres.CostSummaryParams, *validationErro
 		GroupBy: groupBy, Filters: f,
 		SortBy: sortBy, Descending: descending, Limit: limit,
 	}, nil
+}
+
+// statsParams parses a recommendations request.
+//
+// The default range is SEVEN DAYS rather than the 24 hours the cost endpoints use, and that asymmetry
+// is deliberate. A cost figure for the last day is a useful answer on its own; a RECOMMENDATION from
+// one day of data cannot see a weekly pattern, so a batch job that runs on Sundays looks abandoned.
+// Defaulting wider means the advice is more trustworthy without the caller having to know to ask.
+func statsParams(r *http.Request) (postgres.ContainerStatsParams, *validationError) {
+	q := r.URL.Query()
+	v := &validationError{}
+
+	from, to := timeRangeDefault(q, v, 7*24*time.Hour)
+	limit := limitParam(q, "limit", 200, 1000, v)
+	f := filters(q, v)
+
+	if !v.empty() {
+		return postgres.ContainerStatsParams{}, v
+	}
+	return postgres.ContainerStatsParams{From: from, To: to, Filters: f, Limit: limit}, nil
 }
 
 // allocationsParams parses a raw-allocations page request.

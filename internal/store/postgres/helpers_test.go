@@ -161,6 +161,23 @@ type fixture struct {
 	namespaceID int64
 	workloadID  int64
 	podID       int64
+
+	// The NAMES matter as much as the ids, and for a reason that is easy to miss.
+	//
+	// Rollback isolates WRITES. It does not isolate READS: a test transaction sees every row the
+	// collector has already COMMITTED. So any test that aggregates the fact table without narrowing
+	// to its own fixture is really asserting on the contents of the dev database, and it passes only
+	// until the collector runs.
+	//
+	// That has now bitten twice -- once in TestUpsert_IsIdempotent, which counted whole tables, and
+	// once in the CostByNamespace tests, which asserted "1 namespace" and got 6 the moment real data
+	// existed. Both were green when written and both broke without anything being wrong with the code.
+	//
+	// These names are suffixed with the test's own name, so passing namespaceName as a filter gives
+	// a test a private view of the table. Read isolation has to be asked for; it is not free.
+	clusterName   string
+	namespaceName string
+	nodeName      string
 }
 
 func seedFixture(t *testing.T, ctx context.Context, db Querier) fixture {
@@ -200,5 +217,9 @@ func seedFixture(t *testing.T, ctx context.Context, db Querier) fixture {
 		t.Fatalf("seed pod: %v", err)
 	}
 
-	return fixture{clusterID, nodeID, namespaceID, workloadID, podID}
+	return fixture{
+		clusterID: clusterID, nodeID: nodeID, namespaceID: namespaceID,
+		workloadID: workloadID, podID: podID,
+		clusterName: "cluster-" + suffix, namespaceName: "ns-" + suffix, nodeName: "node-" + suffix,
+	}
 }

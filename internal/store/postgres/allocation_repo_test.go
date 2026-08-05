@@ -28,12 +28,14 @@ func baseAllocation(f fixture, start time.Time) domain.ContainerAllocation {
 		PodID:         f.podID,
 		ContainerName: "app",
 
-		ClusterName:   "kca-dev",
-		NamespaceName: "team-payments",
+		// The fixture's UNIQUE names, not "kca-dev"/"team-payments". Those were real namespaces in
+		// the dev cluster, so every aggregate test silently included the collector's own rows.
+		ClusterName:   f.clusterName,
+		NamespaceName: f.namespaceName,
 		PodName:       "api-abc",
 		WorkloadKind:  "Deployment",
 		WorkloadName:  "api",
-		NodeName:      "worker-1",
+		NodeName:      f.nodeName,
 		Team:          "payments",
 		CostCentre:    "cc-1001",
 		Environment:   "production",
@@ -382,118 +384,6 @@ func TestInsertBatch_ValidatesBeforeSending(t *testing.T) {
 	// The transaction must still be usable, which is the practical benefit of failing early.
 	if _, err := tx.Exec(ctx, `SELECT 1`); err != nil {
 		t.Errorf("transaction is unusable after a rejected batch: %v", err)
-	}
-}
-
-// -----------------------------------------------------------------------------
-// Reporting: the half-open interval
-// -----------------------------------------------------------------------------
-
-// TestCostByNamespace_HalfOpenRange is the boundary test, and it is the one most likely to
-// catch a real reporting bug.
-//
-// Windows are [start, end). A range query must therefore be >= from AND < to. Using BETWEEN
-// (closed on both ends) would include the sample exactly at `to`, which is also the first
-// sample of the NEXT period -- so August and September would each count the 1 September
-// 00:00 window, and the two reports would sum to more than the year.
-func TestCostByNamespace_HalfOpenRange(t *testing.T) {
-	ctx, tx := withTx(t)
-	f := seedFixture(t, ctx, tx)
-	repo := NewAllocationRepository(tx)
-
-	// Three windows: before the range, inside it, and exactly ON the upper bound.
-	times := []time.Time{
-		time.Date(2026, 8, 4, 8, 55, 0, 0, time.UTC), // before `from`
-		time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC),  // inside
-		time.Date(2026, 8, 4, 9, 30, 0, 0, time.UTC), // exactly `to`
-	}
-	for _, ts := range times {
-		a := baseAllocation(f, ts)
-		a.NamespaceName = "team-payments"
-		a.CPUCost = mustDec(t, "1.0000000000")
-		a.MemoryCost = decimal.Zero
-		if err := repo.Insert(ctx, a); err != nil {
-			t.Fatalf("insert at %s: %v", ts, err)
-		}
-	}
-
-	from := time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
-	to := time.Date(2026, 8, 4, 9, 30, 0, 0, time.UTC)
-
-	costs, err := repo.CostByNamespace(ctx, from, to)
-	if err != nil {
-		t.Fatalf("CostByNamespace: %v", err)
-	}
-	if len(costs) != 1 {
-		t.Fatalf("got %d namespaces, want 1: %+v", len(costs), costs)
-	}
-
-	// Exactly ONE window is in range: 09:00. The 08:55 sample is before `from`, and the
-	// 09:30 sample sits ON `to`, which is excluded.
-	if !costs[0].TotalCost.Equal(mustDec(t, "1.0000000000")) {
-		t.Errorf("TotalCost = %s, want exactly 1.0 (one window in [09:00, 09:30)). "+
-			"2.0 means the upper bound was included and adjacent reports will double-count",
-			costs[0].TotalCost)
-	}
-	if costs[0].Team != "payments" {
-		t.Errorf("Team = %q, want %q from the denormalised attribution", costs[0].Team, "payments")
-	}
-}
-
-// TestCostByNamespace_CoreHourMaths checks the unit conversion in SQL: a 500 millicore
-// reservation held for one hour is 0.5 core-hours.
-func TestCostByNamespace_CoreHourMaths(t *testing.T) {
-	ctx, tx := withTx(t)
-	f := seedFixture(t, ctx, tx)
-	repo := NewAllocationRepository(tx)
-
-	start := time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
-	a := baseAllocation(f, start)
-	a.WindowEnd = start.Add(time.Hour) // a full hour, to make the arithmetic obvious
-	a.CPUMillicoresRequested = 500
-	a.CPUMillicoresUsed = 0
-	a.MemoryBytesRequested = 2 * 1024 * 1024 * 1024 // 2 GiB
-	a.MemoryBytesUsed = 0
-
-	if err := repo.Insert(ctx, a); err != nil {
-		t.Fatalf("insert: %v", err)
-	}
-
-	costs, err := repo.CostByNamespace(ctx, start, start.Add(2*time.Hour))
-	if err != nil {
-		t.Fatalf("CostByNamespace: %v", err)
-	}
-	if len(costs) != 1 {
-		t.Fatalf("got %d rows, want 1", len(costs))
-	}
-
-	// 500 millicores for 1 hour = 0.5 core-hours.
-	if !costs[0].CPUCoreHours.Equal(mustDec(t, "0.5")) {
-		t.Errorf("CPUCoreHours = %s, want 0.5", costs[0].CPUCoreHours)
-	}
-	// 2 GiB for 1 hour = 2 GiB-hours.
-	if !costs[0].MemoryGiBHours.Equal(mustDec(t, "2")) {
-		t.Errorf("MemoryGiBHours = %s, want 2", costs[0].MemoryGiBHours)
-	}
-}
-
-// TestCostByNamespace_EmptyRangeIsEmptySlice guards the JSON contract: a nil slice marshals
-// to null, and null.length throws in the frontend.
-func TestCostByNamespace_EmptyRangeIsEmptySlice(t *testing.T) {
-	ctx, tx := withTx(t)
-	repo := NewAllocationRepository(tx)
-
-	costs, err := repo.CostByNamespace(ctx,
-		time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC),
-		time.Date(2030, 1, 2, 0, 0, 0, 0, time.UTC))
-	if err != nil {
-		t.Fatalf("CostByNamespace: %v", err)
-	}
-	if costs == nil {
-		t.Error("returned a nil slice; want empty so it marshals as [] not null")
-	}
-	if len(costs) != 0 {
-		t.Errorf("got %d rows for an empty range, want 0", len(costs))
 	}
 }
 
