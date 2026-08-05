@@ -28,7 +28,12 @@ const (
 
 	// labelCapacityType is OURS (kca.io/), because there is no cross-cloud standard.
 	// AWS uses eks.amazonaws.com/capacityType, Karpenter uses karpenter.sh/capacity-type,
-	// GKE uses cloud.google.com/gke-spot. Phase 3 will map those onto this one.
+	// GKE uses cloud.google.com/gke-spot.
+	//
+	// NOT YET MAPPED: deploy/kind/cluster.yaml sets kca.io/capacity-type directly, so the demo
+	// cluster needs no translation. A real EKS or GKE cluster does, and that mapping belongs
+	// with the cloud providers in Phase 11 rather than here -- reading a provider-specific label
+	// in the generic translation layer would mean this file growing a branch per cloud.
 	labelCapacityType = "kca.io/capacity-type"
 
 	// Cost allocation dimensions, read from namespace labels.

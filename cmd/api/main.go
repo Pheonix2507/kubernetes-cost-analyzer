@@ -164,9 +164,14 @@ func run() error {
 		"has_fallback", catalogue.Fallback != nil,
 	)
 
-	// The aggregator receives db and store as health.Checkers. It has no idea one is
-	// Postgres and the other an informer cache -- which is exactly why adding the
-	// Prometheus check in Phase 4 will be a change to THIS LINE ONLY.
+	// The aggregator receives db and store as health.Checkers. It has no idea one is Postgres
+	// and the other an informer cache.
+	//
+	// Prometheus is deliberately NOT a readiness dependency of the API, even though
+	// prom.Client implements health.Checker. The API serves inventory and (from Phase 5) cost
+	// data out of Postgres; it never queries Prometheus. Adding a check for a dependency this
+	// process does not use would take it out of service during a monitoring outage it is
+	// entirely unaffected by. The COLLECTOR is the process that depends on Prometheus.
 	readiness := health.NewAggregator(2*time.Second, db, store)
 
 	// -------------------------------------------------------------------------

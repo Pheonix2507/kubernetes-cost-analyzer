@@ -112,6 +112,13 @@ func run() error {
 		return fmt.Errorf("loading pricing catalogue: %w", err)
 	}
 	pricer := pricing.NewCatalogueProvider(catalogue, logger)
+	logger.Info("pricing catalogue loaded",
+		"path", cfg.Pricing.CataloguePath,
+		"currency", catalogue.Currency,
+		"cpu_share", catalogue.Split.CPU,
+		"memory_share", catalogue.Split.Memory,
+		"has_fallback", catalogue.Fallback != nil,
+	)
 
 	engine, err := costing.NewEngine(costing.Options{
 		ClusterName: cfg.ClusterName,
@@ -125,7 +132,7 @@ func run() error {
 		return err
 	}
 
-	w := newWriter(db, cfg.ClusterName, logger)
+	w := newWriter(db, store, cfg.ClusterName, logger)
 
 	// -------------------------------------------------------------------------
 	// Run the informers and the collection loop together.
@@ -153,7 +160,7 @@ func run() error {
 	})
 
 	g.Go(func() error {
-		return collectLoop(gctx, engine, w, cfg, logger, synced)
+		return collectLoop(gctx, engine, w, pricer, cfg, logger, synced)
 	})
 
 	if err := g.Wait(); err != nil {
@@ -167,7 +174,8 @@ func run() error {
 // collectLoop runs a collection cycle on every tick until ctx is cancelled.
 func collectLoop(
 	ctx context.Context, engine *costing.Engine, w *writer,
-	cfg *config.Config, logger *slog.Logger, synced <-chan struct{},
+	pricer *pricing.CatalogueProvider, cfg *config.Config, logger *slog.Logger,
+	synced <-chan struct{},
 ) error {
 	// Wait for the informer caches before the first cycle.
 	select {
@@ -194,7 +202,7 @@ func collectLoop(
 
 	// Collect immediately rather than waiting a full interval for the first tick, so a restart
 	// costs one window of data rather than two.
-	runCycle(ctx, engine, w, cfg, logger)
+	runCycle(ctx, engine, w, pricer, cfg, logger)
 
 	for {
 		select {
@@ -206,7 +214,7 @@ func collectLoop(
 			return nil
 
 		case <-ticker.C:
-			runCycle(ctx, engine, w, cfg, logger)
+			runCycle(ctx, engine, w, pricer, cfg, logger)
 		}
 	}
 }
@@ -222,7 +230,7 @@ func collectLoop(
 // counter, which is the signal that actually matters -- one failed cycle is noise, twenty in a
 // row is an outage.
 func runCycle(
-	ctx context.Context, engine *costing.Engine, w *writer,
+	ctx context.Context, engine *costing.Engine, w *writer, pricer *pricing.CatalogueProvider,
 	cfg *config.Config, logger *slog.Logger,
 ) {
 	// Aligned AND lagged: the last interval boundary at least scrapeLag ago. Alignment is what
@@ -254,6 +262,17 @@ func runCycle(
 		return
 	}
 
-	logger.Info("collection cycle complete",
-		append(result.Summary(), "duration_ms", time.Since(started).Milliseconds())...)
+	// FALLBACK COUNT IS REPORTED EVERY CYCLE, because "how much of this bill is guessed?" is
+	// otherwise unanswerable in practice.
+	//
+	// pricing tracks it, but nothing was reading it -- so a cluster whose entire fleet was
+	// priced from the fallback rate would have produced confident-looking numbers with the
+	// caveat visible only in a per-node database column nobody queries. Surfacing it on the
+	// cycle log makes an estimated bill obvious at a glance, and Phase 9 turns it into the
+	// metric this really wants to be.
+	summary := append(result.Summary(),
+		"duration_ms", time.Since(started).Milliseconds(),
+		"fallback_priced_nodes", pricer.FallbackCount(),
+	)
+	logger.Info("collection cycle complete", summary...)
 }

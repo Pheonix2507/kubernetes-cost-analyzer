@@ -21,6 +21,10 @@
 # identities, and so reviewing "what may this thing do" is reading one document rather
 # than hunting through an identity's inline permissions.
 #
+# The verbs are get, list and watch, and NOTHING else -- no create, update, patch or delete
+# appears anywhere below. The resource list is likewise the exact set the code reads today;
+# see the note further down about what was removed and why.
+#
 # CLUSTER-scoped, not namespace-scoped (Role/RoleBinding), for two reasons:
 #   1. Nodes are cluster-scoped objects. A namespaced Role cannot grant access to them
 #      at all, and node capacity is where cost originates.
@@ -78,13 +82,6 @@ rules:
       - nodes # capacity, allocatable, instance-type labels: the basis of price
       - namespaces # the cost-allocation dimensions (team, cost-centre, environment)
       - pods # what reserved what, and where it landed
-      # Below are not read in Phase 1, but are granted now because they are the
-      # remaining pieces of the cost picture and adding them later means a second RBAC
-      # review. Granting a read verb on an object we will read next phase is a
-      # different thing from granting a write verb we will never use.
-      - persistentvolumeclaims # orphaned storage (the Phase 6 fixture)
-      - persistentvolumes # the actual provisioned disks, and their reclaim policy
-      - services # correlating idle workloads with traffic
     verbs: ["get", "list", "watch"]
 
   # ---------------------------------------------------------------------------
@@ -97,28 +94,34 @@ rules:
   # ---------------------------------------------------------------------------
   - apiGroups: ["apps"]
     resources:
-      - replicasets # the second hop: pod -> ReplicaSet -> Deployment
-      - deployments # replica counts, for the over-replication check
-      - statefulsets
-      - daemonsets
-    verbs: ["get", "list", "watch"]
-
-  - apiGroups: ["batch"]
-    resources:
-      - jobs # a Job-owned pod attributes to its Job
-      - cronjobs # and a Job to its CronJob
+      # replicasets is the ONLY apps resource the code reads, and it is not optional: a pod
+      # managed by a Deployment is owned by a ReplicaSet whose name carries a rollout hash, so
+      # without this every workload's cost history would reset on every deploy. See
+      # resolveWorkload in internal/kube/convert.go.
+      #
+      # Deployments, StatefulSets and DaemonSets are deliberately ABSENT. Ownership is resolved
+      # from each object's OwnerReferences, which requires reading only the intermediate
+      # ReplicaSet -- the Deployment's own object is never fetched.
+      - replicasets
     verbs: ["get", "list", "watch"]
 
   # ---------------------------------------------------------------------------
-  # The Metrics API, for cross-checking Prometheus.
+  # WHAT IS DELIBERATELY NOT GRANTED, AND WHY THAT CHANGED
+  # ---------------------------------------------------------------------------
+  # An earlier version of this file also granted persistentvolumeclaims, persistentvolumes,
+  # services, deployments, statefulsets, daemonsets, jobs, cronjobs and metrics.k8s.io -- on
+  # the reasoning that they are "the remaining pieces of the cost picture" and that adding them
+  # later would mean a second RBAC review.
   #
-  # metrics.k8s.io is an AGGREGATED API served by metrics-server, not by the API server
-  # itself, which is why it needs its own rule. Read-only by nature -- there is nothing
-  # to write.
-  # ---------------------------------------------------------------------------
-  - apiGroups: ["metrics.k8s.io"]
-    resources: ["nodes", "pods"]
-    verbs: ["get", "list"]
+  # An audit found the code reads NONE of them. So the file was granting nine unused resources
+  # while arguing loudly for least privilege three paragraphs above, which is not a defensible
+  # position: least privilege means what is needed NOW, and a second review when the need
+  # arrives is the POINT rather than a cost to be avoided. An RBAC change should be a reviewed
+  # event.
+  #
+  # Phase 6 will need persistentvolumeclaims and persistentvolumes for orphaned-storage
+  # detection, and services to correlate idle workloads with traffic. It can add them, in a
+  # commit whose diff says exactly that.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding

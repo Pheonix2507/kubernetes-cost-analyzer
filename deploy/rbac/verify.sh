@@ -69,8 +69,6 @@ want_yes watch  namespaces
 # their Deployment.
 want_yes get    replicasets    --all-namespaces
 want_yes list   replicasets    --all-namespaces
-want_yes list   persistentvolumeclaims --all-namespaces
-want_yes list   services       --all-namespaces
 
 echo
 echo "MUST BE DENIED -- these prove least privilege actually holds:"
@@ -92,6 +90,24 @@ want_no  list   secrets        --all-namespaces
 want_no  list   configmaps     --all-namespaces
 # Exec into a pod is remote code execution inside the cluster.
 want_no  create pods/exec      --all-namespaces
+
+echo
+echo "MUST BE DENIED -- resources the code does not read, removed after an audit:"
+# These were granted on the reasoning that they are "the remaining pieces of the cost picture".
+# The code reads none of them, so granting them contradicted the least-privilege argument in
+# the same file. Phase 6 will add PVCs, PVs and services when it genuinely needs them, in a
+# commit whose diff says so.
+#
+# Asserting they are DENIED turns "we removed these" into a property the script enforces,
+# rather than a claim in a comment that could silently drift back.
+want_no  list   persistentvolumeclaims --all-namespaces
+want_no  list   persistentvolumes
+want_no  list   services       --all-namespaces
+want_no  list   deployments    --all-namespaces
+want_no  list   statefulsets   --all-namespaces
+want_no  list   daemonsets     --all-namespaces
+want_no  list   jobs           --all-namespaces
+want_no  list   cronjobs       --all-namespaces
 
 echo
 if (( failures > 0 )); then

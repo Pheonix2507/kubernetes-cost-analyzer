@@ -21,13 +21,24 @@ import (
 // If a second binary ever needs to persist allocations, that is the moment to extract it --
 // from two real callers rather than in anticipation of one.
 type writer struct {
-	db          *postgres.DB
+	db *postgres.DB
+	// inventory is the AUTHORITATIVE source for dimension rows.
+	//
+	// An earlier version reconstructed nodes and namespaces from the fact rows, which carry
+	// only the handful of fields denormalised onto them. The result was node rows with
+	// capacity_cpu_millicores = 0, because a fact row has no reason to carry node capacity --
+	// and a comment claimed cmd/api would "correct" them later, which was simply false:
+	// cmd/api never writes to the database at all.
+	//
+	// Dimensions come from the live objects; facts come from the engine. Each from the source
+	// that actually knows.
+	inventory   costing.Inventory
 	clusterName string
 	log         *slog.Logger
 }
 
-func newWriter(db *postgres.DB, clusterName string, log *slog.Logger) *writer {
-	return &writer{db: db, clusterName: clusterName, log: log}
+func newWriter(db *postgres.DB, inventory costing.Inventory, clusterName string, log *slog.Logger) *writer {
+	return &writer{db: db, inventory: inventory, clusterName: clusterName, log: log}
 }
 
 // write persists the dimensions and the fact rows for one cycle.
@@ -59,58 +70,87 @@ func (w *writer) write(ctx context.Context, result costing.Result) error {
 			return fmt.Errorf("upserting cluster: %w", err)
 		}
 
-		// Resolve each distinct dimension ONCE per cycle, not once per allocation.
+		// NODES AND NAMESPACES COME FROM THE LIVE OBJECTS, not from the fact rows.
 		//
-		// A 5,000-container cluster produces 5,000 fact rows but only a few hundred distinct
-		// pods and a handful of nodes and namespaces. Upserting per fact row would issue tens
-		// of thousands of statements to write the same few hundred dimension rows, and every
-		// one is a round trip. These caches turn that back into the number of DISTINCT objects.
+		// The informer cache holds the complete Node and Namespace objects -- capacity,
+		// allocatable, the full label map. A fact row carries only the few fields denormalised
+		// onto it for reporting, so reconstructing dimensions from facts produces rows that are
+		// technically present and substantively empty.
 		//
-		// Plain maps with no locking, because this runs on one goroutine inside a single
-		// transaction -- a transaction cannot be used concurrently anyway, so there is nothing
-		// to synchronise.
-		nodeIDs := map[string]int64{}
-		namespaceIDs := map[string]int64{}
+		// There are only tens of nodes and namespaces, so writing them all is cheaper than the
+		// conditional bookkeeping it replaces, and it means the dimension tables are complete
+		// even for a node currently hosting no pods -- which is itself a finding, since an empty
+		// node still costs money.
+		nodes, err := w.inventory.Nodes()
+		if err != nil {
+			return fmt.Errorf("listing nodes for dimension rows: %w", err)
+		}
+		nodeIDs := make(map[string]int64, len(nodes))
+		for _, n := range nodes {
+			id, upsertErr := inv.UpsertNode(ctx, clusterID, n)
+			if upsertErr != nil {
+				return fmt.Errorf("upserting node %q: %w", n.Name, upsertErr)
+			}
+			nodeIDs[n.Name] = id
+		}
+
+		namespaces, err := w.inventory.Namespaces()
+		if err != nil {
+			return fmt.Errorf("listing namespaces for dimension rows: %w", err)
+		}
+		namespaceIDs := make(map[string]int64, len(namespaces))
+		for _, ns := range namespaces {
+			id, upsertErr := inv.UpsertNamespace(ctx, clusterID, ns)
+			if upsertErr != nil {
+				return fmt.Errorf("upserting namespace %q: %w", ns.Name, upsertErr)
+			}
+			namespaceIDs[ns.Name] = id
+		}
+
+		// Workloads and pods ARE resolved from the allocations, and for those it is the right
+		// source: the engine already resolved each pod's owning workload during collection, and
+		// re-reading the cache could disagree with what the cycle actually measured.
+		//
+		// Cached so each distinct workload and pod is upserted once per cycle rather than once
+		// per fact row. A 5,000-container cluster has 5,000 facts but only a few hundred pods,
+		// and every avoided upsert is a saved round trip.
+		//
+		// Plain maps with no locking: this runs on one goroutine inside a single transaction,
+		// and a transaction cannot be used concurrently anyway.
 		workloadIDs := map[string]int64{}
 		podIDs := map[string]int64{}
 
-		// The allocations carry only names, so the dimension rows are reconstructed from them.
-		// That is deliberate: it means the engine's output is self-describing and the writer
-		// needs no second read of the informer cache, which could by then disagree with what
-		// the cycle actually measured.
 		for i := range result.Allocations {
 			a := &result.Allocations[i]
 
 			nsID, ok := namespaceIDs[a.NamespaceName]
 			if !ok {
+				// The namespace was collected but is no longer in the cache -- deleted between
+				// collection and write. Its cost is real and already measured, so the row is
+				// worth keeping rather than discarding, and a minimal dimension row is enough
+				// to hang it on.
 				nsID, err = inv.UpsertNamespace(ctx, clusterID, domain.Namespace{
-					Name:        a.NamespaceName,
-					Team:        a.Team,
-					CostCentre:  a.CostCentre,
-					Environment: a.Environment,
+					Name: a.NamespaceName, Team: a.Team,
+					CostCentre: a.CostCentre, Environment: a.Environment,
 				})
 				if err != nil {
-					return fmt.Errorf("upserting namespace %q: %w", a.NamespaceName, err)
+					return fmt.Errorf("upserting vanished namespace %q: %w", a.NamespaceName, err)
 				}
 				namespaceIDs[a.NamespaceName] = nsID
 			}
 
 			var nodeID *int64
 			if a.NodeName != "" {
+				// Same reasoning: a node removed by the autoscaler mid-cycle still hosted these
+				// containers for the window being priced.
 				id, found := nodeIDs[a.NodeName]
 				if !found {
-					// Capacity is not carried on the fact row, so it is written as zero here and
-					// corrected by cmd/api, which sees the live node objects. The alternative --
-					// carrying full node capacity on every one of thousands of fact rows -- would
-					// bloat the table to record a value that belongs to the node dimension.
 					id, err = inv.UpsertNode(ctx, clusterID, domain.Node{
-						Name:         a.NodeName,
-						InstanceType: a.InstanceType,
-						Zone:         a.Zone,
-						CapacityType: a.CapacityType,
+						Name: a.NodeName, InstanceType: a.InstanceType,
+						Zone: a.Zone, CapacityType: a.CapacityType,
 					})
 					if err != nil {
-						return fmt.Errorf("upserting node %q: %w", a.NodeName, err)
+						return fmt.Errorf("upserting vanished node %q: %w", a.NodeName, err)
 					}
 					nodeIDs[a.NodeName] = id
 				}

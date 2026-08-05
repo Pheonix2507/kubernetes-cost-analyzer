@@ -59,9 +59,8 @@ var panicWriter io.Writer = os.Stderr
 // --------------------------------------------------
 // An interface earns its place when there are multiple real implementations and a
 // caller that must not know which one it has. Both are true here: Postgres
-// implements it now, and Prometheus (Phase 4) and the Kubernetes API (Phase 1) will
-// implement it later. The /readyz handler consumes Checker and will never change as
-// those arrive.
+// implement it: store/postgres.DB, kube.Store and prom.Client. The /readyz handler has never
+// changed as each was added, which is exactly the property the interface was there to provide.
 //
 // It is deliberately tiny. A single-method-plus-name interface is trivial to
 // implement, trivial to fake in tests, and impossible to misuse. Interfaces in Go

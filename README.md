@@ -309,6 +309,7 @@ make check         # fmt + vet + lint + test — everything CI runs
 make test          # go test -race
 make docker-build  # container image
 make db-psql       # psql shell
+make env-check     # report .env keys that .env.example has gained since you created it
 make rbac-up       # apply the ServiceAccount, ClusterRole and binding
 make rbac-verify   # prove the RBAC grants reads and denies every write
 make reset         # tear down and rebuild everything
@@ -320,9 +321,16 @@ make reset         # tear down and rebuild everything
 asks the API server's own authoriser. It tests the real ClusterRole without deploying
 anything, so the fast local loop stays intact.
 
-The **negative** assertions are the point. A ClusterRole granting cluster-admin passes
-every "can I read?" check; only `delete pods → no` and `list secrets → no` demonstrate
-that least privilege holds. Same reasoning as the `right-sized-worker` fixture.
+The **negative** assertions are the point. A ClusterRole granting cluster-admin passes every
+"can I read?" check; only `delete pods → no` and `list secrets → no` demonstrate that least
+privilege holds. Same reasoning as the `right-sized-worker` fixture.
+
+The grant is exactly `get`/`list`/`watch` on **nodes, namespaces, pods and replicasets** — the
+four the code actually reads. An audit found nine further resources granted on the reasoning that
+they were "the remaining pieces of the cost picture"; the code read none of them, which
+contradicted the least-privilege argument three paragraphs above it in the same file. They were
+removed, and `verify.sh` now asserts each is **denied**, so the removal is enforced rather than
+claimed. Phase 6 will add PVCs and services when it genuinely needs them.
 
 ## Roadmap
 

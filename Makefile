@@ -62,11 +62,43 @@ help: ## Show this help
 # Local environment
 # =============================================================================
 .PHONY: env
-env: ## Create .env from .env.example (does not overwrite an existing .env)
+env: ## Create .env from .env.example, or report drift if it already exists
 	@if [ -f .env ]; then \
 		echo ".env already exists, leaving it alone"; \
+		$(MAKE) --no-print-directory env-check; \
 	else \
 		cp .env.example .env && echo "created .env from .env.example"; \
+	fi
+
+.PHONY: env-check
+# WHY THIS TARGET EXISTS
+#
+# `make env` refuses to overwrite an existing .env, which is right -- it holds local edits and a
+# password. The consequence is that every variable added to .env.example afterwards is MISSING
+# from an existing .env, silently, and the service quietly runs on defaults.
+#
+# That is usually harmless because the defaults are sensible. CLUSTER_NAME is the exception: it
+# is denormalised onto every cost row, so running on the default writes data attributed to a
+# cluster called "default" and nothing complains. This audit found exactly that, eight keys
+# behind after four phases.
+#
+# So the drift is reported rather than left to be discovered.
+env-check: ## Report variables present in .env.example but missing from .env
+	@if [ ! -f .env ]; then echo "no .env yet; run: make env"; exit 0; fi
+	@missing=$$(comm -23 \
+		<(grep -oE '^[A-Z_]+=' .env.example | tr -d '=' | sort) \
+		<(grep -oE '^[A-Z_]+=' .env | tr -d '=' | sort)); \
+	if [ -n "$$missing" ]; then \
+		echo ""; \
+		echo "  .env is missing keys that .env.example defines:"; \
+		echo "$$missing" | sed 's/^/    /'; \
+		echo ""; \
+		echo "  Defaults apply, so nothing breaks -- but CLUSTER_NAME in particular is stored on"; \
+		echo "  every cost row, so running on the default attributes data to \"default\"."; \
+		echo "  Copy the missing lines across from .env.example."; \
+		echo ""; \
+	else \
+		echo ".env is in sync with .env.example"; \
 	fi
 
 .PHONY: up
@@ -304,8 +336,20 @@ docker-build: ## Build the container image
 		-t $(IMAGE_REPO)/api:$(VERSION) \
 		-t $(IMAGE_REPO)/api:latest \
 		--target api .
+	# BOTH stages are built. The Dockerfile has always had a collector target, but only api was
+	# ever built -- so a broken collector stage would have been discovered at deploy time in
+	# Phase 10 rather than here. An image nothing builds is an image nothing tests.
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t $(IMAGE_REPO)/collector:$(VERSION) \
+		-t $(IMAGE_REPO)/collector:latest \
+		--target collector .
 	@docker images $(IMAGE_REPO)/api
+	@docker images $(IMAGE_REPO)/collector
 
 .PHONY: kind-load
-kind-load: docker-build ## Load the image into the kind cluster (no registry needed)
+kind-load: docker-build ## Load both images into the kind cluster (no registry needed)
 	kind load docker-image $(IMAGE_REPO)/api:latest --name $(CLUSTER_NAME)
+	kind load docker-image $(IMAGE_REPO)/collector:latest --name $(CLUSTER_NAME)

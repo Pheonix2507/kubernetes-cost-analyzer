@@ -218,7 +218,16 @@ func (r *InventoryRepository) UpsertPod(ctx context.Context, p UpsertPodParams) 
 	return id, nil
 }
 
-// CountRows is a small helper used by tests and by the /readyz depth check.
+// CountRows counts every row in one of the known tables.
+//
+// USED ONLY BY TESTS TODAY. An earlier comment claimed it also backed a "/readyz depth check",
+// which was never true -- readiness checks connectivity via pool.Ping and deliberately does not
+// run a counting query, because a probe polled every few seconds must stay cheap.
+//
+// It is kept because the allow-list pattern below is the answer to a real problem, and because
+// a whole-table count is genuinely useful for diagnostics. Note the trap it caused:
+// TestUpsert_IsIdempotent asserted on these global counts and so passed only against an empty
+// database. Scope counts to the rows under test.
 //
 // The table name is interpolated, which would normally be an injection risk -- so it is
 // validated against an explicit allow-list first. Table and column names CANNOT be

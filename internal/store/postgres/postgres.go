@@ -12,7 +12,9 @@
 // -----------------------------------------
 //   - database/sql is a lowest-common-denominator abstraction across every SQL
 //     driver, so it cannot express Postgres-specific features. It also has no native
-//     support for COPY, which we will want in Phase 4 for bulk-inserting cost rows.
+//     support for COPY. Phase 4 uses pgx.Batch rather than COPY -- COPY cannot express
+//     ON CONFLICT, and idempotent re-collection is not negotiable -- but COPY into a temp
+//     table remains the escalation if batching ever becomes the bottleneck.
 //   - GORM hides the SQL it generates. For a system whose whole job is aggregating
 //     time-series cost data, the queries ARE the product, and being unable to read
 //     or EXPLAIN them without instrumenting the ORM is disqualifying.
