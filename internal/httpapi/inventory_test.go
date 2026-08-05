@@ -66,11 +66,17 @@ func defaultStubPricer() stubPricer {
 }
 
 func newTestRouter(inv Inventory) http.Handler {
-	return NewRouter(discardLogger(), health.NewAggregator(time.Second), inv, defaultStubPricer())
+	return NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
+		Inventory: inv, Pricer: defaultStubPricer(), Reports: &stubReports{},
+	})
 }
 
 func newTestRouterWithPricer(inv Inventory, p pricing.Provider) http.Handler {
-	return NewRouter(discardLogger(), health.NewAggregator(time.Second), inv, p)
+	return NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
+		Inventory: inv, Pricer: p, Reports: &stubReports{},
+	})
 }
 
 func TestListNodes(t *testing.T) {

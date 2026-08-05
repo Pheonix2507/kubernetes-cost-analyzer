@@ -14,6 +14,7 @@ var allKeys = []string{
 	"APP_ENV", "LOG_LEVEL", "CLUSTER_NAME",
 	"API_HTTP_ADDR", "API_READ_TIMEOUT", "API_WRITE_TIMEOUT",
 	"API_IDLE_TIMEOUT", "API_SHUTDOWN_TIMEOUT",
+	"API_KEYS", "API_RATE_LIMIT_PER_SECOND", "API_RATE_LIMIT_BURST",
 	"DATABASE_URL", "DB_MAX_OPEN_CONNS", "DB_MIN_IDLE_CONNS", "DB_CONN_MAX_LIFETIME",
 	"KUBECONFIG", "KUBE_CONTEXT", "KUBE_RESYNC_INTERVAL", "KUBE_CACHE_SYNC_TIMEOUT",
 	"KUBE_QPS", "KUBE_BURST",
@@ -77,6 +78,8 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 		{"API.WriteTimeout", cfg.API.WriteTimeout, 15 * time.Second},
 		{"API.IdleTimeout", cfg.API.IdleTimeout, 60 * time.Second},
 		{"API.ShutdownTimeout", cfg.API.ShutdownTimeout, 15 * time.Second},
+		{"API.RateLimitPerSecond", cfg.API.RateLimitPerSecond, float64(20)},
+		{"API.RateLimitBurst", cfg.API.RateLimitBurst, 40},
 		{"Database.MaxOpenConns", cfg.Database.MaxOpenConns, int32(20)},
 		{"Database.MinIdleConns", cfg.Database.MinIdleConns, int32(5)},
 		{"Database.ConnMaxLifetime", cfg.Database.ConnMaxLifetime, 30 * time.Minute},
@@ -100,6 +103,9 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 func TestLoad_OverridesFromEnvironment(t *testing.T) {
 	env := validEnv()
 	env["APP_ENV"] = "production"
+	// Required in production: see the API_KEYS validation. The test previously passed only
+	// because that rule did not exist yet.
+	env["API_KEYS"] = "0123456789abcdef0123456789abcdef"
 	env["LOG_LEVEL"] = "warn"
 	env["API_HTTP_ADDR"] = ":9999"
 	env["API_SHUTDOWN_TIMEOUT"] = "25s"
@@ -129,6 +135,41 @@ func TestLoad_OverridesFromEnvironment(t *testing.T) {
 	}
 	if cfg.Collector.Interval != 90*time.Minute {
 		t.Errorf("Collector.Interval = %v, want 1h30m", cfg.Collector.Interval)
+	}
+}
+
+// TestLoad_APIKeysAreParsedAsAList covers key rotation: two keys must both be accepted so a new
+// one can be introduced before the old is withdrawn.
+func TestLoad_APIKeysAreParsedAsAList(t *testing.T) {
+	env := validEnv()
+	env["API_KEYS"] = " 0123456789abcdef0123456789abcdef , fedcba9876543210fedcba9876543210 ,, "
+	setEnv(t, env)
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() returned unexpected error: %v", err)
+	}
+	if len(cfg.API.APIKeys) != 2 {
+		t.Fatalf("got %d keys, want 2 (blanks and whitespace must be discarded): %#v",
+			len(cfg.API.APIKeys), cfg.API.APIKeys)
+	}
+	// Trimmed, or a key with a stray space would never match what a client sends.
+	if cfg.API.APIKeys[0] != "0123456789abcdef0123456789abcdef" {
+		t.Errorf("key not trimmed: %q", cfg.API.APIKeys[0])
+	}
+}
+
+// TestLoad_DevelopmentAllowsNoKeys covers the deliberate asymmetry: development must not need
+// ceremony, and production must not be able to run open.
+func TestLoad_DevelopmentAllowsNoKeys(t *testing.T) {
+	setEnv(t, validEnv()) // APP_ENV defaults to development, API_KEYS blank
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load() rejected a development config with no API keys: %v", err)
+	}
+	if len(cfg.API.APIKeys) != 0 {
+		t.Errorf("expected no keys, got %v", cfg.API.APIKeys)
 	}
 }
 
@@ -207,6 +248,29 @@ func TestLoad_InvalidValues(t *testing.T) {
 			env:       map[string]string{"API_SHUTDOWN_TIMEOUT": "0s"},
 			wantIs:    ErrInvalid,
 			wantInMsg: "API_SHUTDOWN_TIMEOUT",
+		},
+		{
+			// The rule that matters most in this table: an unauthenticated cost API serves spend
+			// data to anyone who can reach it, and a healthy startup would say nothing about it.
+			name:      "production without API keys",
+			env:       map[string]string{"APP_ENV": "production"},
+			wantIs:    ErrRequired,
+			wantInMsg: "API_KEYS",
+		},
+		{
+			name: "API key too short to be a secret",
+			env: map[string]string{
+				"APP_ENV":  "production",
+				"API_KEYS": "short",
+			},
+			wantIs:    ErrInvalid,
+			wantInMsg: "API_KEYS",
+		},
+		{
+			name:      "negative rate limit",
+			env:       map[string]string{"API_RATE_LIMIT_PER_SECOND": "-1"},
+			wantIs:    ErrInvalid,
+			wantInMsg: "API_RATE_LIMIT_PER_SECOND",
 		},
 		{
 			// REGRESSION: net/http treats a zero timeout as NO timeout, silently

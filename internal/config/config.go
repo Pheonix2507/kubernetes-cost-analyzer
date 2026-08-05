@@ -113,6 +113,17 @@ type API struct {
 	// politely waiting, and we lose the in-flight requests we were trying to
 	// protect -- strictly worse than not implementing graceful shutdown at all.
 	ShutdownTimeout time.Duration
+
+	// APIKeys are the accepted bearer tokens, comma-separated in the environment.
+	//
+	// A LIST rather than one key, so a key can be ROTATED without downtime: add the new one,
+	// migrate clients, remove the old. With a single key, rotation means every client breaks at
+	// the instant the value changes.
+	APIKeys []string
+
+	// RateLimitPerSecond and RateLimitBurst bound requests per client. Zero disables limiting.
+	RateLimitPerSecond float64
+	RateLimitBurst     int
 }
 
 // Database holds PostgreSQL connection settings.
@@ -240,6 +251,13 @@ func Load() (*Config, error) {
 			WriteTimeout:    l.duration("API_WRITE_TIMEOUT", 15*time.Second),
 			IdleTimeout:     l.duration("API_IDLE_TIMEOUT", 60*time.Second),
 			ShutdownTimeout: l.duration("API_SHUTDOWN_TIMEOUT", 15*time.Second),
+
+			APIKeys: l.csv("API_KEYS"),
+			// 20/sec sustained with a burst of 40 is generous for a dashboard and still bounds a
+			// runaway script. Each request aggregates over a partitioned fact table, so the cost
+			// of an unbounded caller falls on Postgres rather than here.
+			RateLimitPerSecond: l.float("API_RATE_LIMIT_PER_SECOND", 20),
+			RateLimitBurst:     l.integer("API_RATE_LIMIT_BURST", 40),
 		},
 
 		Database: Database{
@@ -356,6 +374,36 @@ func (c *Config) Validate() error {
 			errs = append(errs, fmt.Errorf("%s=%s: %w (must be positive; zero or negative "+
 				"disables the timeout entirely)", t.name, t.value, ErrInvalid))
 		}
+	}
+
+	// AUTHENTICATION IS MANDATORY IN PRODUCTION.
+	//
+	// Without this the service starts happily with no keys and serves cost data to anyone who can
+	// reach it -- and nothing about a healthy startup would indicate that. "Secure by default"
+	// means the insecure configuration must be the one that refuses to run, not the one that is
+	// convenient.
+	//
+	// Development is exempt so `make run-api` needs no ceremony, and the API logs a warning at
+	// startup so an unauthenticated instance is never silent about it.
+	if c.IsProduction() && len(c.API.APIKeys) == 0 {
+		errs = append(errs, fmt.Errorf("API_KEYS: %w (at least one key is required when APP_ENV=production; "+
+			"an unauthenticated cost API serves spend data to anyone who can reach it)", ErrRequired))
+	}
+	for i, k := range c.API.APIKeys {
+		// A short key is brute-forceable, and a rate limiter does not save it: an attacker with
+		// several source addresses gets several quotas. 16 characters of real entropy is the
+		// minimum worth calling a secret.
+		if len(k) < 16 {
+			errs = append(errs, fmt.Errorf("API_KEYS[%d]: %w (each key must be at least 16 characters)", i, ErrInvalid))
+		}
+	}
+	if c.API.RateLimitPerSecond < 0 {
+		errs = append(errs, fmt.Errorf("API_RATE_LIMIT_PER_SECOND=%v: %w (must not be negative; use 0 to disable)",
+			c.API.RateLimitPerSecond, ErrInvalid))
+	}
+	if c.API.RateLimitBurst < 0 {
+		errs = append(errs, fmt.Errorf("API_RATE_LIMIT_BURST=%d: %w (must not be negative)",
+			c.API.RateLimitBurst, ErrInvalid))
 	}
 
 	if c.Database.MaxOpenConns <= 0 {
@@ -531,6 +579,26 @@ func (l *loader) float32(key string, def float32) float32 {
 		return def
 	}
 	return float32(f)
+}
+
+// csv parses a comma-separated list, discarding blanks.
+//
+// Blanks are discarded rather than preserved because "a,,b" and a trailing comma are what a
+// hand-edited environment variable actually looks like, and an empty string in a list of API keys
+// would be a key that matches an empty presented value.
+func (l *loader) csv(key string) []string {
+	raw := l.str(key, "")
+	if raw == "" {
+		return nil
+	}
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if trimmed := strings.TrimSpace(p); trimmed != "" {
+			out = append(out, trimmed)
+		}
+	}
+	return out
 }
 
 // float parses a base-10 floating point value.

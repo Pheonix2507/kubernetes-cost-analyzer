@@ -15,11 +15,11 @@ waste = requested - used
 Everything else in this repository is data collection, aggregation and presentation on
 top of that.
 
-## Status: Phase 4 complete — it produces real numbers
+## Status: Phase 5 complete — the API is consumable
 
-The collector runs, queries Prometheus for observed usage, joins it to cluster topology and
-rates, and writes per-container cost into Postgres. **The product works end to end.** What
-remains is reporting on it (Phases 5-8) and operating it (9-10).
+The collector produces cost data and the API serves it: aggregated summaries, cursor-paginated raw
+rows, authentication, rate limiting and an OpenAPI contract. **A frontend could be built against
+this today** — which is Phase 8.
 
 What works today:
 
@@ -58,6 +58,16 @@ What works today:
 | GET | `/api/v1/nodes` | capacity, allocatable, instance type, zone, spot vs on-demand, **and rates** |
 | GET | `/api/v1/namespaces` | cost-allocation dimensions (team, cost-centre, environment) |
 | GET | `/api/v1/pods` | requests, limits, QoS class, resolved workload. `?namespace=` filters |
+| GET | `/api/v1/costs/summary` | **aggregated cost** — `?group_by=` any of 10 dimensions, filtered, sorted |
+| GET | `/api/v1/allocations` | raw per-container samples, cursor-paginated |
+
+Full contract in [`api/openapi.yaml`](api/openapi.yaml), kept honest by a test asserting its enums
+match the allow-lists the code enforces.
+
+```bash
+curl -H "Authorization: Bearer $KEY" \
+  'localhost:8080/api/v1/costs/summary?group_by=workload&sort=wasted_cpu_core_hours'
+```
 
 ## Prerequisites
 
@@ -143,6 +153,7 @@ internal/
   kube           client-go: dual-mode client, shared informers, pure translation
   pricing        rate catalogue, the CPU/memory split, pure cost arithmetic
   prom           PromQL usage queries (the container!="" filter matters -- see below)
+    middleware   ...plus API-key auth and a token-bucket rate limiter
   costing        the join: topology x usage x rates -> cost, with a bounded worker pool
   store/postgres pgx pool, Querier seam, dimension + fact repositories
 migrations       numbered SQL, applied with golang-migrate
@@ -300,6 +311,33 @@ first error, which is right for all-or-nothing work and catastrophic here. The c
 return `nil` and record failures separately, so `errgroup` acts purely as a bounded pool.
 Partial coverage that *reports its gaps* beats a total blank.
 
+## API design decisions
+
+**Cursor pagination, not offset.** `OFFSET 5000` makes Postgres produce and discard 5,000 rows, and
+it is *inconsistent under concurrent writes* — the collector appends every five minutes, so rows
+shift between requests and a client silently sees a duplicate or misses one. Keyset pagination on
+`(window_start, pod_id, container_name)` is an index range scan and stable. Verified: walking every
+page returns 74 rows with **zero duplicates**, matching the table exactly.
+
+**Filters and sorts go through allow-lists.** SQL placeholders bind *values*, not *identifiers* —
+there is no `GROUP BY $1`. So the request carries a symbolic name, the repository maps it to columns
+it owns, and an unrecognised name is a 400 rather than a query.
+
+**Over-large `limit` is refused, not clamped.** Silently returning 100 rows to a caller who asked for
+10,000 makes them believe they have everything — and a client paginating on "did I get fewer rows
+than I asked for?" would stop early and lose data.
+
+**Auth exempts the probes, and that is not convenience.** The kubelet cannot present a credential, so
+a 401 on `/healthz` reads as a probe failure and the container is killed. Enabling authentication
+would put the service into CrashLoopBackOff. The rate limiter exempts them for the same reason.
+
+**Production refuses to start without `API_KEYS`.** Secure by default means the *insecure*
+configuration is the one that will not run. Development starts open and warns loudly on every boot.
+
+**Keys are compared in constant time** against a SHA-256 digest. A plain `==` returns on the first
+differing byte, so it takes measurably longer the more of the prefix matched — an attacker recovers
+the key one position at a time, in linear rather than exponential attempts.
+
 ## Development
 
 ```bash
@@ -341,7 +379,7 @@ claimed. Phase 6 will add PVCs and services when it genuinely needs them.
 | **2** ✅ | Postgres schema, migrations, repositories |
 | **3** ✅ | Pricing engine behind a provider interface |
 | **4** ✅ | Cost engine + Prometheus collector (worker pools, channels, context) |
-| 5 | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |
+| **5** ✅ | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |
 | 6 | Idle detection + recommendation engine |
 | 7 | Rollups, historical trends, monthly reports |
 | 8 | Next.js frontend |

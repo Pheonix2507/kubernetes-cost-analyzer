@@ -177,7 +177,28 @@ func run() error {
 	// -------------------------------------------------------------------------
 	// 5. Run the HTTP server and the informers together.
 	// -------------------------------------------------------------------------
-	router := httpapi.NewRouter(logger, readiness, store, pricer)
+	// An unauthenticated API must never be silent about it. config.Validate refuses this in
+	// production, so reaching here with no keys means development -- but a warning on every start
+	// is what stops a development setting quietly reaching somewhere it should not.
+	if len(cfg.API.APIKeys) == 0 {
+		logger.Warn("API AUTHENTICATION IS DISABLED: no API_KEYS configured",
+			"env", cfg.Env,
+			"note", "anyone who can reach this port can read cost data; refused outright when APP_ENV=production",
+		)
+	} else {
+		logger.Info("api authentication enabled", "configured_keys", len(cfg.API.APIKeys))
+	}
+
+	router := httpapi.NewRouter(httpapi.RouterOptions{
+		Log:                logger,
+		Readiness:          readiness,
+		Inventory:          store,
+		Pricer:             pricer,
+		Reports:            postgres.NewReportRepository(db.Pool()),
+		APIKeys:            cfg.API.APIKeys,
+		RateLimitPerSecond: cfg.API.RateLimitPerSecond,
+		RateLimitBurst:     cfg.API.RateLimitBurst,
+	})
 	srv := httpapi.NewServer(cfg.API, logger, router)
 
 	// errgroup, not sync.WaitGroup. The difference matters here:

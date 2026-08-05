@@ -1,0 +1,611 @@
+# OpenAPI description of the Kubernetes Cost Analyzer API.
+#
+# WHY HAND-WRITTEN RATHER THAN GENERATED FROM CODE
+# ------------------------------------------------
+# Code-first generators (swaggo, huma, goa) cannot drift from the implementation, which is a real
+# advantage and the reason most teams eventually adopt one. The cost is that the contract stops
+# being a reviewed artefact: it becomes an output, and nobody reads a diff of a generated file.
+#
+# For a learning project the contract is the point, so it is written by hand and kept honest by a
+# test that asserts the enum values here match the allow-lists the code actually enforces --
+# see TestOpenAPISpec_MatchesTheCode. That gives most of the drift protection without hiding the
+# design.
+#
+# WHY VERSIONED FROM THE FIRST ENDPOINT
+# /api/v1 was there before there was anything to version. Adding it later means either breaking
+# every client or maintaining an unversioned alias forever, and "we will version it when we need
+# to" is how teams end up doing both.
+
+openapi: 3.1.0
+
+info:
+  title: Kubernetes Cost Analyzer
+  version: "1.0.0"
+  description: |
+    Attributes Kubernetes spend to the teams, namespaces and workloads that cause it.
+
+    Cost is billed on `max(requested, used)`, not on requests alone. A BestEffort container
+    declares no requests, so a request-only formula would price it at zero while it consumes real
+    CPU and memory -- and that cost would be silently smeared across every other team's share.
+
+    **Monetary values are JSON strings, not numbers.** A JSON number is parsed as an IEEE-754
+    double by every JavaScript client, which would reintroduce the imprecision that `numeric(20,10)`
+    in the database and `decimal.Decimal` in the service exist to prevent. Format them for display;
+    never do arithmetic on them client-side.
+
+    **Check `rate_source` and `estimated_rates`.** A cost derived from a fallback rate for an
+    unrecognised instance type is an estimate. It is reported rather than hidden, and it must not be
+    presented as a real figure.
+
+servers:
+  - url: http://localhost:8080
+    description: Local development
+
+security:
+  # Applies to every operation unless overridden. The probes below override it to none, because the
+  # kubelet cannot present a credential -- requiring one there would make every probe fail and kill
+  # the container.
+  - bearerAuth: []
+
+tags:
+  - name: cost
+    description: What things cost.
+  - name: inventory
+    description: Live cluster topology, read from the informer cache.
+  - name: operations
+    description: Probes and build information.
+
+paths:
+  /healthz:
+    get:
+      tags: [operations]
+      summary: Liveness probe
+      description: |
+        Checks NOTHING and returns 200 unconditionally.
+
+        That is the correct implementation, not laziness. Failing liveness makes the kubelet KILL
+        the container, so the only question it should answer is "is this process so broken that a
+        restart is the remedy?" A restart fixes a deadlock; it does not fix an unreachable database,
+        and trying makes a brief dependency blip into a cluster-wide restart storm.
+      security: []
+      responses:
+        "200":
+          description: The process is alive.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, const: ok }
+
+  /readyz:
+    get:
+      tags: [operations]
+      summary: Readiness probe
+      description: |
+        Reports whether this replica can serve traffic, with per-dependency detail.
+
+        Failing removes the pod from Service endpoints WITHOUT restarting it, so traffic drains and
+        returns automatically once the dependency recovers.
+
+        Returns 503, not 500: the service is working correctly and temporarily cannot serve.
+
+        **Must not be exposed through a public ingress** -- the response includes dependency error
+        strings, which can name internal hosts.
+      security: []
+      responses:
+        "200":
+          description: Every dependency is usable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthReport" }
+        "503":
+          description: At least one dependency is unusable.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/HealthReport" }
+
+  /version:
+    get:
+      tags: [operations]
+      summary: Which build is running
+      security: []
+      responses:
+        "200":
+          description: Build metadata injected at link time.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  version: { type: string, example: "2ff2824" }
+                  commit: { type: string, example: "2ff2824" }
+                  build_time: { type: string, format: date-time }
+
+  /api/v1/costs/summary:
+    get:
+      tags: [cost]
+      summary: Aggregated cost over a time range
+      description: |
+        The primary reporting endpoint. Aggregates cost across a half-open range `[from, to)`,
+        grouped by one dimension.
+
+        `totals` is summed from the rows actually returned, so the headline figure can never
+        disagree with the rows beneath it. When `totals.truncated` is true the row set was cut short
+        by `limit` and the totals cover only what was returned.
+      parameters:
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - name: group_by
+          in: query
+          description: The dimension to aggregate by.
+          schema:
+            type: string
+            default: namespace
+            # Kept in step with postgres.GroupByOptions() by TestOpenAPISpec_MatchesTheCode.
+            enum:
+              - capacity_type
+              - container
+              - cost_centre
+              - environment
+              - instance_type
+              - namespace
+              - node
+              - pod
+              - team
+              - workload
+        - name: sort
+          in: query
+          description: Which value to order by.
+          schema:
+            type: string
+            default: total_cost
+            enum:
+              - cpu_cost
+              - cpu_core_hours
+              - dimension
+              - memory_cost
+              - total_cost
+              - wasted_cpu_core_hours
+        - name: order
+          in: query
+          schema: { type: string, enum: [asc, desc], default: desc }
+        - name: limit
+          in: query
+          description: |
+            Maximum rows. **Refused, not clamped**, if too large: silently returning 100 rows to a
+            caller who asked for 10,000 would make them believe they had the whole result set.
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - $ref: "#/components/parameters/Namespace"
+        - $ref: "#/components/parameters/Team"
+        - $ref: "#/components/parameters/Environment"
+        - $ref: "#/components/parameters/CostCentre"
+        - $ref: "#/components/parameters/WorkloadKind"
+        - $ref: "#/components/parameters/WorkloadName"
+        - $ref: "#/components/parameters/Node"
+        - $ref: "#/components/parameters/InstanceType"
+        - $ref: "#/components/parameters/CapacityType"
+        - $ref: "#/components/parameters/EstimatedOnly"
+      responses:
+        "200":
+          description: The aggregated cost.
+          headers:
+            Cache-Control:
+              description: |
+                `private, max-age=60`. Private rather than public: these responses are scoped to
+                whoever authenticated, and a shared proxy caching one caller's report and serving it
+                to another would be a data leak.
+              schema: { type: string }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CostSummaryResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/allocations:
+    get:
+      tags: [cost]
+      summary: Raw per-container cost samples, cursor-paginated
+      description: |
+        The rows a summary was computed from. Use this when a figure looks wrong: it returns
+        requested, used AND billable separately, so the `max(requested, used)` rule is visible
+        rather than implied.
+
+        **Cursor pagination, not offset.** Offset would make Postgres scan and discard N rows, and
+        it is inconsistent under concurrent writes -- the collector appends every five minutes, so
+        rows shift between requests and a client silently sees a duplicate or misses one. A cursor
+        asks for "rows after this exact position", which is an index range scan and stable.
+
+        The cursor is **opaque**. Do not parse it: its internal shape may change, and a client that
+        depends on it has coupled itself to our primary key. Follow `next_cursor` until it is absent.
+      parameters:
+        - $ref: "#/components/parameters/From"
+        - $ref: "#/components/parameters/To"
+        - name: cursor
+          in: query
+          description: Opaque position from a previous response's `next_cursor`. Omit for the first page.
+          schema: { type: string }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - $ref: "#/components/parameters/Namespace"
+        - $ref: "#/components/parameters/Team"
+        - $ref: "#/components/parameters/Environment"
+        - $ref: "#/components/parameters/CostCentre"
+        - $ref: "#/components/parameters/WorkloadKind"
+        - $ref: "#/components/parameters/WorkloadName"
+        - $ref: "#/components/parameters/Node"
+        - $ref: "#/components/parameters/InstanceType"
+        - $ref: "#/components/parameters/CapacityType"
+        - $ref: "#/components/parameters/EstimatedOnly"
+      responses:
+        "200":
+          description: One page of allocations.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/AllocationsResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/nodes:
+    get:
+      tags: [inventory]
+      summary: Cluster nodes with their rates
+      description: |
+        Live node topology from the informer cache, with the per-resource rates the pricing engine
+        derives for each.
+
+        A node that cannot be priced is **still returned**, carrying `pricing.error`. Failing the
+        whole request because one node in fifty has an unrecognised instance type would make the
+        endpoint useless; omitting it silently would hide capacity that exists and costs money.
+      responses:
+        "200":
+          description: Every node.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items:
+                    type: array
+                    items: { $ref: "#/components/schemas/Node" }
+                  count: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/namespaces:
+    get:
+      tags: [inventory]
+      summary: Namespaces and their cost-allocation dimensions
+      responses:
+        "200":
+          description: Every namespace.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+                  count: { type: integer }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/v1/pods:
+    get:
+      tags: [inventory]
+      summary: Pods with requests, QoS class and resolved workload
+      parameters:
+        - name: namespace
+          in: query
+          description: Restrict to one namespace. Must be a DNS-1123 label.
+          schema: { type: string }
+      responses:
+        "200":
+          description: Matching pods.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  items: { type: array, items: { type: object } }
+                  count: { type: integer }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: |
+        `Authorization: Bearer <key>`, or `X-API-Key: <key>`.
+
+        Keys are configured via `API_KEYS` and compared in constant time against a SHA-256 digest --
+        a plain `==` leaks the secret through timing, since it returns on the first differing byte.
+
+        The API refuses to start in production with no keys configured. In development it starts
+        with authentication disabled and warns loudly on every boot.
+
+  parameters:
+    From:
+      name: from
+      in: query
+      description: |
+        Start of the range, inclusive. RFC3339 **with a timezone**.
+
+        One format only, deliberately: `01/02/2026` is January 2nd or February 1st depending on
+        where the caller lives, and guessing wrong shifts a whole cost report by a month.
+
+        Defaults to 24 hours before `to`.
+      schema: { type: string, format: date-time, example: "2026-08-05T00:00:00Z" }
+    To:
+      name: to
+      in: query
+      description: |
+        End of the range, **exclusive**. The range is half-open `[from, to)`, matching the collection
+        windows -- a closed range would double-count the boundary window in two adjacent reports.
+
+        Defaults to now. The range may span at most 400 days.
+      schema: { type: string, format: date-time }
+    Namespace:
+      { name: namespace, in: query, schema: { type: string } }
+    Team:
+      { name: team, in: query, schema: { type: string } }
+    Environment:
+      { name: environment, in: query, schema: { type: string } }
+    CostCentre:
+      { name: cost_centre, in: query, schema: { type: string } }
+    WorkloadKind:
+      { name: workload_kind, in: query, schema: { type: string, example: Deployment } }
+    WorkloadName:
+      { name: workload_name, in: query, schema: { type: string } }
+    Node:
+      { name: node, in: query, schema: { type: string } }
+    InstanceType:
+      { name: instance_type, in: query, schema: { type: string, example: m5.large } }
+    CapacityType:
+      name: capacity_type
+      in: query
+      schema: { type: string, enum: [spot, on-demand] }
+    EstimatedOnly:
+      name: estimated_only
+      in: query
+      description: Return only rows priced from a fallback rate, to answer "how much of this bill is guessed?"
+      schema: { type: boolean, default: false }
+
+  schemas:
+    Money:
+      type: string
+      description: |
+        An exact decimal as a STRING. A JSON number would be parsed as a double by every JavaScript
+        client and lose precision. Format for display; do not compute with it.
+      example: "0.0185500000"
+
+    CostSummaryResponse:
+      type: object
+      required: [from, to, group_by, items, count, totals]
+      properties:
+        from:
+          type: string
+          format: date-time
+          description: Echoed back, because a caller who omitted it received a default it never chose.
+        to: { type: string, format: date-time }
+        group_by: { type: string }
+        count: { type: integer }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/CostSummaryRow" }
+        totals:
+          type: object
+          required: [total_cost, cpu_cost, memory_cost, estimated_rates, truncated]
+          properties:
+            total_cost: { $ref: "#/components/schemas/Money" }
+            cpu_cost: { $ref: "#/components/schemas/Money" }
+            memory_cost: { $ref: "#/components/schemas/Money" }
+            estimated_rates:
+              type: boolean
+              description: True if any returned group was priced from a fallback guess.
+            truncated:
+              type: boolean
+              description: |
+                True when `limit` cut the results short, meaning these totals cover only the rows
+                returned. A partial total presented as complete is simply a wrong number.
+
+    CostSummaryRow:
+      type: object
+      description: |
+        Only the dimension fields relevant to the requested `group_by` are present.
+      properties:
+        namespace: { type: string }
+        team: { type: string }
+        environment: { type: string }
+        cost_centre: { type: string }
+        workload_kind: { type: string }
+        workload_name: { type: string }
+        node: { type: string }
+        instance_type: { type: string }
+        capacity_type: { type: string }
+        pod_name: { type: string }
+        container_name: { type: string }
+        cpu_requested_core_hours: { $ref: "#/components/schemas/Money" }
+        cpu_used_core_hours: { $ref: "#/components/schemas/Money" }
+        cpu_billable_core_hours:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: max(requested, used). This is what cost is computed from.
+        memory_requested_gib_hours: { $ref: "#/components/schemas/Money" }
+        memory_used_gib_hours: { $ref: "#/components/schemas/Money" }
+        memory_billable_gib_hours: { $ref: "#/components/schemas/Money" }
+        wasted_cpu_core_hours:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: |
+            requested minus used, **floored at zero**. Waste cannot be negative: a container using
+            more than it requested is under-requested, which is a reliability problem rather than a
+            saving, and allowing it negative would offset genuine waste elsewhere in a sum.
+        wasted_memory_gib_hours: { $ref: "#/components/schemas/Money" }
+        cpu_cost: { $ref: "#/components/schemas/Money" }
+        memory_cost: { $ref: "#/components/schemas/Money" }
+        total_cost: { $ref: "#/components/schemas/Money" }
+        container_windows:
+          type: integer
+          description: How many container-window samples were aggregated. An unexpectedly small value usually means a filter matched less than intended.
+        estimated_rates: { type: boolean }
+
+    AllocationsResponse:
+      type: object
+      required: [from, to, items, count]
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        count: { type: integer }
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/AllocationRow" }
+        next_cursor:
+          type: string
+          description: |
+            **Absent** on the last page, so its presence answers "is there more?". An empty string
+            would force every client to check for both absence and emptiness.
+
+    AllocationRow:
+      type: object
+      properties:
+        window_start: { type: string, format: date-time }
+        window_end: { type: string, format: date-time }
+        namespace: { type: string }
+        pod_name: { type: string }
+        container_name: { type: string }
+        workload_kind: { type: string }
+        workload_name: { type: string }
+        node_name: { type: string }
+        team: { type: string }
+        cost_centre: { type: string }
+        environment: { type: string }
+        instance_type: { type: string }
+        capacity_type: { type: string, enum: [spot, on-demand] }
+        zone: { type: string }
+        qos_class: { type: string, enum: [Guaranteed, Burstable, BestEffort] }
+        cpu_millicores_requested: { type: integer }
+        cpu_millicores_used: { type: integer }
+        cpu_millicores_billable: { type: integer }
+        memory_bytes_requested: { type: integer }
+        memory_bytes_used: { type: integer }
+        memory_bytes_billable: { type: integer }
+        cpu_cost: { $ref: "#/components/schemas/Money" }
+        memory_cost: { $ref: "#/components/schemas/Money" }
+        total_cost: { $ref: "#/components/schemas/Money" }
+        rate_source:
+          type: string
+          enum: [catalogue, explicit_rates, fallback]
+          description: |
+            How the rate was derived. `fallback` means the instance type was not in the catalogue and
+            an approximate rate was used -- the figure is an estimate and must be presented as one.
+
+    Node:
+      type: object
+      properties:
+        name: { type: string }
+        instance_type: { type: string }
+        region: { type: string }
+        zone: { type: string }
+        capacity_type: { type: string, enum: [spot, on-demand] }
+        capacity_cpu_millicores:
+          type: integer
+          description: What the instance has. **This is what you are billed for.**
+        capacity_memory_bytes: { type: integer }
+        allocatable_cpu_millicores:
+          type: integer
+          description: What the scheduler may hand out. Compute *utilisation* against this, not cost.
+        allocatable_memory_bytes: { type: integer }
+        ready: { type: boolean }
+        unschedulable: { type: boolean }
+        pricing:
+          type: object
+          properties:
+            currency: { type: string, example: USD }
+            node_hourly: { $ref: "#/components/schemas/Money" }
+            cpu_per_core_hour: { $ref: "#/components/schemas/Money" }
+            memory_per_gib_hour: { $ref: "#/components/schemas/Money" }
+            source: { type: string, enum: [catalogue, explicit_rates, fallback] }
+            error:
+              type: string
+              description: Present when the node could not be priced. The node is still returned.
+
+    HealthReport:
+      type: object
+      properties:
+        status: { type: string, enum: [up, down] }
+        checks:
+          type: array
+          items:
+            type: object
+            properties:
+              name: { type: string }
+              status: { type: string, enum: [up, down] }
+              error: { type: string }
+              latency_ms: { type: integer }
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              description: |
+                A stable machine-readable token. Branch on this. `message` is for humans and may be
+                reworded at any time, so never match on it.
+              enum: [invalid_parameter, unauthorized, rate_limited, internal_error]
+            message: { type: string }
+            request_id:
+              type: string
+              description: Quote this when reporting a problem; it turns a vague report into a one-query log lookup.
+            fields:
+              type: array
+              description: Every invalid parameter, not just the first.
+              items:
+                type: object
+                properties:
+                  field: { type: string }
+                  reason: { type: string }
+
+  responses:
+    ValidationError:
+      description: |
+        One or more parameters are invalid. Every problem is listed, so three bad parameters cost one
+        round trip rather than three.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    Unauthorized:
+      description: |
+        No valid API key. The response deliberately does not distinguish missing from wrong -- that
+        would tell an attacker their key is the right shape.
+      headers:
+        WWW-Authenticate:
+          schema: { type: string }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    RateLimited:
+      description: Too many requests. Honour `Retry-After`.
+      headers:
+        Retry-After:
+          description: Seconds to wait. Without this a client can only guess, and most guess "immediately".
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }
+    InternalError:
+      description: |
+        Something failed server-side. The response is deliberately generic; the detail is in the logs
+        against the `request_id`, because an error body can leak SQL, hostnames and internal paths.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/Error" }

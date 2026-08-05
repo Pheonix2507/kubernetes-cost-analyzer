@@ -32,6 +32,12 @@ type ErrorDetail struct {
 	// RequestID lets a user quote an exact identifier when reporting a failure,
 	// which turns an unfalsifiable bug report into a one-query log lookup.
 	RequestID string `json:"request_id,omitempty"`
+	// Fields names each invalid parameter and why.
+	//
+	// A 400 saying only "invalid request" gives a frontend nothing to highlight and a human
+	// nothing to fix. Every problem is listed rather than just the first, so three bad
+	// parameters take one round trip rather than three.
+	Fields []FieldError `json:"fields,omitempty"`
 }
 
 // writeJSON serialises payload as JSON with the given status code.
@@ -94,10 +100,27 @@ func logError(r *http.Request, action string, err error) {
 // writeError sends a structured error response, attaching the request ID
 // automatically so every error is traceable back to its log line.
 func writeError(w http.ResponseWriter, r *http.Request, status int, code, message string) {
+	writeErrorFields(w, r, status, code, message, nil)
+}
+
+// writeValidationError sends a 400 naming every invalid parameter.
+//
+// 400 rather than 422. Both are defensible and the distinction is argued about endlessly: 422
+// strictly means "syntactically valid but semantically wrong", which fits a malformed body better
+// than a malformed query string. For query parameters 400 is what every HTTP client, proxy and
+// developer already expects, and picking the less surprising code matters more than winning the
+// argument.
+func writeValidationError(w http.ResponseWriter, r *http.Request, v *validationError) {
+	writeErrorFields(w, r, http.StatusBadRequest, "invalid_parameter",
+		"one or more query parameters are invalid", v.fields)
+}
+
+func writeErrorFields(w http.ResponseWriter, r *http.Request, status int, code, message string, fields []FieldError) {
 	body := ErrorBody{Error: ErrorDetail{
 		Code:      code,
 		Message:   message,
 		RequestID: middleware.RequestIDFromContext(r.Context()),
+		Fields:    fields,
 	}}
 
 	var buf bytes.Buffer

@@ -47,7 +47,10 @@ func TestHealthz_AlwaysOK(t *testing.T) {
 	// this is the test that enforces the liveness/readiness separation, and it fails
 	// if someone "helpfully" makes /healthz check the database.
 	agg := health.NewAggregator(time.Second, stubChecker{name: "postgres", err: errors.New("down")})
-	srv := NewRouter(discardLogger(), agg, &stubInventory{}, defaultStubPricer())
+	srv := NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: agg,
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	rec := httptest.NewRecorder()
@@ -69,7 +72,10 @@ func TestReadyz_AllDependenciesUp(t *testing.T) {
 	t.Parallel()
 
 	agg := health.NewAggregator(time.Second, stubChecker{name: "postgres"})
-	srv := NewRouter(discardLogger(), agg, &stubInventory{}, defaultStubPricer())
+	srv := NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: agg,
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()
@@ -96,7 +102,10 @@ func TestReadyz_DependencyDownReturns503(t *testing.T) {
 	agg := health.NewAggregator(time.Second,
 		stubChecker{name: "postgres", err: errors.New("connection refused")},
 	)
-	srv := NewRouter(discardLogger(), agg, &stubInventory{}, defaultStubPricer())
+	srv := NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: agg,
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
 	rec := httptest.NewRecorder()
@@ -133,7 +142,10 @@ func TestReadyz_DependencyDownReturns503(t *testing.T) {
 func TestRouting(t *testing.T) {
 	t.Parallel()
 
-	srv := NewRouter(discardLogger(), health.NewAggregator(time.Second), &stubInventory{}, defaultStubPricer())
+	srv := NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+	})
 
 	tests := []struct {
 		name       string
@@ -170,7 +182,10 @@ func TestRouting(t *testing.T) {
 func TestRequestID_GeneratedWhenAbsent(t *testing.T) {
 	t.Parallel()
 
-	srv := NewRouter(discardLogger(), health.NewAggregator(time.Second), &stubInventory{}, defaultStubPricer())
+	srv := NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+	})
 
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/healthz", nil))
@@ -186,7 +201,10 @@ func TestRequestID_HonoursInboundValue(t *testing.T) {
 	t.Parallel()
 
 	const upstream = "abcdef0123456789"
-	srv := NewRouter(discardLogger(), health.NewAggregator(time.Second), &stubInventory{}, defaultStubPricer())
+	srv := NewRouter(RouterOptions{
+		Log: discardLogger(), Readiness: health.NewAggregator(time.Second),
+		Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+	})
 
 	req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
 	req.Header.Set(middleware.RequestIDHeader, upstream)
@@ -306,7 +324,10 @@ func TestProbeLogging(t *testing.T) {
 			if tt.failing {
 				checkers = append(checkers, stubChecker{name: "postgres", err: errors.New("down")})
 			}
-			srv := NewRouter(log, health.NewAggregator(time.Second, checkers...), &stubInventory{}, defaultStubPricer())
+			srv := NewRouter(RouterOptions{
+				Log: log, Readiness: health.NewAggregator(time.Second, checkers...),
+				Inventory: &stubInventory{}, Pricer: defaultStubPricer(), Reports: &stubReports{},
+			})
 
 			rec := httptest.NewRecorder()
 			srv.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, tt.path, nil))
