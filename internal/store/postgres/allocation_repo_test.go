@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/shopspring/decimal"
+
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 )
 
 func mustDec(t *testing.T, s string) decimal.Decimal {
@@ -19,8 +21,8 @@ func mustDec(t *testing.T, s string) decimal.Decimal {
 
 // baseAllocation returns a valid allocation for the seeded fixture, so each test varies
 // only the field it is actually about.
-func baseAllocation(f fixture, start time.Time) ContainerAllocation {
-	return ContainerAllocation{
+func baseAllocation(f fixture, start time.Time) domain.ContainerAllocation {
+	return domain.ContainerAllocation{
 		WindowStart:   start,
 		WindowEnd:     start.Add(5 * time.Minute),
 		PodID:         f.podID,
@@ -230,7 +232,7 @@ func TestBillable(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			a := ContainerAllocation{
+			a := domain.ContainerAllocation{
 				CPUMillicoresRequested: tt.reqCPU, CPUMillicoresUsed: tt.usedCPU,
 				MemoryBytesRequested: tt.reqMem, MemoryBytesUsed: tt.usedMem,
 			}
@@ -270,8 +272,8 @@ func TestValidate(t *testing.T) {
 	t.Parallel()
 
 	start := time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
-	valid := func() ContainerAllocation {
-		return ContainerAllocation{
+	valid := func() domain.ContainerAllocation {
+		return domain.ContainerAllocation{
 			WindowStart: start, WindowEnd: start.Add(5 * time.Minute),
 			PodID: 1, ContainerName: "app",
 			ClusterName: "c", NamespaceName: "n",
@@ -280,20 +282,20 @@ func TestValidate(t *testing.T) {
 
 	tests := []struct {
 		name    string
-		mutate  func(*ContainerAllocation)
+		mutate  func(*domain.ContainerAllocation)
 		wantErr bool
 	}{
-		{"valid", func(*ContainerAllocation) {}, false},
-		{"zero window start", func(a *ContainerAllocation) { a.WindowStart = time.Time{} }, true},
-		{"reversed window", func(a *ContainerAllocation) { a.WindowEnd = start.Add(-time.Minute) }, true},
-		{"zero-length window", func(a *ContainerAllocation) { a.WindowEnd = a.WindowStart }, true},
-		{"missing pod id", func(a *ContainerAllocation) { a.PodID = 0 }, true},
+		{"valid", func(*domain.ContainerAllocation) {}, false},
+		{"zero window start", func(a *domain.ContainerAllocation) { a.WindowStart = time.Time{} }, true},
+		{"reversed window", func(a *domain.ContainerAllocation) { a.WindowEnd = start.Add(-time.Minute) }, true},
+		{"zero-length window", func(a *domain.ContainerAllocation) { a.WindowEnd = a.WindowStart }, true},
+		{"missing pod id", func(a *domain.ContainerAllocation) { a.PodID = 0 }, true},
 		// Part of the primary key: an empty container name would silently collide with any
 		// other unnamed container in the same pod and window.
-		{"empty container name", func(a *ContainerAllocation) { a.ContainerName = "" }, true},
-		{"missing namespace", func(a *ContainerAllocation) { a.NamespaceName = "" }, true},
-		{"negative cpu", func(a *ContainerAllocation) { a.CPUMillicoresRequested = -1 }, true},
-		{"negative cost", func(a *ContainerAllocation) { a.CPUCost = decimal.NewFromInt(-1) }, true},
+		{"empty container name", func(a *domain.ContainerAllocation) { a.ContainerName = "" }, true},
+		{"missing namespace", func(a *domain.ContainerAllocation) { a.NamespaceName = "" }, true},
+		{"negative cpu", func(a *domain.ContainerAllocation) { a.CPUMillicoresRequested = -1 }, true},
+		{"negative cost", func(a *domain.ContainerAllocation) { a.CPUCost = decimal.NewFromInt(-1) }, true},
 	}
 
 	for _, tt := range tests {
@@ -322,7 +324,7 @@ func TestInsertBatch(t *testing.T) {
 	repo := NewAllocationRepository(tx)
 
 	start := time.Date(2026, 8, 4, 9, 0, 0, 0, time.UTC)
-	var batch []ContainerAllocation
+	var batch []domain.ContainerAllocation
 	for i := 0; i < 50; i++ {
 		a := baseAllocation(f, start.Add(time.Duration(i)*5*time.Minute))
 		batch = append(batch, a)
@@ -363,7 +365,7 @@ func TestInsertBatch_ValidatesBeforeSending(t *testing.T) {
 	bad := baseAllocation(f, start.Add(5*time.Minute))
 	bad.ContainerName = "" // invalid
 
-	err := repo.InsertBatch(ctx, []ContainerAllocation{good, bad})
+	err := repo.InsertBatch(ctx, []domain.ContainerAllocation{good, bad})
 	if err == nil {
 		t.Fatal("InsertBatch accepted a batch containing an invalid allocation")
 	}

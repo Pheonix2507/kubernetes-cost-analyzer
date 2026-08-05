@@ -121,6 +121,48 @@ type Namespace struct {
 	CreatedAt time.Time         `json:"created_at"`
 }
 
+// ContainerKind distinguishes the three kinds of container in a pod, which bill differently.
+//
+// This distinction is not cosmetic -- it decides what a container costs:
+//
+//	Regular  runs for the pod's lifetime. Bill it.
+//	Sidecar  an init container with restartPolicy: Always (stable since 1.29). Also runs for
+//	         the pod's whole lifetime, so also billed. A service mesh proxy is the common
+//	         case, and on a mesh-enabled cluster it is on EVERY pod -- ignoring it
+//	         undercounts the entire estate.
+//	Init     runs once, before the app containers, and exits. NOT billed for the window,
+//	         because charging a migration container that ran for ten seconds as though it
+//	         held its reservation for the whole five minutes would overstate that pod
+//	         permanently. It still affects pod-level SCHEDULING via the max() rule.
+type ContainerKind string
+
+// The three container kinds.
+const (
+	ContainerKindRegular ContainerKind = "regular"
+	ContainerKindSidecar ContainerKind = "sidecar"
+	ContainerKindInit    ContainerKind = "init"
+)
+
+// Billable reports whether a container of this kind holds its reservation for the whole
+// window, and therefore whether it should be charged for one.
+//
+// A method rather than a comparison at each call site, so the rule lives in one place. If
+// Kubernetes adds another kind, there is exactly one function to update.
+func (k ContainerKind) Billable() bool {
+	return k == ContainerKindRegular || k == ContainerKindSidecar
+}
+
+// Container is one container's reservation within a pod.
+type Container struct {
+	Name string        `json:"name"`
+	Kind ContainerKind `json:"kind"`
+
+	RequestsCPUMillicores int64 `json:"requests_cpu_millicores"`
+	RequestsMemoryBytes   int64 `json:"requests_memory_bytes"`
+	LimitsCPUMillicores   int64 `json:"limits_cpu_millicores"`
+	LimitsMemoryBytes     int64 `json:"limits_memory_bytes"`
+}
+
 // Workload identifies the controller that owns a pod.
 //
 // Cost is reported at this level, not per pod. Pods are cattle: a Deployment rolling
@@ -172,8 +214,23 @@ type Pod struct {
 	LimitsCPUMillicores int64 `json:"limits_cpu_millicores"`
 	LimitsMemoryBytes   int64 `json:"limits_memory_bytes"`
 
-	ContainerCount int               `json:"container_count"`
-	Labels         map[string]string `json:"labels,omitempty"`
+	ContainerCount int `json:"container_count"`
+
+	// Containers carries PER-CONTAINER reservations, which pod-level totals cannot express.
+	//
+	// WHY THIS EXISTS SEPARATELY FROM THE POD TOTALS ABOVE
+	// ---------------------------------------------------
+	// A pod with a bloated sidecar and a correctly sized application container has
+	// perfectly reasonable pod totals -- they average out. Right-sizing advice must name
+	// WHICH container to shrink, and that is only possible at this grain. It is also why the
+	// fact table is container-grain.
+	//
+	// Note that summing these does NOT reproduce Requests*/Limits* above, and the difference
+	// is not a bug: pod-level effective requests take the MAXIMUM over init containers
+	// rather than their sum, because init containers run sequentially and exit. See
+	// ContainerKind.
+	Containers []Container       `json:"containers,omitempty"`
+	Labels     map[string]string `json:"labels,omitempty"`
 
 	// StartedAt is when the pod began running, and is nil while Pending. Cost is a
 	// rate multiplied by DURATION, so this is what makes it a bill rather than a

@@ -75,6 +75,11 @@ type Config struct {
 	Env      Environment
 	LogLevel string
 
+	// ClusterName is denormalised onto every fact row, so it must be stable for the life of
+	// the cluster: changing it makes yesterday's rows look like they belong to a different
+	// cluster, and a report grouping by cluster would show one estate as two.
+	ClusterName string
+
 	API        API
 	Database   Database
 	Kube       Kube
@@ -225,8 +230,9 @@ func Load() (*Config, error) {
 	l := &loader{}
 
 	cfg := &Config{
-		Env:      Environment(l.str("APP_ENV", string(EnvDevelopment))),
-		LogLevel: l.str("LOG_LEVEL", "info"),
+		Env:         Environment(l.str("APP_ENV", string(EnvDevelopment))),
+		LogLevel:    l.str("LOG_LEVEL", "info"),
+		ClusterName: l.str("CLUSTER_NAME", "default"),
 
 		API: API{
 			Addr:            l.str("API_HTTP_ADDR", ":8080"),
@@ -388,6 +394,9 @@ func (c *Config) Validate() error {
 			c.Kube.ResyncInterval, ErrInvalid))
 	}
 
+	if strings.TrimSpace(c.ClusterName) == "" {
+		errs = append(errs, fmt.Errorf("CLUSTER_NAME: %w (must not be blank; it is stored on every cost row)", ErrInvalid))
+	}
 	if strings.TrimSpace(c.Pricing.CataloguePath) == "" {
 		errs = append(errs, fmt.Errorf("PRICING_CATALOGUE_PATH: %w (must not be blank)", ErrInvalid))
 	}

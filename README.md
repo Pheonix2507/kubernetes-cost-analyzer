@@ -15,11 +15,11 @@ waste = requested - used
 Everything else in this repository is data collection, aggregation and presentation on
 top of that.
 
-## Status: Phase 3 complete
+## Status: Phase 4 complete — it produces real numbers
 
-A reproducible local environment, a production-shaped Go skeleton, live cluster topology
-over a read-only API, a partitioned Postgres schema, and a pricing engine that turns nodes
-into money. **Nothing joins usage to price yet** — that is Phase 4's collector.
+The collector runs, queries Prometheus for observed usage, joins it to cluster topology and
+rates, and writes per-container cost into Postgres. **The product works end to end.** What
+remains is reporting on it (Phases 5-8) and operating it (9-10).
 
 What works today:
 
@@ -43,6 +43,9 @@ What works today:
 - A pricing engine: a YAML rate catalogue keyed on the same well-known instance-type
   labels a cloud provider sets, spot-aware, region-aware, with explicit provenance on
   every rate
+- A cost engine that joins topology, usage and rates: a bounded worker pool over
+  namespaces, best-effort per-namespace failure isolation, `max(request, usage)` billing,
+  and aligned windows that make re-collection idempotent
 - A non-root, shell-less container image
 
 ### Endpoints
@@ -139,6 +142,8 @@ internal/
   domain         the vocabulary all three layers share; stdlib imports only
   kube           client-go: dual-mode client, shared informers, pure translation
   pricing        rate catalogue, the CPU/memory split, pure cost arithmetic
+  prom           PromQL usage queries (the container!="" filter matters -- see below)
+  costing        the join: topology x usage x rates -> cost, with a bounded worker pool
   store/postgres pgx pool, Querier seam, dimension + fact repositories
 migrations       numbered SQL, applied with golang-migrate
 deploy/
@@ -258,6 +263,43 @@ The prices shipped in the catalogue are indicative AWS ap-south-1 list prices an
 approximately wrong for you. Reserved Instances, Savings Plans and Enterprise Agreements move
 the effective rate by 40% or more. Replace them with the numbers on your invoice.
 
+## How a cost figure is produced
+
+```
+informers ──► what exists, and what each CONTAINER reserved
+Prometheus ──► what it actually USED over the window
+catalogue ──► what a core-hour and a GiB-hour COST on that node
+                        │
+                        ▼
+        billable = max(requested, used)          <- the whole product
+        cost     = billable x window x rate
+                        │
+                        ▼
+              container_allocations
+```
+
+Four things this gets right that the obvious implementation does not:
+
+**`container!=""` on every PromQL query.** cAdvisor emits a pod-level aggregate series *and*
+one per container. Omit the filter and every pod is counted twice — measured on this cluster:
+24.0Mi without it, 11.5Mi with it, a **2.1× overcount**.
+
+**Windows are aligned to the interval, not to `now`.** `[now-5m, now)` means a restart at
+09:04:10 records a window overlapping the one recorded at 09:02:37. They share no primary key,
+so the fact table cannot deduplicate them and the overlap is billed twice — the bill grows with
+every restart. Truncating means every process agrees where boundaries are. Verified: three
+collector runs over one window produce 37 rows, not 111.
+
+**Init containers are excluded; sidecars are not.** Kubernetes puts both in
+`spec.initContainers`, distinguished only by `restartPolicy: Always`. Read it naively and
+either every service-mesh proxy vanishes from the bill, or every migration container is charged
+forever for ten seconds of work.
+
+**One namespace failing does not lose the other 39.** `errgroup` cancels its context on the
+first error, which is right for all-or-nothing work and catastrophic here. The closures always
+return `nil` and record failures separately, so `errgroup` acts purely as a bounded pool.
+Partial coverage that *reports its gaps* beats a total blank.
+
 ## Development
 
 ```bash
@@ -290,7 +332,7 @@ that least privilege holds. Same reasoning as the `right-sized-worker` fixture.
 | **1** ✅ | Live inventory via client-go informers + RBAC |
 | **2** ✅ | Postgres schema, migrations, repositories |
 | **3** ✅ | Pricing engine behind a provider interface |
-| 4 | Cost engine + Prometheus collector (worker pools, channels, context) |
+| **4** ✅ | Cost engine + Prometheus collector (worker pools, channels, context) |
 | 5 | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |
 | 6 | Idle detection + recommendation engine |
 | 7 | Rollups, historical trends, monthly reports |

@@ -412,3 +412,151 @@ func TestStripForCache_NonObjectPassesThrough(t *testing.T) {
 // distinguish "unset" from "set to the zero value" -- for RestartPolicy, unset means a
 // normal init container while Always means a sidecar, and those bill differently.
 func ptr[T any](v T) *T { return &v }
+
+// -----------------------------------------------------------------------------
+// Per-container extraction
+// -----------------------------------------------------------------------------
+
+// TestToContainers_ClassifiesKinds is the test that keeps sidecars on the bill and keeps
+// transient init containers off it.
+//
+// Kubernetes stores sidecars in spec.initContainers, distinguished only by
+// restartPolicy: Always. Reading that field naively is wrong in both directions -- every
+// service-mesh proxy disappears from the bill, or every migration container is charged
+// forever for ten seconds of work.
+func TestToContainers_ClassifiesKinds(t *testing.T) {
+	t.Parallel()
+
+	always := corev1.ContainerRestartPolicyAlways
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		InitContainers: []corev1.Container{
+			{
+				Name: "migrate", // plain init: no restartPolicy
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU: qty("2"), corev1.ResourceMemory: qty("2Gi")}},
+			},
+			{
+				Name:          "istio-proxy",
+				RestartPolicy: &always, // this is what makes it a sidecar
+				Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+					corev1.ResourceCPU: qty("100m"), corev1.ResourceMemory: qty("128Mi")}},
+			},
+		},
+		Containers: []corev1.Container{
+			{
+				Name: "app",
+				Resources: corev1.ResourceRequirements{
+					Requests: corev1.ResourceList{
+						corev1.ResourceCPU: qty("500m"), corev1.ResourceMemory: qty("512Mi")},
+					Limits: corev1.ResourceList{
+						corev1.ResourceCPU: qty("1"), corev1.ResourceMemory: qty("1Gi")},
+				},
+			},
+			{Name: "no-resources"}, // BestEffort container
+		},
+	}}
+
+	got := toContainers(pod)
+	if len(got) != 4 {
+		t.Fatalf("got %d containers, want 4", len(got))
+	}
+
+	byName := map[string]domain.Container{}
+	for _, c := range got {
+		byName[c.Name] = c
+	}
+
+	tests := []struct {
+		name       string
+		wantKind   domain.ContainerKind
+		wantBilled bool
+		wantCPU    int64
+		why        string
+	}{
+		{
+			name: "app", wantKind: domain.ContainerKindRegular, wantBilled: true, wantCPU: 500,
+			why: "an ordinary container runs for the pod's lifetime",
+		},
+		{
+			name: "istio-proxy", wantKind: domain.ContainerKindSidecar, wantBilled: true, wantCPU: 100,
+			why: "restartPolicy: Always means it runs alongside the app for the pod's whole " +
+				"life, so it IS billed. On a mesh cluster this is every pod",
+		},
+		{
+			name: "migrate", wantKind: domain.ContainerKindInit, wantBilled: false, wantCPU: 2000,
+			why: "runs once and exits. Charging its 2 cores for the whole window would " +
+				"overstate this pod permanently for ten seconds of work",
+		},
+		{
+			name: "no-resources", wantKind: domain.ContainerKindRegular, wantBilled: true, wantCPU: 0,
+			why: "zero is correct, and is exactly why cost is billed on max(request, usage)",
+		},
+	}
+
+	for _, tt := range tests {
+		c, found := byName[tt.name]
+		if !found {
+			t.Errorf("container %q missing", tt.name)
+			continue
+		}
+		if c.Kind != tt.wantKind {
+			t.Errorf("%s kind = %q, want %q\nwhy: %s", tt.name, c.Kind, tt.wantKind, tt.why)
+		}
+		if c.Kind.Billable() != tt.wantBilled {
+			t.Errorf("%s Billable() = %v, want %v\nwhy: %s",
+				tt.name, c.Kind.Billable(), tt.wantBilled, tt.why)
+		}
+		if c.RequestsCPUMillicores != tt.wantCPU {
+			t.Errorf("%s cpu = %dm, want %dm", tt.name, c.RequestsCPUMillicores, tt.wantCPU)
+		}
+	}
+
+	// Limits must be captured too: a CPU limit equal to the request means guaranteed
+	// throttling, which Phase 6 reports on.
+	if app := byName["app"]; app.LimitsCPUMillicores != 1000 || app.LimitsMemoryBytes != 1<<30 {
+		t.Errorf("app limits = %dm/%d bytes, want 1000m/1Gi",
+			app.LimitsCPUMillicores, app.LimitsMemoryBytes)
+	}
+}
+
+// TestToContainers_SumDiffersFromPodTotal documents a real and intentional discrepancy.
+//
+// Summing per-container requests does NOT reproduce the pod's effective request, because
+// pod-level accounting takes the MAX over init containers rather than their sum. Both numbers
+// are correct for their own purpose, and anyone who assumes they reconcile will chase a bug
+// that does not exist.
+func TestToContainers_SumDiffersFromPodTotal(t *testing.T) {
+	t.Parallel()
+
+	pod := &corev1.Pod{Spec: corev1.PodSpec{
+		InitContainers: []corev1.Container{{
+			Name: "migrate",
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceCPU: qty("2")}},
+		}},
+		Containers: []corev1.Container{{
+			Name: "app",
+			Resources: corev1.ResourceRequirements{Requests: corev1.ResourceList{
+				corev1.ResourceCPU: qty("500m")}},
+		}},
+	}}
+
+	// Pod-level: max(sum(regular)=500m, init=2000m) = 2000m -- what the SCHEDULER reserves.
+	requests, _ := podResources(pod)
+	cpu := requests[corev1.ResourceCPU]
+	if cpu.MilliValue() != 2000 {
+		t.Errorf("pod effective CPU = %dm, want 2000m", cpu.MilliValue())
+	}
+
+	// Container-level BILLABLE: only the app container, 500m -- what is charged for a
+	// steady-state window.
+	var billable int64
+	for _, c := range toContainers(pod) {
+		if c.Kind.Billable() {
+			billable += c.RequestsCPUMillicores
+		}
+	}
+	if billable != 500 {
+		t.Errorf("billable container CPU = %dm, want 500m", billable)
+	}
+}

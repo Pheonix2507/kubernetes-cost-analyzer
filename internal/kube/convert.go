@@ -118,6 +118,7 @@ func toPod(p *corev1.Pod, resolveOwner ownerResolver) domain.Pod {
 		QoSClass:       string(p.Status.QOSClass),
 		Workload:       resolveWorkload(p, resolveOwner),
 		ContainerCount: len(p.Spec.Containers),
+		Containers:     toContainers(p),
 		Labels:         copyLabels(p.Labels),
 		CreatedAt:      p.CreationTimestamp.Time,
 	}
@@ -141,6 +142,68 @@ func toPod(p *corev1.Pod, resolveOwner ownerResolver) domain.Pod {
 		out.StartedAt = &started
 	}
 
+	return out
+}
+
+// toContainers extracts per-container reservations, classifying each container by kind.
+//
+// WHY THE CLASSIFICATION MATTERS MORE THAN THE NUMBERS
+// ---------------------------------------------------
+// Kubernetes puts sidecars in the SAME LIST as init containers -- spec.initContainers -- and
+// distinguishes them only by restartPolicy: Always. So the naive reading of that field is
+// wrong in both directions:
+//
+//	treat all initContainers as init  -> every service-mesh proxy vanishes from the bill, and
+//	                                     on a mesh-enabled cluster that is one per pod
+//	treat all initContainers as running -> every migration container is charged as though it
+//	                                     held its reservation forever, rather than for the ten
+//	                                     seconds it actually ran
+//
+// Both are silent misattributions of the kind that make a cost report quietly wrong, so the
+// distinction is made explicitly here and the billing rule lives on ContainerKind.Billable.
+func toContainers(p *corev1.Pod) []domain.Container {
+	if len(p.Spec.Containers) == 0 && len(p.Spec.InitContainers) == 0 {
+		return nil
+	}
+
+	out := make([]domain.Container, 0, len(p.Spec.Containers)+len(p.Spec.InitContainers))
+
+	for i := range p.Spec.Containers {
+		out = append(out, toContainer(&p.Spec.Containers[i], domain.ContainerKindRegular))
+	}
+	for i := range p.Spec.InitContainers {
+		c := &p.Spec.InitContainers[i]
+		// RestartPolicy is a POINTER on a container, so "unset" is distinguishable from "set
+		// to a zero value" -- and here unset means an ordinary init container while Always
+		// means a sidecar. Those bill differently, which is exactly why the API uses a
+		// pointer rather than an empty string.
+		kind := domain.ContainerKindInit
+		if c.RestartPolicy != nil && *c.RestartPolicy == corev1.ContainerRestartPolicyAlways {
+			kind = domain.ContainerKindSidecar
+		}
+		out = append(out, toContainer(c, kind))
+	}
+
+	return out
+}
+
+// toContainer reads one container's requests and limits.
+func toContainer(c *corev1.Container, kind domain.ContainerKind) domain.Container {
+	out := domain.Container{Name: c.Name, Kind: kind}
+
+	// Indexing a nil ResourceList yields the zero Quantity, so a container declaring no
+	// resources reads as zero rather than panicking. Zero is CORRECT here and is precisely the
+	// BestEffort case that makes max(request, usage) necessary -- billing on requests alone
+	// would price such a container at nothing while it consumes real CPU and memory.
+	cpuReq := c.Resources.Requests[corev1.ResourceCPU]
+	memReq := c.Resources.Requests[corev1.ResourceMemory]
+	cpuLim := c.Resources.Limits[corev1.ResourceCPU]
+	memLim := c.Resources.Limits[corev1.ResourceMemory]
+
+	out.RequestsCPUMillicores = cpuReq.MilliValue()
+	out.RequestsMemoryBytes = memReq.Value()
+	out.LimitsCPUMillicores = cpuLim.MilliValue()
+	out.LimitsMemoryBytes = memLim.Value()
 	return out
 }
 

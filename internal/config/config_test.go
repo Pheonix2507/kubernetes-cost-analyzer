@@ -11,7 +11,7 @@ import (
 // new variable added to Load without a corresponding test entry shows up as a
 // hermeticity failure rather than as a mysteriously passing test.
 var allKeys = []string{
-	"APP_ENV", "LOG_LEVEL",
+	"APP_ENV", "LOG_LEVEL", "CLUSTER_NAME",
 	"API_HTTP_ADDR", "API_READ_TIMEOUT", "API_WRITE_TIMEOUT",
 	"API_IDLE_TIMEOUT", "API_SHUTDOWN_TIMEOUT",
 	"DATABASE_URL", "DB_MAX_OPEN_CONNS", "DB_MIN_IDLE_CONNS", "DB_CONN_MAX_LIFETIME",
@@ -71,6 +71,7 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 	}{
 		{"Env", cfg.Env, EnvDevelopment},
 		{"LogLevel", cfg.LogLevel, "info"},
+		{"ClusterName", cfg.ClusterName, "default"},
 		{"API.Addr", cfg.API.Addr, ":8080"},
 		{"API.ReadTimeout", cfg.API.ReadTimeout, 10 * time.Second},
 		{"API.WriteTimeout", cfg.API.WriteTimeout, 15 * time.Second},

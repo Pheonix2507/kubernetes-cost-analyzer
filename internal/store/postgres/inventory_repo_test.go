@@ -98,14 +98,34 @@ func TestUpsert_IsIdempotent(t *testing.T) {
 		t.Errorf("pod id changed on re-upsert: %d then %d (err=%v)", podID1, podID2, err)
 	}
 
-	// And exactly one row of each.
-	for table, want := range map[string]int64{"clusters": 1, "nodes": 1, "namespaces": 1, "workloads": 1, "pods": 1} {
-		got, err := inv.CountRows(ctx, table)
-		if err != nil {
-			t.Fatalf("count %s: %v", table, err)
+	// And exactly one row of each -- COUNTED WITHIN THIS TEST'S OWN CLUSTER.
+	//
+	// An earlier version used CountRows, which counts the WHOLE table. This test runs inside a
+	// rolled-back transaction so its own writes never persist, but it can still SEE rows
+	// committed by anything else -- another process, or the collector having been run against
+	// this database. So the global assertion was only ever true on an empty database, and it
+	// broke the moment real data existed.
+	//
+	// That is a test that passes by luck. Scoping every count to the cluster_id this test
+	// created makes the assertion about THIS TEST'S rows, which is what it was always meant to
+	// check.
+	counts := []struct {
+		table string
+		query string
+	}{
+		{"clusters", `SELECT count(*) FROM clusters WHERE id = $1`},
+		{"nodes", `SELECT count(*) FROM nodes WHERE cluster_id = $1`},
+		{"namespaces", `SELECT count(*) FROM namespaces WHERE cluster_id = $1`},
+		{"workloads", `SELECT count(*) FROM workloads WHERE cluster_id = $1`},
+		{"pods", `SELECT count(*) FROM pods WHERE cluster_id = $1`},
+	}
+	for _, c := range counts {
+		var got int64
+		if err := tx.QueryRow(ctx, c.query, clusterID1).Scan(&got); err != nil {
+			t.Fatalf("count %s: %v", c.table, err)
 		}
-		if got != want {
-			t.Errorf("%s has %d rows after two upserts, want %d", table, got, want)
+		if got != 1 {
+			t.Errorf("%s has %d rows for this cluster after two upserts, want 1", c.table, got)
 		}
 	}
 }

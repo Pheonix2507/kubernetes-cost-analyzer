@@ -2,142 +2,14 @@ package postgres
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/shopspring/decimal"
+
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 )
-
-// ContainerAllocation is one immutable cost sample: what a single container reserved and
-// used over one time window, and what that cost.
-//
-// WHY MONEY IS decimal.Decimal AND NOT float64
-// --------------------------------------------
-// float64 cannot represent 0.1 exactly, and the error compounds under SUM. Adding
-// 0.0000267 eleven million times -- one row per container per window per month -- drifts
-// from the true total, and the drift is not reproducible because it depends on summation
-// order, which the query planner is free to change between runs.
-//
-// A cost report that disagrees with itself between two runs, or with the cloud invoice it
-// is reconciled against, is not a rounding curiosity. It is the end of anyone trusting the
-// tool. decimal.Decimal is exact base-10 arithmetic and maps directly onto Postgres
-// numeric, which is why the schema uses numeric(20,10) rather than double precision.
-//
-// The trade-off is real and worth stating: decimal arithmetic is roughly an order of
-// magnitude slower than float64 and allocates. That is irrelevant here, because every one
-// of these values crosses a network and a disk, and the I/O dominates by orders of
-// magnitude.
-type ContainerAllocation struct {
-	// The window is HALF-OPEN: [WindowStart, WindowEnd).
-	//
-	// With closed intervals, consecutive windows share an endpoint and every range query
-	// double-counts the boundary sample. Essentially every time-bucketing bug in cost
-	// reporting traces back to this choice.
-	WindowStart time.Time
-	WindowEnd   time.Time
-
-	PodID         int64
-	ContainerName string
-
-	// --- Attribution: an immutable snapshot of ownership at collection time ---------
-	// Denormalised on purpose. If team were joined from the namespaces table, relabelling
-	// a namespace would silently rewrite every historical report, so last month's
-	// finalised figure would change after the fact.
-	ClusterName   string
-	NamespaceName string
-	PodName       string
-	WorkloadKind  string
-	WorkloadName  string
-	NodeName      string
-	Team          string
-	CostCentre    string
-	Environment   string
-	InstanceType  string
-	CapacityType  string
-	Zone          string
-	QoSClass      string
-
-	// --- Measurements, in the same integer units internal/kube uses ---------------
-	CPUMillicoresRequested int64
-	MemoryBytesRequested   int64
-	CPUMillicoresUsed      int64
-	MemoryBytesUsed        int64
-
-	// --- Rates in effect for THIS window -----------------------------------------
-	CPUCostPerCoreHour   decimal.Decimal
-	MemoryCostPerGiBHour decimal.Decimal
-
-	CPUCost    decimal.Decimal
-	MemoryCost decimal.Decimal
-}
-
-// Billable returns the quantities cost is actually charged on: max(requested, used).
-//
-// WHY max AND NOT requested
-// -------------------------
-// Requests alone are the obvious basis, and they miss an entire class of workload. A
-// BestEffort container declares no requests at all, so a request-only formula prices it at
-// exactly ZERO while it consumes real CPU and memory on a real node. That cost does not
-// disappear -- it is silently smeared across every other team's share, so everyone else is
-// over-billed to hide it.
-//
-// This is why the no-requests-at-all fixture exists in deploy/demo-workloads, and why the
-// database has a CHECK constraint asserting the stored billable value really is the max:
-// the rule is the product's definition and must not drift between the three layers that
-// would otherwise each reimplement it.
-//
-// A method on the struct rather than a field the caller sets, so it cannot be filled in
-// wrongly. The database constraint then catches anyone bypassing this by writing SQL
-// directly.
-func (a ContainerAllocation) Billable() (cpuMillicores, memoryBytes int64) {
-	return max(a.CPUMillicoresRequested, a.CPUMillicoresUsed),
-		max(a.MemoryBytesRequested, a.MemoryBytesUsed)
-}
-
-// Validate checks the invariants that the database also enforces.
-//
-// WHY CHECK IN BOTH PLACES
-// ------------------------
-// The CHECK constraints are the real guarantee -- they hold against psql, a migration, and
-// any future service. But a constraint violation surfaces as an opaque Postgres error
-// naming a constraint, arriving after a network round trip, and if it happens mid-batch it
-// aborts the whole transaction including every valid row alongside it.
-//
-// Validating first turns that into a precise, local error naming the field and the pod, and
-// keeps one malformed sample from discarding the other 4,999 in the batch. The database
-// remains the backstop; this is the useful error message.
-func (a ContainerAllocation) Validate() error {
-	var errs []error
-
-	if a.WindowStart.IsZero() || a.WindowEnd.IsZero() {
-		errs = append(errs, errors.New("window_start and window_end must both be set"))
-	} else if !a.WindowEnd.After(a.WindowStart) {
-		errs = append(errs, fmt.Errorf("window_end (%s) must be after window_start (%s)",
-			a.WindowEnd.Format(time.RFC3339), a.WindowStart.Format(time.RFC3339)))
-	}
-	if a.PodID == 0 {
-		errs = append(errs, errors.New("pod_id must be set"))
-	}
-	if a.ContainerName == "" {
-		// Part of the primary key, so an empty name would silently collide with any other
-		// unnamed container in the same pod and window -- one would overwrite the other.
-		errs = append(errs, errors.New("container_name must not be empty"))
-	}
-	if a.ClusterName == "" || a.NamespaceName == "" {
-		errs = append(errs, errors.New("cluster_name and namespace_name must be set for attribution"))
-	}
-	if a.CPUMillicoresRequested < 0 || a.MemoryBytesRequested < 0 ||
-		a.CPUMillicoresUsed < 0 || a.MemoryBytesUsed < 0 {
-		errs = append(errs, errors.New("resource amounts must not be negative"))
-	}
-	if a.CPUCost.IsNegative() || a.MemoryCost.IsNegative() {
-		errs = append(errs, errors.New("costs must not be negative"))
-	}
-
-	return errors.Join(errs...)
-}
 
 // AllocationRepository writes and reads the fact table.
 type AllocationRepository struct {
@@ -165,7 +37,7 @@ const insertAllocation = `
 		window_start, window_end, pod_id, container_name,
 		cluster_name, namespace_name, pod_name, workload_kind, workload_name,
 		node_name, team, cost_centre, environment, instance_type, capacity_type,
-		zone, qos_class,
+		zone, qos_class, rate_source,
 		cpu_millicores_requested, memory_bytes_requested,
 		cpu_millicores_used, memory_bytes_used,
 		cpu_millicores_billable, memory_bytes_billable,
@@ -175,12 +47,12 @@ const insertAllocation = `
 		$1, $2, $3, $4,
 		$5, $6, $7, $8, $9,
 		$10, $11, $12, $13, $14, $15,
-		$16, $17,
-		$18, $19,
-		$20, $21,
-		$22, $23,
-		$24, $25,
-		$26, $27, now()
+		$16, $17, $18,
+		$19, $20,
+		$21, $22,
+		$23, $24,
+		$25, $26,
+		$27, $28, now()
 	)
 	ON CONFLICT (window_start, pod_id, container_name) DO UPDATE
 	SET cluster_name             = EXCLUDED.cluster_name,
@@ -196,6 +68,7 @@ const insertAllocation = `
 	    capacity_type            = EXCLUDED.capacity_type,
 	    zone                     = EXCLUDED.zone,
 	    qos_class                = EXCLUDED.qos_class,
+	    rate_source              = EXCLUDED.rate_source,
 	    window_end               = EXCLUDED.window_end,
 	    cpu_millicores_requested = EXCLUDED.cpu_millicores_requested,
 	    memory_bytes_requested   = EXCLUDED.memory_bytes_requested,
@@ -210,13 +83,13 @@ const insertAllocation = `
 	    collected_at             = now()`
 
 // allocationArgs flattens one allocation into the placeholder order above.
-func allocationArgs(a ContainerAllocation) []any {
+func allocationArgs(a domain.ContainerAllocation) []any {
 	cpuBillable, memBillable := a.Billable()
 	return []any{
 		a.WindowStart, a.WindowEnd, a.PodID, a.ContainerName,
 		a.ClusterName, a.NamespaceName, a.PodName, a.WorkloadKind, a.WorkloadName,
 		a.NodeName, a.Team, a.CostCentre, a.Environment, a.InstanceType, a.CapacityType,
-		a.Zone, a.QoSClass,
+		a.Zone, a.QoSClass, a.RateSource,
 		a.CPUMillicoresRequested, a.MemoryBytesRequested,
 		a.CPUMillicoresUsed, a.MemoryBytesUsed,
 		cpuBillable, memBillable,
@@ -226,7 +99,7 @@ func allocationArgs(a ContainerAllocation) []any {
 }
 
 // Insert writes a single allocation. Mostly for tests; the collector uses InsertBatch.
-func (r *AllocationRepository) Insert(ctx context.Context, a ContainerAllocation) error {
+func (r *AllocationRepository) Insert(ctx context.Context, a domain.ContainerAllocation) error {
 	if err := a.Validate(); err != nil {
 		return fmt.Errorf("invalid allocation for pod %d container %q: %w", a.PodID, a.ContainerName, err)
 	}
@@ -255,7 +128,7 @@ func (r *AllocationRepository) Insert(ctx context.Context, a ContainerAllocation
 // EVERY allocation is validated BEFORE anything is sent. One malformed row inside a batch
 // aborts the enclosing transaction, taking every valid row with it, so failing early with a
 // precise message beats discovering it halfway through.
-func (r *AllocationRepository) InsertBatch(ctx context.Context, allocations []ContainerAllocation) error {
+func (r *AllocationRepository) InsertBatch(ctx context.Context, allocations []domain.ContainerAllocation) error {
 	if len(allocations) == 0 {
 		// Not an error. An empty cluster, or a window where every pod was Pending, is a
 		// legitimate outcome and the caller should not have to special-case it.
