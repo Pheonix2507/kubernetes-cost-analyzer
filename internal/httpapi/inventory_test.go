@@ -1,15 +1,20 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/shopspring/decimal"
+
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/domain"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
 )
 
 // stubInventory is the payoff for defining Inventory as an interface in this package:
@@ -33,8 +38,39 @@ func (s *stubInventory) Pods(namespace string) ([]domain.Pod, error) {
 	return s.pods, s.err
 }
 
+// stubPricer returns fixed rates, or an error when errFor matches the node name.
+//
+// A struct literal rather than a real catalogue: the handler's job is attaching rates and
+// handling a pricing failure, not pricing. Testing it against a real provider would couple
+// these tests to catalogue contents and make them fail for the wrong reason.
+type stubPricer struct {
+	rates  pricing.Rates
+	errFor string
+}
+
+func (s stubPricer) RatesFor(_ context.Context, n domain.Node) (pricing.Rates, error) {
+	if s.errFor != "" && n.Name == s.errFor {
+		return pricing.Rates{}, errors.New("no price for " + n.Name)
+	}
+	return s.rates, nil
+}
+
+func defaultStubPricer() stubPricer {
+	return stubPricer{rates: pricing.Rates{
+		Currency:         "USD",
+		NodeHourly:       decimal.RequireFromString("0.1060"),
+		CPUPerCoreHour:   decimal.RequireFromString("0.0371"),
+		MemoryPerGiBHour: decimal.RequireFromString("0.003975"),
+		Source:           pricing.SourceCatalogue,
+	}}
+}
+
 func newTestRouter(inv Inventory) http.Handler {
-	return NewRouter(discardLogger(), health.NewAggregator(time.Second), inv)
+	return NewRouter(discardLogger(), health.NewAggregator(time.Second), inv, defaultStubPricer())
+}
+
+func newTestRouterWithPricer(inv Inventory, p pricing.Provider) http.Handler {
+	return NewRouter(discardLogger(), health.NewAggregator(time.Second), inv, p)
 }
 
 func TestListNodes(t *testing.T) {
@@ -54,7 +90,7 @@ func TestListNodes(t *testing.T) {
 		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
 	}
 
-	var got listResponse[domain.Node]
+	var got listResponse[pricedNode]
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("response is not valid JSON: %v", err)
 	}
@@ -226,4 +262,140 @@ func contains(haystack, needle string) bool {
 		}
 	}
 	return false
+}
+
+// -----------------------------------------------------------------------------
+// Pricing attached to nodes
+// -----------------------------------------------------------------------------
+
+// TestListNodes_MoneyIsAJSONString pins a contract that is easy to break and expensive to
+// discover.
+//
+// decimal.Decimal marshals to a QUOTED string by default. That default is correct here:
+// JSON numbers are parsed as IEEE-754 doubles by every JavaScript client, so a rate sent as
+// a bare number arrives in the browser as the nearest binary double -- reintroducing at the
+// very last step the imprecision that numeric(20,10) and decimal.Decimal exist to prevent.
+//
+// If someone "tidies" these to float64, this test fails.
+func TestListNodes_MoneyIsAJSONString(t *testing.T) {
+	t.Parallel()
+
+	inv := &stubInventory{nodes: []domain.Node{{Name: "w1", InstanceType: "m5.large"}}}
+	rec := httptest.NewRecorder()
+	newTestRouter(inv).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil))
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	// Assert on the RAW JSON. Unmarshalling into a struct would accept either form and hide
+	// exactly what is under test.
+	var envelope struct {
+		Items []struct {
+			Pricing map[string]json.RawMessage `json:"pricing"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &envelope); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(envelope.Items) != 1 {
+		t.Fatalf("got %d nodes, want 1", len(envelope.Items))
+	}
+
+	for _, field := range []string{"node_hourly", "cpu_per_core_hour", "memory_per_gib_hour"} {
+		raw, ok := envelope.Items[0].Pricing[field]
+		if !ok {
+			t.Errorf("pricing.%s is missing from the response", field)
+			continue
+		}
+		if !strings.HasPrefix(string(raw), `"`) {
+			t.Errorf("pricing.%s = %s, want a quoted string. A bare JSON number is parsed as "+
+				"float64 by every JS client and loses precision", field, raw)
+		}
+	}
+}
+
+// TestListNodes_IncludesRatesAndProvenance checks the values and, critically, that the
+// source is surfaced. A cost derived from a guessed fallback must never look identical to
+// one derived from a real catalogue entry.
+func TestListNodes_IncludesRatesAndProvenance(t *testing.T) {
+	t.Parallel()
+
+	inv := &stubInventory{nodes: []domain.Node{{Name: "w1", InstanceType: "m5.large", Zone: "ap-south-1a"}}}
+	rec := httptest.NewRecorder()
+	newTestRouter(inv).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil))
+
+	var got listResponse[pricedNode]
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	if len(got.Items) != 1 {
+		t.Fatalf("got %d nodes, want 1", len(got.Items))
+	}
+	n := got.Items[0]
+
+	// The embedded domain.Node fields must still be present and flat, not nested.
+	if n.Name != "w1" || n.InstanceType != "m5.large" || n.Zone != "ap-south-1a" {
+		t.Errorf("node fields lost by embedding: %+v", n.Node)
+	}
+	if n.Pricing.Currency != "USD" {
+		t.Errorf("currency = %q, want USD", n.Pricing.Currency)
+	}
+	if n.Pricing.NodeHourly != "0.106" {
+		t.Errorf("node_hourly = %q, want 0.106", n.Pricing.NodeHourly)
+	}
+	if n.Pricing.Source != string(pricing.SourceCatalogue) {
+		t.Errorf("source = %q, want %q; provenance must reach the client",
+			n.Pricing.Source, pricing.SourceCatalogue)
+	}
+}
+
+// TestListNodes_UnpriceableNodeIsStillReported covers the case that decides whether the
+// endpoint is usable on a real cluster.
+//
+// One node with an unrecognised instance type must not fail the whole request, and must not
+// be silently omitted either: the node exists and costs money, so hiding it understates the
+// cluster. Reporting it with an explicit error is the only option that neither lies nor hides.
+func TestListNodes_UnpriceableNodeIsStillReported(t *testing.T) {
+	t.Parallel()
+
+	inv := &stubInventory{nodes: []domain.Node{
+		{Name: "priced", InstanceType: "m5.large"},
+		{Name: "exotic", InstanceType: "m7i.metal-48xl"},
+	}}
+	pricer := defaultStubPricer()
+	pricer.errFor = "exotic"
+
+	rec := httptest.NewRecorder()
+	newTestRouterWithPricer(inv, pricer).ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/v1/nodes", nil))
+
+	// NOT a 500. One unpriceable node must not deny the whole report.
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200: one unpriceable node must not fail the request", rec.Code)
+	}
+
+	var got listResponse[pricedNode]
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+	// BOTH nodes present. Omitting the unpriceable one would hide real capacity.
+	if got.Count != 2 {
+		t.Fatalf("got %d nodes, want 2 (the unpriceable node must not be dropped)", got.Count)
+	}
+
+	byName := map[string]pricedNode{}
+	for _, n := range got.Items {
+		byName[n.Name] = n
+	}
+	if byName["priced"].Pricing.Error != "" {
+		t.Errorf("the priceable node carries an error: %q", byName["priced"].Pricing.Error)
+	}
+	if byName["exotic"].Pricing.Error == "" {
+		t.Error("the unpriceable node carries no error; the caller cannot tell its cost is unknown")
+	}
+	// And it must NOT be reported as costing zero, which would look like a real figure.
+	if byName["exotic"].Pricing.NodeHourly != "" {
+		t.Errorf("unpriceable node reports node_hourly=%q; an absent price must be absent, "+
+			"not zero", byName["exotic"].Pricing.NodeHourly)
+	}
 }

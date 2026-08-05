@@ -36,6 +36,7 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/kube"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/logging"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
 )
 
@@ -146,6 +147,23 @@ func run() error {
 	store := kube.NewStore(clientset, cfg.Kube, logger)
 	logger.Info("kubernetes client configured", "host", restCfg.Host, "qps", cfg.Kube.QPS)
 
+	// Pricing catalogue. Loaded and fully validated HERE, at startup, so a typo in the
+	// catalogue is a refusal to start with a clear message -- not a cost report that
+	// silently prices half the fleet at zero. Same principle as config.Load.
+	catalogue, err := pricing.LoadCatalogueFile(cfg.Pricing.CataloguePath)
+	if err != nil {
+		return fmt.Errorf("loading pricing catalogue: %w", err)
+	}
+	pricer := pricing.NewCatalogueProvider(catalogue, logger)
+	logger.Info("pricing catalogue loaded",
+		"path", cfg.Pricing.CataloguePath,
+		"currency", catalogue.Currency,
+		"regions", len(catalogue.Regions),
+		"cpu_share", catalogue.Split.CPU,
+		"memory_share", catalogue.Split.Memory,
+		"has_fallback", catalogue.Fallback != nil,
+	)
+
 	// The aggregator receives db and store as health.Checkers. It has no idea one is
 	// Postgres and the other an informer cache -- which is exactly why adding the
 	// Prometheus check in Phase 4 will be a change to THIS LINE ONLY.
@@ -154,7 +172,7 @@ func run() error {
 	// -------------------------------------------------------------------------
 	// 5. Run the HTTP server and the informers together.
 	// -------------------------------------------------------------------------
-	router := httpapi.NewRouter(logger, readiness, store)
+	router := httpapi.NewRouter(logger, readiness, store, pricer)
 	srv := httpapi.NewServer(cfg.API, logger, router)
 
 	// errgroup, not sync.WaitGroup. The difference matters here:

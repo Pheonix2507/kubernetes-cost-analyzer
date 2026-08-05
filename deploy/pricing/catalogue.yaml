@@ -1,0 +1,153 @@
+# Pricing catalogue for the Kubernetes Cost Analyzer.
+#
+# EVERY PRICE HERE IS AN APPROXIMATION AND YOU SHOULD REPLACE THEM.
+#
+# These are indicative AWS ap-south-1 (Mumbai) on-demand list prices, recorded while
+# building this project. They are almost certainly already out of date, and more
+# importantly they are LIST prices: Reserved Instances, Savings Plans, Spot, committed-use
+# discounts and Enterprise Agreements routinely change the effective rate by 40% or more,
+# and no public price list knows what you actually pay.
+#
+# Treat this file as a template. The numbers that matter are the ones on your invoice.
+# Phase 11 replaces this with a live AWS/GCP/Azure pricing provider, and even then a static
+# catalogue remains useful for on-premise nodes, which have no API to ask.
+#
+# WHY PRICES ARE QUOTED AS STRINGS
+# YAML parses a bare 0.106 as a float64, which cannot represent it exactly -- so the value
+# would already have lost precision before it reached the decimal type, at the very first
+# step of a pipeline built to keep money exact. Quoting keeps it exact end to end.
+
+version: 1
+currency: USD
+
+# ---------------------------------------------------------------------------------------
+# THE CENTRAL ASSUMPTION OF THIS WHOLE SYSTEM
+# ---------------------------------------------------------------------------------------
+# An instance has ONE price and TWO resources. Splitting that price between CPU and memory
+# is an allocation POLICY, not a calculation -- there is no objectively correct answer, and
+# any tool implying otherwise has simply hidden its assumption.
+#
+# This is ours, in the open, where you can change it and see the effect.
+#
+# 70/30 is a reasonable default for general-purpose instances (AWS m5, GCP n2). If your
+# fleet is mostly memory-optimised (r5, n2-highmem), memory is a larger share of what you
+# are paying for and 50/50 is closer to the truth. Compute-optimised (c5, c2) leans further
+# toward CPU, around 80/20.
+#
+# How to sanity-check your own number: take two instance types from the same family that
+# differ mainly in memory -- m5.large (2 vCPU / 8 GiB) against r5.large (2 vCPU / 16 GiB) --
+# and see how much of the price difference the extra memory accounts for.
+#
+# MUST sum to 1, or the invariant that a whole node costs its hourly price breaks silently.
+# The loader rejects anything else.
+split:
+  cpu: 0.70
+  memory: 0.30
+
+default_region: ap-south-1
+
+regions:
+  # -------------------------------------------------------------------------------------
+  # ap-south-1 (Mumbai) -- the region the kind fixtures pretend to be in, so the demo
+  # cluster prices against real-looking numbers. See deploy/kind/cluster.yaml.
+  # -------------------------------------------------------------------------------------
+  ap-south-1:
+    instance_types:
+      # The three types our fake node labels use.
+      t3.medium:
+        vcpu: 2
+        memory_gib: 4
+        hourly: "0.0448"
+        # Spot is 60-90% cheaper and, unlike on-demand, genuinely varies by availability
+        # zone and over time. A static value is therefore a rougher approximation than the
+        # on-demand one -- fine for making spot visibly cheaper in a report, not fine for
+        # reconciling an invoice.
+        spot_hourly: "0.0134"
+
+      m5.large:
+        vcpu: 2
+        memory_gib: 8
+        hourly: "0.1060"
+        spot_hourly: "0.0318"
+
+      m5.xlarge:
+        vcpu: 4
+        memory_gib: 16
+        hourly: "0.2120"
+        spot_hourly: "0.0636"
+
+      # A few more of the same family, so the catalogue is useful beyond the fixtures.
+      m5.2xlarge:
+        vcpu: 8
+        memory_gib: 32
+        hourly: "0.4240"
+        spot_hourly: "0.1272"
+
+      # Memory-optimised. Worth including precisely because it illustrates why one global
+      # split ratio is a compromise: an r5 is bought FOR its memory, so attributing 70% of
+      # its price to CPU understates what memory on it really costs.
+      r5.large:
+        vcpu: 2
+        memory_gib: 16
+        hourly: "0.1400"
+        spot_hourly: "0.0420"
+
+      # Compute-optimised, the opposite case.
+      c5.large:
+        vcpu: 2
+        memory_gib: 4
+        hourly: "0.0940"
+        spot_hourly: "0.0282"
+
+  # -------------------------------------------------------------------------------------
+  # us-east-1, to demonstrate that region matters. The same m5.large is ~10% cheaper here.
+  # -------------------------------------------------------------------------------------
+  us-east-1:
+    instance_types:
+      m5.large:
+        vcpu: 2
+        memory_gib: 8
+        hourly: "0.0960"
+        spot_hourly: "0.0288"
+
+      m5.xlarge:
+        vcpu: 4
+        memory_gib: 16
+        hourly: "0.1920"
+        spot_hourly: "0.0576"
+
+      # A SERVERLESS entry, showing the case where the split assumption is not needed at
+      # all. Fargate publishes per-vCPU-hour and per-GB-hour rates directly, so the true
+      # per-resource rates are KNOWN and applying a 70/30 guess on top of them would be
+      # strictly worse. Rates from an entry like this are marked source=explicit_rates,
+      # which is more trustworthy than a derived rate.
+      #
+      # Note that Fargate quotes per GB (10^9) while Kubernetes reports GiB (2^30). The
+      # ~7% difference is silently absorbed here; a production catalogue should convert.
+      fargate:
+        vcpu: 1
+        memory_gib: 2
+        cpu_per_core_hour: "0.04656"
+        memory_per_gib_hour: "0.00511"
+
+# ---------------------------------------------------------------------------------------
+# FALLBACK: how to price an instance type that is not listed above.
+# ---------------------------------------------------------------------------------------
+# Without this, an unknown instance type produces ErrNoPrice and that node is excluded from
+# the report. With it, the node is priced approximately and the result is marked
+# source=fallback so nobody mistakes it for a real figure.
+#
+# The alternative that must never be chosen is pricing it at ZERO. Every pod on the node
+# would report as free, the cluster total would understate the bill, and because the missing
+# money still has to go somewhere in a percentage breakdown, every OTHER team would appear
+# to consume a larger share than it does. A wrong number that looks plausible is worse than
+# a missing one.
+#
+# Delete this block if you would rather be told loudly than given an estimate. Both are
+# defensible; a silent zero is not.
+fallback:
+  vcpu: 2
+  memory_gib: 8
+  # Roughly a general-purpose 2 vCPU / 8 GiB instance -- deliberately not cheap, so an
+  # unpriced fleet does not look free.
+  hourly: "0.1060"

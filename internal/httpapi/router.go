@@ -6,6 +6,7 @@ import (
 
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi/middleware"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
 )
 
 // NewRouter builds the complete HTTP handler: routes plus the middleware chain.
@@ -29,7 +30,7 @@ import (
 //
 // Adopting a router before that need exists would be choosing a dependency on
 // speculation.
-func NewRouter(log *slog.Logger, readiness *health.Aggregator, inv Inventory) http.Handler {
+func NewRouter(log *slog.Logger, readiness *health.Aggregator, inv Inventory, pricer pricing.Provider) http.Handler {
 	mux := http.NewServeMux()
 
 	// Method-qualified patterns mean a POST to /healthz gets an automatic 405 Method
@@ -44,7 +45,7 @@ func NewRouter(log *slog.Logger, readiness *health.Aggregator, inv Inventory) ht
 	//
 	// These are all GET and all read-only, which mirrors the RBAC in deploy/rbac: this
 	// service is structurally incapable of mutating the cluster it observes.
-	mux.HandleFunc("GET /api/v1/nodes", handleListNodes(inv))
+	mux.HandleFunc("GET /api/v1/nodes", handleListNodes(inv, pricer))
 	mux.HandleFunc("GET /api/v1/namespaces", handleListNamespaces(inv))
 	mux.HandleFunc("GET /api/v1/pods", handleListPods(inv))
 

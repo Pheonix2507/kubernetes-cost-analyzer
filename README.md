@@ -15,11 +15,11 @@ waste = requested - used
 Everything else in this repository is data collection, aggregation and presentation on
 top of that.
 
-## Status: Phase 2 complete
+## Status: Phase 3 complete
 
 A reproducible local environment, a production-shaped Go skeleton, live cluster topology
-over a read-only API, and a partitioned Postgres schema with repositories.
-**No pricing yet** — that is Phase 3, so cost columns exist but nothing populates them.
+over a read-only API, a partitioned Postgres schema, and a pricing engine that turns nodes
+into money. **Nothing joins usage to price yet** — that is Phase 4's collector.
 
 What works today:
 
@@ -40,6 +40,9 @@ What works today:
 - A partitioned star-schema in Postgres: normalised dimensions, an immutable
   container-grain fact table, monthly RANGE partitions, and idempotent upserts
 - Exact decimal money end to end (`decimal.Decimal` ↔ `numeric(20,10)`), never float
+- A pricing engine: a YAML rate catalogue keyed on the same well-known instance-type
+  labels a cloud provider sets, spot-aware, region-aware, with explicit provenance on
+  every rate
 - A non-root, shell-less container image
 
 ### Endpoints
@@ -49,7 +52,7 @@ What works today:
 | GET | `/healthz` | liveness — checks nothing, by design |
 | GET | `/readyz` | readiness — per-dependency detail for Postgres and the informer cache |
 | GET | `/version` | the build actually running |
-| GET | `/api/v1/nodes` | capacity, allocatable, instance type, zone, spot vs on-demand |
+| GET | `/api/v1/nodes` | capacity, allocatable, instance type, zone, spot vs on-demand, **and rates** |
 | GET | `/api/v1/namespaces` | cost-allocation dimensions (team, cost-centre, environment) |
 | GET | `/api/v1/pods` | requests, limits, QoS class, resolved workload. `?namespace=` filters |
 
@@ -135,6 +138,7 @@ internal/
     middleware   request ID, structured access log, panic recovery
   domain         the vocabulary all three layers share; stdlib imports only
   kube           client-go: dual-mode client, shared informers, pure translation
+  pricing        rate catalogue, the CPU/memory split, pure cost arithmetic
   store/postgres pgx pool, Querier seam, dimension + fact repositories
 migrations       numbered SQL, applied with golang-migrate
 deploy/
@@ -142,6 +146,7 @@ deploy/
   monitoring     Helm values
   demo-workloads fixture workloads
   rbac           read-only ClusterRole + a script that proves it
+  pricing        the rate catalogue (edit this; the shipped prices are indicative)
 ```
 
 ## The fixtures are the test data
@@ -210,6 +215,49 @@ Two properties the schema enforces rather than trusts:
 - **The billing rule.** A `CHECK` constraint asserts the stored billable amount really is
   `max(requested, used)`, so even SQL written outside this repo cannot break it.
 
+## Pricing: the assumption you should know about
+
+An `m5.large` costs **one** number per hour and has **two** resources. Splitting that price
+between CPU and memory is an *allocation policy*, not a calculation — there is no objectively
+correct answer, and any tool implying otherwise has hidden its assumption somewhere you
+cannot see it.
+
+Ours lives in `deploy/pricing/catalogue.yaml`, in the open:
+
+```yaml
+split:
+  cpu: 0.70      # must sum to 1, or the loader refuses to start
+  memory: 0.30
+```
+
+```
+cpu_per_core_hour = hourly × cpu_share / vcpu_count
+mem_per_gib_hour  = hourly × mem_share / memory_gib
+```
+
+The invariant that makes this coherent rather than merely plausible: **reserving a whole node
+for one hour must cost exactly the node's hourly price**, because the shares sum to 1. That is
+tested directly across six instance shapes, including a deliberately indivisible 3-vCPU/7-GiB
+one so the rounding is real rather than hidden by convenient arithmetic.
+
+Three details that decide whether the numbers can be trusted:
+
+- **We divide by the catalogue's vCPU count, not the node's reported capacity.** You are
+  billed for the instance you rented. This is also why the fake labels on the kind nodes work
+  — they report 6 CPU but price as the 2 vCPU an `m5.large` actually has.
+- **Every rate carries its provenance** (`catalogue`, `explicit_rates`, `fallback`). A cost
+  derived from a guess must never look identical to one derived from a real price, or someone
+  will take a fabricated figure to a finance meeting.
+- **An unknown instance type is priced from a stated fallback and marked as such — never
+  zero.** Zero is the tempting option and the worst one: every pod on that node reports as
+  free, the cluster total understates the bill, and because the missing money still has to go
+  somewhere in a percentage breakdown, every *other* team appears to consume a larger share
+  than it does.
+
+The prices shipped in the catalogue are indicative AWS ap-south-1 list prices and are
+approximately wrong for you. Reserved Instances, Savings Plans and Enterprise Agreements move
+the effective rate by 40% or more. Replace them with the numbers on your invoice.
+
 ## Development
 
 ```bash
@@ -241,7 +289,7 @@ that least privilege holds. Same reasoning as the `right-sized-worker` fixture.
 | **0** ✅ | Reproducible environment + Go skeleton |
 | **1** ✅ | Live inventory via client-go informers + RBAC |
 | **2** ✅ | Postgres schema, migrations, repositories |
-| 3 | Pricing engine behind a provider interface |
+| **3** ✅ | Pricing engine behind a provider interface |
 | 4 | Cost engine + Prometheus collector (worker pools, channels, context) |
 | 5 | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |
 | 6 | Idle detection + recommendation engine |

@@ -17,6 +17,7 @@ var allKeys = []string{
 	"DATABASE_URL", "DB_MAX_OPEN_CONNS", "DB_MIN_IDLE_CONNS", "DB_CONN_MAX_LIFETIME",
 	"KUBECONFIG", "KUBE_CONTEXT", "KUBE_RESYNC_INTERVAL", "KUBE_CACHE_SYNC_TIMEOUT",
 	"KUBE_QPS", "KUBE_BURST",
+	"PRICING_CATALOGUE_PATH",
 	"PROMETHEUS_URL", "PROMETHEUS_TIMEOUT",
 	"COLLECTOR_INTERVAL", "COLLECTOR_WORKERS",
 }
@@ -82,6 +83,7 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 		{"Kube.ResyncInterval", cfg.Kube.ResyncInterval, time.Duration(0)},
 		{"Kube.QPS", cfg.Kube.QPS, float32(50)},
 		{"Kube.Burst", cfg.Kube.Burst, 100},
+		{"Pricing.CataloguePath", cfg.Pricing.CataloguePath, "deploy/pricing/catalogue.yaml"},
 		{"Prometheus.URL", cfg.Prometheus.URL, "http://localhost:19090"},
 		{"Prometheus.Timeout", cfg.Prometheus.Timeout, 30 * time.Second},
 		{"Collector.Interval", cfg.Collector.Interval, 5 * time.Minute},

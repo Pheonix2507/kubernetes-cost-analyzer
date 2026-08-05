@@ -78,6 +78,7 @@ type Config struct {
 	API        API
 	Database   Database
 	Kube       Kube
+	Pricing    Pricing
 	Prometheus Prometheus
 	Collector  Collector
 }
@@ -182,6 +183,17 @@ type Kube struct {
 	Burst int
 }
 
+// Pricing holds settings for the cost rate catalogue.
+type Pricing struct {
+	// CataloguePath points at the YAML pricing catalogue.
+	//
+	// A FILE rather than environment variables, because prices are a table: dozens of
+	// instance types each with several fields. Expressing that as env vars would mean
+	// something like PRICING_M5_LARGE_HOURLY per entry, which is unreadable, undiffable and
+	// impossible to review. In Kubernetes this becomes a mounted ConfigMap.
+	CataloguePath string
+}
+
 // Prometheus holds settings for querying Prometheus (our usage data source).
 type Prometheus struct {
 	URL     string
@@ -241,6 +253,10 @@ func Load() (*Config, error) {
 			CacheSyncTimeout: l.duration("KUBE_CACHE_SYNC_TIMEOUT", 60*time.Second),
 			QPS:              l.float32("KUBE_QPS", 50),
 			Burst:            l.integer("KUBE_BURST", 100),
+		},
+
+		Pricing: Pricing{
+			CataloguePath: l.str("PRICING_CATALOGUE_PATH", "deploy/pricing/catalogue.yaml"),
 		},
 
 		Prometheus: Prometheus{
@@ -370,6 +386,10 @@ func (c *Config) Validate() error {
 	if c.Kube.ResyncInterval < 0 {
 		errs = append(errs, fmt.Errorf("KUBE_RESYNC_INTERVAL=%s: %w (must not be negative)",
 			c.Kube.ResyncInterval, ErrInvalid))
+	}
+
+	if strings.TrimSpace(c.Pricing.CataloguePath) == "" {
+		errs = append(errs, fmt.Errorf("PRICING_CATALOGUE_PATH: %w (must not be blank)", ErrInvalid))
 	}
 
 	if c.Collector.Workers <= 0 {
