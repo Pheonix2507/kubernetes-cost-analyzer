@@ -57,11 +57,11 @@ func TestUpsert_IsIdempotent(t *testing.T) {
 	ctx, tx := withTx(t)
 	inv := NewInventoryRepository(tx)
 
-	clusterID1, err := inv.UpsertCluster(ctx, "c1", "kind", "ap-south-1")
+	clusterID1, err := inv.UpsertCluster(ctx, ClusterAttributes{Name: "c1", Provider: "kind", Region: "ap-south-1", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("first UpsertCluster: %v", err)
 	}
-	clusterID2, err := inv.UpsertCluster(ctx, "c1", "kind", "ap-south-1")
+	clusterID2, err := inv.UpsertCluster(ctx, ClusterAttributes{Name: "c1", Provider: "kind", Region: "ap-south-1", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("second UpsertCluster: %v", err)
 	}
@@ -140,7 +140,7 @@ func TestUpsertNode_PreservesFirstSeen(t *testing.T) {
 	ctx, tx := withTx(t)
 	inv := NewInventoryRepository(tx)
 
-	clusterID, err := inv.UpsertCluster(ctx, "c1", "kind", "")
+	clusterID, err := inv.UpsertCluster(ctx, ClusterAttributes{Name: "c1", Provider: "kind", Region: "", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("seed cluster: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestUpsertPod_NullableForeignKeys(t *testing.T) {
 	ctx, tx := withTx(t)
 	inv := NewInventoryRepository(tx)
 
-	clusterID, _ := inv.UpsertCluster(ctx, "c1", "kind", "")
+	clusterID, _ := inv.UpsertCluster(ctx, ClusterAttributes{Name: "c1", Provider: "kind", Region: "", Currency: "USD"})
 	nsID, _ := inv.UpsertNamespace(ctx, clusterID, testNamespace("ns1"))
 
 	// A Pending pod with no controller: unscheduled AND bare. Both FKs nil.
@@ -244,7 +244,7 @@ func TestUpsertNamespace_NilLabelsBecomeEmptyObject(t *testing.T) {
 	ctx, tx := withTx(t)
 	inv := NewInventoryRepository(tx)
 
-	clusterID, _ := inv.UpsertCluster(ctx, "c1", "kind", "")
+	clusterID, _ := inv.UpsertCluster(ctx, ClusterAttributes{Name: "c1", Provider: "kind", Region: "", Currency: "USD"})
 	nsID, err := inv.UpsertNamespace(ctx, clusterID, domain.Namespace{Name: "bare", Labels: nil})
 	if err != nil {
 		t.Fatalf("upsert namespace with nil labels: %v", err)
@@ -265,7 +265,7 @@ func TestUpsertNamespace_LabelsRoundTrip(t *testing.T) {
 	ctx, tx := withTx(t)
 	inv := NewInventoryRepository(tx)
 
-	clusterID, _ := inv.UpsertCluster(ctx, "c1", "kind", "")
+	clusterID, _ := inv.UpsertCluster(ctx, ClusterAttributes{Name: "c1", Provider: "kind", Region: "", Currency: "USD"})
 	nsID, _ := inv.UpsertNamespace(ctx, clusterID, testNamespace("ns1"))
 
 	var team, extra string
@@ -288,7 +288,7 @@ func TestUpsertPod_RejectsInvalidQoS(t *testing.T) {
 	ctx, tx := withTx(t)
 	inv := NewInventoryRepository(tx)
 
-	clusterID, _ := inv.UpsertCluster(ctx, "c1", "kind", "")
+	clusterID, _ := inv.UpsertCluster(ctx, ClusterAttributes{Name: "c1", Provider: "kind", Region: "", Currency: "USD"})
 	nsID, _ := inv.UpsertNamespace(ctx, clusterID, testNamespace("ns1"))
 
 	_, err := inv.UpsertPod(ctx, UpsertPodParams{
@@ -309,7 +309,7 @@ func TestInTx_RollsBackOnError(t *testing.T) {
 	wantErr := context.Canceled
 	err := InTx(ctx, testPool, func(db Querier) error {
 		inv := NewInventoryRepository(db)
-		if _, err := inv.UpsertCluster(ctx, "rollback-me", "kind", ""); err != nil {
+		if _, err := inv.UpsertCluster(ctx, ClusterAttributes{Name: "rollback-me", Provider: "kind", Region: "", Currency: "USD"}); err != nil {
 			return err
 		}
 		// Fail AFTER a successful write. This is the case that matters: the naive
@@ -331,5 +331,75 @@ func TestInTx_RollsBackOnError(t *testing.T) {
 	}
 	if exists {
 		t.Error("the row survived a failed transaction; InTx committed partial work")
+	}
+}
+
+// TestUpsertCluster_RefreshesDerivedAttributes covers the reason Phase 11 changed this method at
+// all: provider and region are DERIVED from the cluster's nodes on every cycle, so they have to be
+// able to change. Before Phase 11 the collector passed the literals "kubernetes" and "", and a
+// cluster that moved region would have reported its original location forever.
+func TestUpsertCluster_RefreshesDerivedAttributes(t *testing.T) {
+	ctx, tx := withTx(t)
+	inv := NewInventoryRepository(tx)
+
+	id1, err := inv.UpsertCluster(ctx, ClusterAttributes{
+		Name: "migrating", Provider: "kind", Region: "ap-south-1", Account: "", Currency: "USD",
+	})
+	if err != nil {
+		t.Fatalf("first upsert: %v", err)
+	}
+
+	// The same cluster, now genuinely somewhere else and paid for by a named account.
+	id2, err := inv.UpsertCluster(ctx, ClusterAttributes{
+		Name: "migrating", Provider: "aws", Region: "us-east-1", Account: "1234567890", Currency: "USD",
+	})
+	if err != nil {
+		t.Fatalf("second upsert: %v", err)
+	}
+	if id1 != id2 {
+		t.Fatalf("identity changed on re-upsert: %d then %d; name must remain the identity", id1, id2)
+	}
+
+	var provider, region, account, currency string
+	if err := tx.QueryRow(ctx,
+		`SELECT provider, region, account, currency FROM clusters WHERE id = $1`, id1,
+	).Scan(&provider, &region, &account, &currency); err != nil {
+		t.Fatalf("reading back: %v", err)
+	}
+	if provider != "aws" || region != "us-east-1" || account != "1234567890" {
+		t.Errorf("attributes not refreshed: provider=%q region=%q account=%q", provider, region, account)
+	}
+	if currency != "USD" {
+		t.Errorf("currency = %q, want USD", currency)
+	}
+}
+
+// TestUpsertCluster_RejectsNonISO4217Currency asserts the CHECK constraint, not our own code.
+//
+// It is worth a test because the value's ORIGIN is a YAML file a human edits: `usd` or `US$` in a
+// catalogue would otherwise travel all the way to a rendered dashboard. The constraint is the last
+// place that can refuse it, so the constraint is what gets tested.
+func TestUpsertCluster_RejectsNonISO4217Currency(t *testing.T) {
+	ctx, tx := withTx(t)
+	inv := NewInventoryRepository(tx)
+
+	for _, bad := range []string{"usd", "US$", "US", "USDD", "", "usd "} {
+		t.Run("currency="+bad, func(t *testing.T) {
+			// A SAVEPOINT per case, because a constraint violation aborts the enclosing
+			// transaction: without it the first rejection would poison the shared test
+			// transaction and every later case would fail for the wrong reason.
+			if _, err := tx.Exec(ctx, "SAVEPOINT c"); err != nil {
+				t.Fatalf("savepoint: %v", err)
+			}
+			_, err := inv.UpsertCluster(ctx, ClusterAttributes{
+				Name: "bad-currency-" + bad, Provider: "kind", Region: "", Currency: bad,
+			})
+			if err == nil {
+				t.Errorf("currency %q was accepted; the ISO 4217 CHECK did not fire", bad)
+			}
+			if _, rbErr := tx.Exec(ctx, "ROLLBACK TO SAVEPOINT c"); rbErr != nil {
+				t.Fatalf("rollback to savepoint: %v", rbErr)
+			}
+		})
 	}
 }

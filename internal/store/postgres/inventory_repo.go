@@ -37,20 +37,48 @@ func NewInventoryRepository(db Querier) *InventoryRepository {
 	return &InventoryRepository{db: db}
 }
 
+// ClusterAttributes is everything recorded about a cluster.
+//
+// A struct rather than five string parameters, because five same-typed positional arguments is a
+// call site nobody can read and a transposition nothing can catch:
+// UpsertCluster(ctx, name, region, provider, account, currency) compiles perfectly and silently
+// records the region as the provider. Named fields make that mistake impossible to write.
+type ClusterAttributes struct {
+	Name string
+	// Provider and Region are DERIVED from the cluster's nodes, so they are refreshed on every
+	// cycle and may legitimately go empty when the nodes stop agreeing. See
+	// domain.DescribeCluster.
+	Provider string
+	Region   string
+	// Account is configured, since it cannot be read from the Kubernetes API.
+	Account string
+	// Currency is the ISO 4217 code of the rate catalogue that prices this cluster. A CHECK
+	// constraint rejects anything that is not three uppercase letters.
+	Currency string
+}
+
 // UpsertCluster records a cluster and returns its id.
 //
 // The RETURNING clause is what makes this ONE round trip instead of two. Without it we
 // would need a follow-up SELECT to learn the id, doubling the latency of every upsert --
 // and on the ON CONFLICT path there is no other way to discover the existing row's id.
-func (r *InventoryRepository) UpsertCluster(ctx context.Context, name, provider, region string) (int64, error) {
+func (r *InventoryRepository) UpsertCluster(ctx context.Context, attrs ClusterAttributes) (int64, error) {
 	// A named constant for the SQL rather than an inline string, so it can be read as SQL
 	// and pasted into psql or EXPLAIN unchanged.
+	//
+	// EVERY ATTRIBUTE IS REFRESHED ON CONFLICT, INCLUDING THE DERIVED ONES.
+	// That is what makes a cluster moved between regions, or migrated between clouds, correct
+	// themselves on the next collector cycle instead of reporting their original location
+	// forever. The cost is that a transient disagreement between nodes blanks the value until
+	// they agree again, which is the behaviour DescribeCluster is written to make rare.
 	const q = `
-		INSERT INTO clusters (name, provider, region)
-		VALUES ($1, $2, $3)
+		INSERT INTO clusters (name, provider, region, account, currency)
+		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (name) DO UPDATE
 		SET provider   = EXCLUDED.provider,
 		    region     = EXCLUDED.region,
+		    account    = EXCLUDED.account,
+		    currency   = EXCLUDED.currency,
 		    updated_at = now()
 		RETURNING id`
 
@@ -59,8 +87,10 @@ func (r *InventoryRepository) UpsertCluster(ctx context.Context, name, provider,
 	// arguments as separate protocol messages, so the values are never parsed as SQL and
 	// injection is structurally impossible -- not merely escaped. This is why the input
 	// validation in the HTTP layer is defence in depth rather than the primary control.
-	if err := r.db.QueryRow(ctx, q, name, provider, region).Scan(&id); err != nil {
-		return 0, fmt.Errorf("upsert cluster %q: %w", name, err)
+	if err := r.db.QueryRow(ctx, q,
+		attrs.Name, attrs.Provider, attrs.Region, attrs.Account, attrs.Currency,
+	).Scan(&id); err != nil {
+		return 0, fmt.Errorf("upsert cluster %q: %w", attrs.Name, err)
 	}
 	return id, nil
 }

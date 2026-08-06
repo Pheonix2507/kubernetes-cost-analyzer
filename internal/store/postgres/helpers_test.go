@@ -243,7 +243,7 @@ func seedFixture(t *testing.T, ctx context.Context, db Querier) fixture {
 	// mysteriously and only when run alongside another.
 	suffix := t.Name()
 
-	clusterID, err := inv.UpsertCluster(ctx, "cluster-"+suffix, "kind", "ap-south-1")
+	clusterID, err := inv.UpsertCluster(ctx, ClusterAttributes{Name: "cluster-" + suffix, Provider: "kind", Region: "ap-south-1", Currency: "USD"})
 	if err != nil {
 		t.Fatalf("seed cluster: %v", err)
 	}

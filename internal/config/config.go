@@ -90,6 +90,20 @@ type Config struct {
 	// cluster, and a report grouping by cluster would show one estate as two.
 	ClusterName string
 
+	// ClusterAccount is the billing account, project or subscription that pays for the nodes.
+	//
+	// WHY THIS IS CONFIGURED WHEN provider AND region ARE DERIVED
+	// ---------------------------------------------------------
+	// A pod can read its own nodes' providerID and region labels, so the cluster describes its
+	// own cloud and location and there is no reason to ask a human (see domain.DescribeCluster).
+	// Nothing in the Kubernetes API names the ACCOUNT, though. The account id appears inside an
+	// Azure providerID, but not in an AWS or GCE one, so there is no portable way to read it.
+	//
+	// Optional, and empty means "not recorded". It exists because two clusters may be
+	// indistinguishable on every other attribute while appearing on different invoices, and
+	// reconciling against an invoice is the point of the tool.
+	ClusterAccount string
+
 	API        API
 	Database   Database
 	Kube       Kube
@@ -272,9 +286,10 @@ func Load() (*Config, error) {
 	l := &loader{}
 
 	cfg := &Config{
-		Env:         Environment(l.str("APP_ENV", string(EnvDevelopment))),
-		LogLevel:    l.str("LOG_LEVEL", "info"),
-		ClusterName: l.str("CLUSTER_NAME", defaultClusterName),
+		Env:            Environment(l.str("APP_ENV", string(EnvDevelopment))),
+		LogLevel:       l.str("LOG_LEVEL", "info"),
+		ClusterName:    l.str("CLUSTER_NAME", defaultClusterName),
+		ClusterAccount: l.str("CLUSTER_ACCOUNT", ""),
 
 		API: API{
 			Addr:            l.str("API_HTTP_ADDR", ":8080"),

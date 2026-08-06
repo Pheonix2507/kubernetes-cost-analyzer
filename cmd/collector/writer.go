@@ -34,11 +34,28 @@ type writer struct {
 	// that actually knows.
 	inventory   costing.Inventory
 	clusterName string
-	log         *slog.Logger
+	// clusterAccount is configuration; see config.Config.ClusterAccount for why it is the one
+	// cluster attribute that cannot be derived.
+	clusterAccount string
+	// currency is the catalogue's ISO 4217 code, carried here so the cluster row records the
+	// denomination of the costs written alongside it.
+	currency string
+	log      *slog.Logger
 }
 
-func newWriter(db *postgres.DB, inventory costing.Inventory, clusterName string, log *slog.Logger) *writer {
-	return &writer{db: db, inventory: inventory, clusterName: clusterName, log: log}
+func newWriter(
+	db *postgres.DB, inventory costing.Inventory,
+	clusterName, clusterAccount, currency string,
+	log *slog.Logger,
+) *writer {
+	return &writer{
+		db:             db,
+		inventory:      inventory,
+		clusterName:    clusterName,
+		clusterAccount: clusterAccount,
+		currency:       currency,
+		log:            log,
+	}
 }
 
 // write persists the dimensions and the fact rows for one cycle.
@@ -65,7 +82,32 @@ func (w *writer) write(ctx context.Context, result costing.Result) error {
 		inv := postgres.NewInventoryRepository(q)
 		allocRepo := postgres.NewAllocationRepository(q)
 
-		clusterID, err := inv.UpsertCluster(ctx, w.clusterName, "kubernetes", "")
+		// The cluster's own description of itself, derived from its nodes rather than declared.
+		//
+		// This used to pass the literals "kubernetes" and "", which meant two columns in the
+		// clusters table held the same values for every cluster forever. Reading them from the
+		// informer cache costs nothing here: the nodes are fetched a few lines below for the
+		// dimension rows anyway, and an error is not fatal to the cycle -- a cluster whose
+		// provider is momentarily unknown is still worth costing, so the profile degrades to
+		// empty rather than aborting the window.
+		profile := domain.ClusterProfile{}
+		if nodes, nodeErr := w.inventory.Nodes(); nodeErr != nil {
+			w.log.Warn("cannot describe cluster from its nodes; recording provider and region as unknown",
+				"error", nodeErr)
+		} else {
+			profile = domain.DescribeCluster(nodes)
+		}
+
+		clusterID, err := inv.UpsertCluster(ctx, postgres.ClusterAttributes{
+			Name:     w.clusterName,
+			Provider: profile.Provider,
+			Region:   profile.Region,
+			Account:  w.clusterAccount,
+			// From the catalogue that computed the costs, not from a separate environment
+			// variable. The currency is a property of the rates, so the rates are the single
+			// place it can be stated without two sources of truth to reconcile.
+			Currency: w.currency,
+		})
 		if err != nil {
 			return fmt.Errorf("upserting cluster: %w", err)
 		}

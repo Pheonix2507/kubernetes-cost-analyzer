@@ -72,6 +72,21 @@ type Node struct {
 	// be reclaimed at short notice, so it changes both the price and the advice.
 	CapacityType string `json:"capacity_type"`
 
+	// ProviderID is spec.providerID, the cloud's own identifier for the machine, shaped
+	// as an opaque URI whose SCHEME names the provider:
+	//
+	//	aws:///ap-south-1a/i-0abc123           kind://docker/kca-dev/kca-dev-worker
+	//	gce://project/asia-south1-a/instance   azure:///subscriptions/.../virtualMachines/vm
+	//
+	// It is carried for one reason: it is the only trustworthy statement of which cloud a
+	// cluster runs on. Every alternative is a guess. Inferring from the instance-type label
+	// mistakes an `m5.large` label on a bare-metal node for AWS, and a node with no labels
+	// at all yields nothing. The scheme is set by the cloud controller manager itself.
+	//
+	// Empty on a cluster with no cloud provider configured, which is a legitimate answer
+	// rather than an error: it means nobody has told Kubernetes where it is running.
+	ProviderID string `json:"provider_id"`
+
 	// CAPACITY vs ALLOCATABLE -- the distinction that decides whether your cost
 	// numbers are right.
 	//

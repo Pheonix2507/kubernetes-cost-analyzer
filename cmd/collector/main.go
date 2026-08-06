@@ -162,7 +162,10 @@ func run() error {
 		return err
 	}
 
-	w := newWriter(db, store, cfg.ClusterName, logger)
+	// catalogue.Currency, not a CLUSTER_CURRENCY environment variable. The catalogue declares the
+	// denomination of the rates it contains, and those rates are what produced every cost figure,
+	// so any second declaration could only ever contradict it.
+	w := newWriter(db, store, cfg.ClusterName, cfg.ClusterAccount, catalogue.Currency, logger)
 
 	// This process's own instrumentation, and its readiness aggregator.
 	//

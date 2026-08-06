@@ -50,6 +50,7 @@ func toNode(n *corev1.Node) domain.Node {
 		Region:         n.Labels[labelRegion],
 		Zone:           n.Labels[labelZone],
 		CapacityType:   n.Labels[labelCapacityType],
+		ProviderID:     n.Spec.ProviderID,
 		Unschedulable:  n.Spec.Unschedulable,
 		KubeletVersion: n.Status.NodeInfo.KubeletVersion,
 		CreatedAt:      n.CreationTimestamp.Time,
