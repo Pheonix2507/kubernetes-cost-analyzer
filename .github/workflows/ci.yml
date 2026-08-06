@@ -294,9 +294,19 @@ jobs:
         # running `pnpm store path`, so pnpm has to already be on PATH. Reversing these two steps
         # produces "Unable to locate executable file: pnpm", which reads like a missing install
         # rather than a sequencing mistake.
-        #
-        # No version here: the action reads `packageManager` from package.json, so the version is
-        # declared once, in the file npm/pnpm/yarn all already respect.
+        with:
+          # THE PATH IS EXPLICIT BECAUSE `defaults.run.working-directory` DOES NOT APPLY HERE.
+          #
+          # That default governs `run:` steps ONLY. A `uses:` step runs at the root of the workspace
+          # regardless, so this action looked for package.json in the repository root -- where there
+          # is none, since this is a Go repository with the frontend in a subdirectory -- and failed
+          # with "No pnpm version is specified", which reads like a missing pin rather than a
+          # wrong-directory problem. The pin was there all along, one level down.
+          #
+          # Pointed at the file rather than passing `version: 10.33.0`, so the version stays declared
+          # exactly once, in the `packageManager` field that pnpm, npm and yarn all already honour.
+          # Duplicating it here would create a second place to forget.
+          package_json_file: web/package.json
 
       - uses: actions/setup-node@v4
         with:
@@ -340,6 +350,16 @@ jobs:
         # present, so a shallow clone produces a usable version rather than an error.
 
       - name: Build all three targets
+        env:
+          # Full build output rather than BuildKit's collapsed default.
+          #
+          # Added because the first CI failure here reported only `exit code: 127` and the flattened
+          # RUN command, with every line of context above it collapsed away. 127 means "command not
+          # found", and identifying WHICH command was impossible from that -- the log had thrown away
+          # both the earlier layers' status and anything the toolchain printed. A build log that
+          # cannot be read is a build log that cannot be debugged, and this is the whole cost of
+          # fixing that.
+          BUILDKIT_PROGRESS: plain
         # `make docker-build` builds api, collector AND rollup from the one multi-stage Dockerfile.
         # Building all three matters because they share a builder stage: a compile error in
         # cmd/rollup breaks the image build while `go build ./...` in another job stays green only
