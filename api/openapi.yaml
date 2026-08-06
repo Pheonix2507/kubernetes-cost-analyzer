@@ -299,6 +299,154 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/costs/trend:
+    get:
+      tags: [cost]
+      summary: Cost through time, from the daily rollup
+      description: |
+        The same question `/costs/summary` answers for one period, asked repeatedly.
+
+        **Which table answers this is reported in `source`, and it is part of the contract.** The daily
+        rollup is roughly 293x smaller than the fact table (measured), but it cannot answer every
+        question, so the query is routed:
+
+        | Request | Source | Why |
+        |---|---|---|
+        | `interval=day\|week\|month` | `daily_rollup` | the rollup's grain is a day, so these aggregate from it exactly |
+        | `interval=hour` | `raw_facts` | there is no hourly data in the rollup to read |
+        | `group_by=pod\|container` | `raw_facts` | pod is the one groupable dimension the rollup drops |
+
+        The two sources agree for any question both can serve — there is a test asserting exactly that —
+        but they differ in what they *can* serve, and the rollup only covers days the rollup job has
+        processed. So a rollup-sourced series can legitimately stop short of today, and a client
+        comparing this against `/costs/summary` needs to know which it got.
+
+        **`window_count` on every point is not decoration.** A bucket with a tenth of its neighbours'
+        window count is a collection gap, not a cost saving, and on a chart those look identical.
+      parameters:
+        - name: interval
+          in: query
+          schema:
+            type: string
+            enum: [hour, day, week, month]
+            default: day
+          description: |
+            Bucket width. `hour` is limited to 14 days: it reads the fact table, and 336 points is
+            already the practical ceiling for a line chart.
+        - name: from
+          in: query
+          schema: { type: string, format: date-time }
+          description: |
+            Inclusive lower bound, RFC3339. Defaults to 30 days ago — wider than the cost endpoints'
+            24 hours and the recommendation endpoint's 7 days, because a trend with two points is not
+            a trend.
+        - name: to
+          in: query
+          schema: { type: string, format: date-time }
+          description: Exclusive upper bound, RFC3339. Defaults to now.
+        - name: group_by
+          in: query
+          schema:
+            type: string
+            enum: [namespace, team, environment, cost_centre, workload, node, instance_type, capacity_type, pod, container]
+            default: namespace
+          description: One series per distinct value of this dimension.
+        - name: compare
+          in: query
+          schema:
+            type: string
+            enum: [previous_period, none]
+            default: none
+          description: |
+            `previous_period` adds a comparison against the immediately preceding window of EQUAL
+            length — not the previous calendar month, which is ambiguous for a 10-day range and makes
+            a 31-day month look 3% dearer than a 30-day one.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+          description: |
+            Caps SERIES, not points. A truncated series would draw a chart that stops partway through
+            the range with nothing to say why.
+        - $ref: "#/components/parameters/Namespace"
+        - $ref: "#/components/parameters/Team"
+        - $ref: "#/components/parameters/Environment"
+        - $ref: "#/components/parameters/CostCentre"
+        - $ref: "#/components/parameters/WorkloadKind"
+        - $ref: "#/components/parameters/WorkloadName"
+        - $ref: "#/components/parameters/Node"
+        - $ref: "#/components/parameters/InstanceType"
+        - $ref: "#/components/parameters/CapacityType"
+      responses:
+        "200":
+          description: One series per group, each ordered oldest bucket first.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TrendResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
+  /api/v1/reports/monthly:
+    get:
+      tags: [cost]
+      summary: Monthly statements, frozen once signed off
+      description: |
+        Not "what is true now" — **what we said**. Every other endpoint here is a view of current data.
+        This one is stored, because a statement must not change after it is issued: backfill a missing
+        day, correct a price, or fix a rollup bug, and a computed-on-demand figure for last August
+        silently becomes a different number from the one somebody already reported.
+
+        `finalised_at` is the line. `null` means provisional and regenerable; set means frozen — and
+        frozen is enforced by database triggers, not only by the writer that happens to set it.
+
+        **Read `coverage` before quoting any total.** A month containing a collector outage produces a
+        figure that is confidently too low, and nothing about the figure itself reveals that. Coverage is
+        `days_with_data / days_in_month`, so it is DAY-level: a day on which the collector ran for one
+        hour counts as a full day. `window_count` is reported alongside for exactly that reason, and the
+        daily trend is where a partial day is visible as a dip.
+
+        Statements exist at three scopes. The gap between a cluster statement and the sum of its team
+        statements IS the unattributed spend — cost whose containers carry no team label, which gets no
+        team statement rather than one belonging to nobody.
+      parameters:
+        - name: from
+          in: query
+          schema: { type: string, pattern: "^[0-9]{4}-[0-9]{2}$" }
+          description: |
+            First month, as `YYYY-MM`. Defaults to 11 months ago. A timestamp is REFUSED rather than
+            truncated to its month, because silently discarding the day answers a different question.
+        - name: to
+          in: query
+          schema: { type: string, pattern: "^[0-9]{4}-[0-9]{2}$" }
+          description: |
+            Last month, `YYYY-MM`, **INCLUSIVE** — the one place this API is not half-open, and
+            deliberately. A month is a label, not an instant, and "January to March" means three months
+            to everyone who asks for it.
+        - name: scope_kind
+          in: query
+          schema:
+            type: string
+            enum: [cluster, namespace, team]
+          description: Omit to return all three scopes.
+        - name: scope_value
+          in: query
+          schema: { type: string, maxLength: 253 }
+          description: The namespace, team or cluster name to filter to.
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+      responses:
+        "200":
+          description: Statements, newest month first, largest cost first within a month.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/MonthlyReportsResponse" }
+        "400": { $ref: "#/components/responses/ValidationError" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/nodes:
     get:
       tags: [inventory]
@@ -517,6 +665,170 @@ components:
           description: |
             **Absent** on the last page, so its presence answers "is there more?". An empty string
             would force every client to check for both absence and emptiness.
+
+    TrendResponse:
+      type: object
+      required: [from, to, interval, group_by, source, series, count]
+      properties:
+        from: { type: string, format: date-time }
+        to: { type: string, format: date-time }
+        interval:
+          type: string
+          enum: [hour, day, week, month]
+        group_by: { type: string }
+        source:
+          type: string
+          enum: [daily_rollup, raw_facts]
+          description: |
+            Which table answered. PART OF THE CONTRACT, not a debug field: the two sources cannot serve
+            the same set of questions, and the rollup only covers days the rollup job has processed. A
+            silent choice between them is how a system becomes unexplainable.
+        count: { type: integer }
+        series:
+          type: array
+          items: { $ref: "#/components/schemas/TrendSeries" }
+        comparison:
+          allOf: [{ $ref: "#/components/schemas/TrendComparison" }]
+          description: Present only when `compare=previous_period` was requested.
+
+    TrendSeries:
+      type: object
+      required: [group, points, total_cost]
+      properties:
+        group:
+          type: object
+          additionalProperties: { type: string }
+          description: |
+            The dimension values identifying this series, keyed by column. A map rather than eleven
+            explicit fields, because a series is IDENTIFIED by its group rather than described by it --
+            a chart legend wants a label, not a struct with ten empty fields.
+        total_cost:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: The sum over the returned points, so it provably matches the line beneath it.
+        points:
+          type: array
+          items: { $ref: "#/components/schemas/TrendPoint" }
+
+    TrendPoint:
+      type: object
+      required: [bucket_start, total_cost, window_count]
+      properties:
+        bucket_start:
+          type: string
+          format: date-time
+          description: Start of the bucket, half-open to the next one.
+        total_cost: { $ref: "#/components/schemas/Money" }
+        cpu_cost: { $ref: "#/components/schemas/Money" }
+        memory_cost: { $ref: "#/components/schemas/Money" }
+        cpu_billable_core_hours: { $ref: "#/components/schemas/Money" }
+        memory_billable_gib_hours: { $ref: "#/components/schemas/Money" }
+        wasted_cpu_core_hours: { $ref: "#/components/schemas/Money" }
+        wasted_memory_gib_hours: { $ref: "#/components/schemas/Money" }
+        window_count:
+          type: integer
+          format: int64
+          description: |
+            Samples aggregated into this bucket. **Read this alongside the cost.** A bucket with a tenth
+            of its neighbours' window count is a collection gap, not a saving, and on a chart those two
+            are indistinguishable.
+        estimated_rates:
+          type: boolean
+          description: True when any rate behind this bucket was a fallback guess.
+
+    TrendComparison:
+      type: object
+      required: [previous_from, previous_to, current_total_cost, previous_total_cost, change, comparable]
+      properties:
+        previous_from: { type: string, format: date-time }
+        previous_to: { type: string, format: date-time }
+        current_total_cost: { $ref: "#/components/schemas/Money" }
+        previous_total_cost: { $ref: "#/components/schemas/Money" }
+        change:
+          allOf: [{ $ref: "#/components/schemas/Money" }]
+          description: current minus previous. Negative means it got cheaper.
+        change_ratio:
+          type: string
+          nullable: true
+          description: |
+            `change / previous`, as a decimal fraction. **NULL when the previous period cost nothing**,
+            because the ratio is then undefined -- "cost went from 0 to 5" is a real and common
+            situation (a new workload) with no percentage increase. Rendering "+Inf%" or "+100%" would
+            state something the data does not support.
+        comparable:
+          type: boolean
+          description: |
+            False when the two periods have materially different window counts, so part of the
+            difference is missing data rather than changed cost. **This is the most misleading thing a
+            trend can do:** a period during which collection started shows a large apparent increase
+            that is purely an artefact of when the collector was deployed.
+        note:
+          type: string
+          description: Why the comparison is not comparable, when it is not.
+
+    MonthlyReportsResponse:
+      type: object
+      required: [items, count, provisional_count, lowest_coverage]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/MonthlyReport" }
+        count: { type: integer }
+        provisional_count:
+          type: integer
+          description: |
+            How many of these are not yet frozen, which tells a reader whether the page can still
+            change. A page mixing frozen and provisional rows without saying so invites someone to
+            quote a number that is still moving.
+        lowest_coverage:
+          type: string
+          description: |
+            The WORST coverage among the returned statements, hoisted here because it is the easiest
+            thing on this response to overlook and the most dangerous to miss. `0.0000` on an empty
+            page: claiming perfect coverage of nothing would read as a real measurement.
+
+    MonthlyReport:
+      type: object
+      required: [cluster, month, scope_kind, scope_value, total_cost, coverage, generated_at]
+      properties:
+        cluster: { type: string }
+        month:
+          type: string
+          pattern: "^[0-9]{4}-[0-9]{2}$"
+          example: "2026-07"
+          description: |
+            YYYY-MM, not a timestamp. A statement is for a month, and a date would invite a reader to
+            wonder what happened at 00:00 on the 1st.
+        scope_kind:
+          type: string
+          enum: [cluster, namespace, team]
+        scope_value: { type: string }
+        cpu_cost: { $ref: "#/components/schemas/Money" }
+        memory_cost: { $ref: "#/components/schemas/Money" }
+        total_cost: { $ref: "#/components/schemas/Money" }
+        cpu_billable_core_hours: { $ref: "#/components/schemas/Money" }
+        memory_billable_gib_hours: { $ref: "#/components/schemas/Money" }
+        wasted_cpu_core_hours: { $ref: "#/components/schemas/Money" }
+        wasted_memory_gib_hours: { $ref: "#/components/schemas/Money" }
+        days_with_data: { type: integer }
+        days_in_month: { type: integer }
+        window_count: { type: integer, format: int64 }
+        coverage:
+          type: string
+          description: |
+            `days_with_data / days_in_month`. **DAY-level:** a day on which the collector ran for one
+            hour counts as a full day, so read `window_count` alongside it and use the daily trend to
+            see a partial day as a dip. Second-level coverage would need the collection interval of
+            every historical day, which is not recorded.
+        estimated_rates: { type: boolean }
+        generated_at: { type: string, format: date-time }
+        finalised_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            NULL while provisional. Once set the row is FROZEN by database trigger -- against every
+            writer, not only the one that generates statements. This is what makes a statement
+            quotable.
 
     RecommendationsResponse:
       type: object

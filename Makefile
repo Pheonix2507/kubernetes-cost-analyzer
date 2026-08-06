@@ -284,11 +284,30 @@ run-api: ## Run the API server locally
 run-collector: ## Run the collector locally
 	go run -ldflags '$(LDFLAGS)' ./cmd/collector
 
+.PHONY: rollup
+rollup: ## Roll up yesterday (what the Phase 10 CronJob will run)
+	go run -ldflags '$(LDFLAGS)' ./cmd/rollup
+
+.PHONY: rollup-backfill
+rollup-backfill: ## Roll up EVERY day that has fact rows. Safe to re-run: the rollup is a projection, not an accumulation
+	go run -ldflags '$(LDFLAGS)' ./cmd/rollup -all
+
+.PHONY: rollup-month
+rollup-month: ## Roll up a month and write its statements: make rollup-month MONTH=2026-07
+	@test -n "$(MONTH)" || (echo "usage: make rollup-month MONTH=2026-07" && exit 1)
+	go run -ldflags '$(LDFLAGS)' ./cmd/rollup -month $(MONTH)
+
+.PHONY: rollup-close
+rollup-close: ## Roll up a month, write its statements and FREEZE them. Irreversible without a deliberate un-finalise
+	@test -n "$(MONTH)" || (echo "usage: make rollup-close MONTH=2026-07" && exit 1)
+	go run -ldflags '$(LDFLAGS)' ./cmd/rollup -month $(MONTH) -close
+
 .PHONY: build
-build: ## Compile both binaries into ./bin
+build: ## Compile all three binaries into ./bin
 	@mkdir -p bin
 	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/api ./cmd/api
 	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/collector ./cmd/collector
+	go build -trimpath -ldflags '$(LDFLAGS)' -o bin/rollup ./cmd/rollup
 	@ls -lh bin/
 
 .PHONY: test
@@ -346,8 +365,17 @@ docker-build: ## Build the container image
 		-t $(IMAGE_REPO)/collector:$(VERSION) \
 		-t $(IMAGE_REPO)/collector:latest \
 		--target collector .
+	# And the rollup, for the same reason: a target nothing builds is a target nothing tests.
+	docker build \
+		--build-arg VERSION=$(VERSION) \
+		--build-arg COMMIT=$(COMMIT) \
+		--build-arg BUILD_TIME=$(BUILD_TIME) \
+		-t $(IMAGE_REPO)/rollup:$(VERSION) \
+		-t $(IMAGE_REPO)/rollup:latest \
+		--target rollup .
 	@docker images $(IMAGE_REPO)/api
 	@docker images $(IMAGE_REPO)/collector
+	@docker images $(IMAGE_REPO)/rollup
 
 .PHONY: kind-load
 kind-load: docker-build ## Load both images into the kind cluster (no registry needed)

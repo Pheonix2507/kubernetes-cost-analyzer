@@ -194,14 +194,23 @@ func run() error {
 	// implementation: each handler declares only what it needs, and there is still one place that
 	// knows how to talk to the database.
 	reportRepo := postgres.NewReportRepository(db.Pool())
+	// A SECOND repository, not a wider first one. RollupRepository reads
+	// container_allocations_daily and monthly_reports; nothing served by reportRepo touches either.
+	// Folding them together would make every existing handler depend on tables it never reads, and
+	// would give the trend queries access to the fact-table SQL they must not fall back to silently.
+	rollupRepo := postgres.NewRollupRepository(db.Pool())
 
 	router := httpapi.NewRouter(httpapi.RouterOptions{
-		Log:                logger,
-		Readiness:          readiness,
-		Inventory:          store,
-		Pricer:             pricer,
-		Reports:            reportRepo,
-		Stats:              reportRepo,
+		Log:       logger,
+		Readiness: readiness,
+		Inventory: store,
+		Pricer:    pricer,
+		Reports:   reportRepo,
+		Stats:     reportRepo,
+		// The SAME pool, a different repository. The trend endpoint reads container_allocations_daily
+		// and monthly_reports, which no other handler touches -- so it gets its own repository rather
+		// than widening reportRepo with queries its other callers would never issue.
+		Trends:             rollupRepo,
 		Recommender:        recommend.NewEngine(recommend.DefaultThresholds()),
 		APIKeys:            cfg.API.APIKeys,
 		RateLimitPerSecond: cfg.API.RateLimitPerSecond,

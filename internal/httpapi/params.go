@@ -295,3 +295,134 @@ func allocationsParams(r *http.Request) (postgres.AllocationsParams, *validation
 		From: from, To: to, Filters: f, Limit: limit, Cursor: cursor,
 	}, nil
 }
+
+// trendParams parses a trend request.
+//
+// The default range is THIRTY DAYS, wider than both the cost endpoints' 24 hours and the
+// recommendation endpoint's 7 days. Each default answers the question its endpoint is for: a cost
+// figure is about now, a recommendation needs a week to see a weekly pattern, and a trend with two
+// points is not a trend. A month of daily buckets is the smallest range where the shape of the line
+// carries information.
+func trendParams(r *http.Request) (postgres.TrendParams, bool, *validationError) {
+	q := r.URL.Query()
+	v := &validationError{}
+
+	from, to := timeRangeDefault(q, v, 30*24*time.Hour)
+
+	interval := postgres.Interval(strings.TrimSpace(q.Get("interval")))
+	if interval == "" {
+		// Day: the bucket that matches the rollup's grain, so the default is also the cheap path.
+		interval = postgres.IntervalDay
+	}
+	if !postgres.ValidInterval(interval) {
+		v.add("interval", "must be one of: %s", strings.Join(postgres.IntervalOptions(), ", "))
+	}
+
+	groupBy := postgres.GroupBy(strings.TrimSpace(q.Get("group_by")))
+	if groupBy == "" {
+		groupBy = postgres.GroupByNamespace
+	}
+	if !postgres.ValidGroupBy(groupBy) {
+		v.add("group_by", "must be one of: %s", strings.Join(postgres.GroupByOptions(), ", "))
+	}
+
+	// A LOWER limit than the summary's 1000, and the unit is different: this caps SERIES, and each
+	// series carries a point per bucket. 50 series x 400 daily buckets is 20,000 points, which is
+	// already more than any chart can render legibly and more than a browser should be asked to parse.
+	limit := limitParam(q, "limit", 20, 100, v)
+
+	compare := false
+	if raw := strings.TrimSpace(q.Get("compare")); raw != "" {
+		switch raw {
+		case "previous_period":
+			compare = true
+		case "none":
+		default:
+			v.add("compare", "must be previous_period or none")
+		}
+	}
+
+	f := filters(q, v)
+
+	// The interval must divide the range into something a chart can show. Checked AFTER the range so
+	// the message can quote real numbers -- and only when both parsed, or it would fire on garbage
+	// input and bury the actual error.
+	if v.empty() && interval == postgres.IntervalHour && to.Sub(from) > 14*24*time.Hour {
+		// 14 days of hourly buckets is 336 points per series, which is the practical ceiling for a
+		// line chart. Beyond it the caller almost certainly wants day buckets, and hourly over a year
+		// would read the FACT table for 8,760 buckets -- the exact query this phase exists to avoid.
+		v.add("interval", "hourly buckets are limited to 14 days (requested %.0f); use interval=day for longer ranges",
+			to.Sub(from).Hours()/24)
+	}
+
+	if !v.empty() {
+		return postgres.TrendParams{}, false, v
+	}
+	return postgres.TrendParams{
+		From: from, To: to, Interval: interval, GroupBy: groupBy, Filters: f, Limit: limit,
+	}, compare, nil
+}
+
+// monthlyReportParams parses a monthly-statement request.
+func monthlyReportParams(r *http.Request) (postgres.MonthlyReportParams, *validationError) {
+	q := r.URL.Query()
+	v := &validationError{}
+
+	// Months, not timestamps. A statement is for a calendar month, so the parameter is YYYY-MM and
+	// there is no way to ask for half of one -- which removes the question of what a partial month's
+	// statement would even mean.
+	now := time.Now().UTC()
+	to := postgres.MonthOf(now)
+	// Twelve months back by default: the range a year-on-year comparison needs, and small enough that
+	// the default response stays readable.
+	from := postgres.MonthOf(now.AddDate(0, -11, 0))
+
+	if raw := strings.TrimSpace(q.Get("from")); raw != "" {
+		m, err := postgres.ParseMonth(raw)
+		if err != nil {
+			v.add("from", "must be a month as YYYY-MM, for example 2026-07")
+		} else {
+			from = m
+		}
+	}
+	if raw := strings.TrimSpace(q.Get("to")); raw != "" {
+		m, err := postgres.ParseMonth(raw)
+		if err != nil {
+			v.add("to", "must be a month as YYYY-MM, for example 2026-08")
+		} else {
+			to = m
+		}
+	}
+	if v.empty() && to.Time().Before(from.Time()) {
+		v.add("to", "must not be before from")
+	}
+	if v.empty() && to.Time().Sub(from.Time()) > maxReportMonths*31*24*time.Hour {
+		v.add("from", "range exceeds the %d-month maximum", maxReportMonths)
+	}
+
+	scopeKind := strings.TrimSpace(q.Get("scope_kind"))
+	switch scopeKind {
+	case "", postgres.ScopeCluster, postgres.ScopeNamespace, postgres.ScopeTeam:
+	default:
+		v.add("scope_kind", "must be one of: %s, %s, %s",
+			postgres.ScopeCluster, postgres.ScopeNamespace, postgres.ScopeTeam)
+	}
+
+	scopeValue := strings.TrimSpace(q.Get("scope_value"))
+	if len(scopeValue) > 253 {
+		v.add("scope_value", "must be at most 253 characters")
+	}
+
+	limit := limitParam(q, "limit", 100, 1000, v)
+
+	if !v.empty() {
+		return postgres.MonthlyReportParams{}, v
+	}
+	return postgres.MonthlyReportParams{
+		From: from, To: to, ScopeKind: scopeKind, ScopeValue: scopeValue, Limit: limit,
+	}, nil
+}
+
+// maxReportMonths bounds a statement query. Five years of three scopes across fifty namespaces is
+// already 9,000 rows, and nobody reads a statement page that long.
+const maxReportMonths = 60

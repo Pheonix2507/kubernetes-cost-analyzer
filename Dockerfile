@@ -97,7 +97,14 @@ RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} ${TARGETARCH:+GOARCH=$TARGETARCH} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Version=${VERSION} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Commit=${COMMIT} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.BuildTime=${BUILD_TIME}" \
-      -o /out/collector ./cmd/collector
+      -o /out/collector ./cmd/collector \
+ && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} ${TARGETARCH:+GOARCH=$TARGETARCH} \
+    go build -trimpath \
+      -ldflags "-s -w \
+        -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Version=${VERSION} \
+        -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Commit=${COMMIT} \
+        -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.BuildTime=${BUILD_TIME}" \
+      -o /out/rollup ./cmd/rollup
 
 # =============================================================================
 # Stage 2: api runtime
@@ -158,3 +165,24 @@ COPY --from=builder /out/collector /usr/local/bin/collector
 USER nonroot:nonroot
 
 ENTRYPOINT ["/usr/local/bin/collector"]
+
+# =============================================================================
+# Stage 4: rollup runtime
+# =============================================================================
+#
+# A BATCH JOB, not a service, and the image reflects that in one way worth noting: there is no CMD
+# alongside the ENTRYPOINT. Kubernetes appends a CronJob's `args` to the entrypoint, so the schedule
+# supplies the flags -- `-month 2026-07 -close` for the monthly close, nothing at all for the nightly
+# run. A CMD with default flags would be silently overridden by any args and silently applied when
+# there are none, which is the worst of both.
+#
+# Same distroless base as the others: no shell, so a compromised job cannot run one. That matters more
+# for this binary than the API, because a CronJob's pod spec is the sort of thing that ends up with
+# broader database credentials than a read-only service needs.
+FROM gcr.io/distroless/static-debian12:nonroot AS rollup
+
+COPY --from=builder /out/rollup /usr/local/bin/rollup
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/usr/local/bin/rollup"]

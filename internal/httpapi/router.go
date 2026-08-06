@@ -22,6 +22,9 @@ type RouterOptions struct {
 	Pricer    pricing.Provider
 	Reports   Reports
 	Stats     Stats
+	// Trends reads the daily rollup and the monthly statements. A fourth read interface rather than a
+	// wider one, so a handler depends only on the queries it calls.
+	Trends Trends
 	// Recommender is the rule engine. Injected rather than constructed here, so its thresholds are an
 	// operator's decision made once in main rather than a default buried in the HTTP layer.
 	Recommender *recommend.Engine
@@ -80,6 +83,12 @@ func NewRouter(opts RouterOptions) http.Handler {
 
 	// Advice, as distinct from data. The endpoint that says what to CHANGE.
 	mux.HandleFunc("GET /api/v1/recommendations", handleRecommendations(opts.Stats, opts.Recommender))
+
+	// History. /trend is cost THROUGH TIME, served from the daily rollup -- the same question
+	// /costs/summary answers for a single period, asked repeatedly. /reports/monthly is the frozen
+	// statement, which is a different thing again: not "what is true now" but "what did we say".
+	mux.HandleFunc("GET /api/v1/costs/trend", handleTrend(opts.Trends))
+	mux.HandleFunc("GET /api/v1/reports/monthly", handleMonthlyReports(opts.Trends))
 
 	// MIDDLEWARE ORDER IS A CORRECTNESS CONCERN, NOT A STYLE CHOICE.
 	// The first entry is outermost; a request travels down the list and back up.

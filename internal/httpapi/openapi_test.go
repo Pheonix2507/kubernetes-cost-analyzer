@@ -129,6 +129,110 @@ func TestOpenAPISpec_RecommendationEnumsMatchTheEngine(t *testing.T) {
 	}
 }
 
+// TestOpenAPISpec_TrendEnumsMatchTheCode extends the drift guard to the trend endpoint.
+//
+// The interval enum is the one that matters most here, because the unit is INTERPOLATED into
+// date_trunc rather than bound as a parameter. So the spec's list, the parser's allow-list and the
+// repository's map all have to be the same set -- and this asserts the spec against the map the SQL
+// actually uses, not against a hand-maintained copy.
+func TestOpenAPISpec_TrendEnumsMatchTheCode(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("cannot read the spec: %v", err)
+	}
+	var spec map[string]any
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatalf("invalid YAML: %v", err)
+	}
+
+	params, ok := navigate(t, spec, "paths", "/api/v1/costs/trend", "get", "parameters").([]any)
+	if !ok {
+		t.Fatal("the trend parameters are not a list")
+	}
+
+	t.Run("interval", func(t *testing.T) {
+		documented := enumFor(params, "interval")
+		if documented == nil {
+			t.Fatal("interval has no enum in the spec")
+		}
+		assertSameSet(t, documented, postgres.IntervalOptions(),
+			"the interval is interpolated into date_trunc, so a documented value the code rejects is a "+
+				"400 no client could have predicted -- and one the code accepts but the spec omits is invisible")
+	})
+
+	t.Run("group_by", func(t *testing.T) {
+		documented := enumFor(params, "group_by")
+		if documented == nil {
+			t.Fatal("group_by has no enum on the trend endpoint")
+		}
+		// The SAME allow-list the summary uses. The trend routes some groupings to the fact table rather
+		// than refusing them, so every grouping must be documented here too.
+		assertSameSet(t, documented, postgres.GroupByOptions(),
+			"the trend accepts every grouping the summary does -- it routes pod and container to the "+
+				"fact table rather than refusing them")
+	})
+
+	t.Run("source is documented as an enum", func(t *testing.T) {
+		// The response field, not a parameter. Checked because a client that switches on `source` and
+		// meets an undocumented third value has no branch for it.
+		node := navigate(t, spec, "components", "schemas", "TrendResponse", "properties", "source", "enum")
+		list, ok := node.([]any)
+		if !ok {
+			t.Fatal("TrendResponse.source has no enum")
+		}
+		got := make([]string, 0, len(list))
+		for _, v := range list {
+			got = append(got, fmt.Sprint(v))
+		}
+		assertSameSet(t, got,
+			[]string{string(postgres.TrendSourceRollup), string(postgres.TrendSourceFacts)},
+			"source is part of the contract, so its possible values must be documented")
+	})
+}
+
+// TestOpenAPISpec_MonthlyScopesMatchTheCode guards the scope enum against the three constants the
+// database CHECK constraint uses.
+//
+// Three places have to agree: the constraint, the repository's validation, and the spec. A fourth scope
+// added to the code and forgotten in the spec would be invisible to every client.
+func TestOpenAPISpec_MonthlyScopesMatchTheCode(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("cannot read the spec: %v", err)
+	}
+	var spec map[string]any
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatalf("invalid YAML: %v", err)
+	}
+
+	want := []string{postgres.ScopeCluster, postgres.ScopeNamespace, postgres.ScopeTeam}
+
+	params, _ := navigate(t, spec, "paths", "/api/v1/reports/monthly", "get", "parameters").([]any)
+	documented := enumFor(params, "scope_kind")
+	if documented == nil {
+		t.Fatal("scope_kind has no enum in the spec")
+	}
+	assertSameSet(t, documented, want,
+		"scope_kind is constrained by the database, so a value the spec documents and the constraint "+
+			"rejects would be a 500 rather than a 400")
+
+	// And on the response schema, so a client can exhaustively switch on what it receives.
+	node := navigate(t, spec, "components", "schemas", "MonthlyReport", "properties", "scope_kind", "enum")
+	list, ok := node.([]any)
+	if !ok {
+		t.Fatal("MonthlyReport.scope_kind has no enum")
+	}
+	got := make([]string, 0, len(list))
+	for _, v := range list {
+		got = append(got, fmt.Sprint(v))
+	}
+	assertSameSet(t, got, want, "the response enum must match the request enum and the constraint")
+}
+
 // TestOpenAPISpec_DocumentsEveryRoute catches the commonest drift: a route added to the router and
 // never written down. An undocumented endpoint is one no client can discover and nobody maintains.
 func TestOpenAPISpec_DocumentsEveryRoute(t *testing.T) {
@@ -151,6 +255,7 @@ func TestOpenAPISpec_DocumentsEveryRoute(t *testing.T) {
 		"/healthz", "/readyz", "/version",
 		"/api/v1/nodes", "/api/v1/namespaces", "/api/v1/pods",
 		"/api/v1/costs/summary", "/api/v1/allocations", "/api/v1/recommendations",
+		"/api/v1/costs/trend", "/api/v1/reports/monthly",
 	}
 	for _, route := range routes {
 		if _, documented := spec.Paths[route]; !documented {

@@ -23,11 +23,12 @@ Measured on real data, `kube-system` reported **0 GiB-hours** of memory waste wh
 50, and `team-search` was understated by 126%. The more under-requested a team's workloads were, the
 more efficient it looked.
 
-## Status: Phase 6 complete — it now says what to change
+## Status: Phase 7 complete — history is now affordable to read
 
-The collector produces cost data, the API serves it, and the recommendation engine turns it into
-advice: right-sizing from p95 peaks, idle detection, under-request warnings, missing requests and
-over-replication. **A frontend could be built against this today** — which is Phase 8.
+The collector produces cost data, the API serves it, the recommendation engine says what to change,
+and a nightly rollup makes trends and monthly statements cheap: **292.7x compression, measured on
+real data**, with statements that freeze once signed off. **A frontend could be built against this
+today** — which is Phase 8.
 
 What works today:
 
@@ -58,7 +59,10 @@ What works today:
   different questions: an average for cost, p95-of-peaks for right-sizing
 - A recommendation engine with an evidence gate, headroom on every proposal, and savings
   that are allowed to be negative when the correct advice costs money
-- A non-root, shell-less container image
+- A daily rollup at 292.7x compression, written by a batch job that is idempotent, backfillable,
+  and mutually excluded by a Postgres advisory lock
+- Immutable monthly statements with honest coverage metadata, frozen by database trigger
+- Three non-root, shell-less container images
 
 ### Endpoints
 
@@ -73,6 +77,8 @@ What works today:
 | GET | `/api/v1/costs/summary` | **aggregated cost** — `?group_by=` any of 10 dimensions, filtered, sorted |
 | GET | `/api/v1/allocations` | raw per-container samples, cursor-paginated |
 | GET | `/api/v1/recommendations` | **what to change** — right-size, idle, under-requested, set-requests, over-replicated |
+| GET | `/api/v1/costs/trend` | cost **through time** from the rollup, with period-over-period comparison |
+| GET | `/api/v1/reports/monthly` | frozen monthly statements at cluster, namespace and team scope |
 
 Full contract in [`api/openapi.yaml`](api/openapi.yaml), kept honest by a test asserting its enums
 match the allow-lists the code enforces.
@@ -82,6 +88,9 @@ curl -H "Authorization: Bearer $KEY" \
   'localhost:8080/api/v1/costs/summary?group_by=workload&sort=wasted_cpu_core_hours'
 
 curl -H "Authorization: Bearer $KEY" localhost:8080/api/v1/recommendations
+
+curl -H "Authorization: Bearer $KEY" \
+  'localhost:8080/api/v1/costs/trend?interval=day&group_by=team&compare=previous_period'
 ```
 
 ## Prerequisites
@@ -156,21 +165,23 @@ retention is finite. Postgres holds the allocation facts and the aggregates.
 
 ```
 cmd/api          HTTP API — wiring only, no logic
-cmd/collector    background collection loop (skeleton)
+cmd/collector    the collection loop: aligned windows, cost engine, writer
+cmd/rollup       the batch job: nightly rollup, backfill, monthly statements
 internal/
   buildinfo      version/commit injected at link time
   config         env loading + validation, stdlib only
   logging        log/slog setup and request-scoped loggers
   health         Checker interface + concurrent readiness aggregator
-  httpapi        server, router, JSON responses, health handlers
-    middleware   request ID, structured access log, panic recovery
   domain         the vocabulary all three layers share; stdlib imports only
   kube           client-go: dual-mode client, shared informers, pure translation
   pricing        rate catalogue, the CPU/memory split, pure cost arithmetic
   prom           PromQL usage queries (the container!="" filter matters -- see below)
-    middleware   ...plus API-key auth and a token-bucket rate limiter
   costing        the join: topology x usage x rates -> cost, with a bounded worker pool
-  store/postgres pgx pool, Querier seam, dimension + fact repositories
+  recommend      the rule engine: evidence gates, p95 right-sizing, severity by failure mode
+  rollup         batch orchestration: transaction boundaries, failure isolation, backfill
+  httpapi        server, router, JSON responses, handlers for every endpoint
+    middleware   request ID, access log, panic recovery, API-key auth, rate limiting
+  store/postgres pgx pool, Querier seam, dimension + fact + rollup + statement repositories
 migrations       numbered SQL, applied with golang-migrate
 deploy/
   kind           cluster definition
@@ -370,6 +381,144 @@ for $1.26 a month. The rule read `count(DISTINCT pod_name) = 3` without asking *
 three. The gate is an **allow-list** of kinds, so an unknown CRD defaults to silence rather than to
 confident advice about someone else's resource.
 
+## Rollups: making history affordable
+
+**The problem, measured before writing anything.** 74,925 fact rows over 8 days of a 23-container
+cluster, and `sum(total_cost) GROUP BY namespace` over a year read 3,372 buffers (~26 MB) to produce
+six rows. Projected to 5,000 containers at 288 five-minute windows a day: 1.44 M rows/day, 525 M/year.
+A dashboard drawing a twelve-point annual trend would scan half a billion rows — not because the query
+is bad, but because the data is stored at 288x the resolution the question needs.
+
+**Measured after:** 74,925 rows → 256, or **292.7x**. Query cost 3,372 buffers → **18**.
+
+### The rule that decided the whole design: not every aggregate rolls up
+
+| Aggregate | Rolls up? | Why |
+|---|---|---|
+| `sum` | ✅ | the sum of sums is the sum |
+| `max` / `min` | ✅ | the max of maxes is the max |
+| `count` | ✅ | it is a sum |
+| `avg` | ⚠️ **only as sum ÷ count** | averaging averages is wrong unless every count is equal, and window counts are never equal once a container starts mid-day |
+| **`percentile`** | ❌ **never** | p95 of daily p95s is not the p95 of the data. Nothing fixes this but a mergeable sketch |
+
+Two consequences designed in rather than discovered:
+
+**The rollup stores core-hours, not millicores.** A core-hour is a sum, so it re-aggregates correctly
+at any grain. Storing `avg_millicores` would make a monthly average weight a two-hour day identically
+to a twenty-four-hour one.
+
+**The recommendation engine keeps reading the fact table**, because its p95 cannot come from a rollup.
+That is an architectural boundary, not an omission — and it is why raw-fact retention must always
+exceed the recommendation window.
+
+### DELETE-then-INSERT, not upsert
+
+Upsert is what the fact table uses, so consistency argued for it. It is wrong for a rollup, and the
+reason is the difference between a row and a *projection*. An upsert can only correct rows it is given:
+if a dimension tuple that existed on Monday no longer appears in Monday's facts — a mislabelled
+namespace corrected, a duplicated pod cleaned up — re-running writes the new rows and **leaves the old
+one forever**. Nothing will reference its tuple again, so nothing will overwrite it.
+
+`DELETE` then `INSERT ... SELECT`, in one transaction, makes the operation *"make the rollup equal the
+fact table for this day"*. Verified: dropping the whole rollup and rebuilding from facts takes 711 ms
+and reproduces figures identical to the fact table for every namespace, to the last decimal place.
+
+### The aggregation never leaves Postgres
+
+`INSERT ... SELECT`, not "SELECT into Go, aggregate, INSERT back". The instinctive shape would move
+1.44 M rows/day over the network to produce 4,900, and reimplement Postgres's aggregation in Go where
+it can drift from the SQL the summary endpoint uses. Cost figures computed two ways eventually
+disagree, and then nobody knows which is right.
+
+### Which table answers a trend, and saying so
+
+A rollup only pays off if something reads it, and only stays *correct* if that something declines to
+read it for the questions it cannot answer:
+
+```
+interval=hour        -> raw_facts    the rollup's finest grain is a day
+group_by=pod         -> raw_facts    pod is the one dimension the rollup drops
+otherwise            -> daily_rollup ~293x less data
+```
+
+`source` is in the response body, as part of the contract. The two do not answer identically, and *"the
+trend disagrees with the summary"* should be answerable from the response rather than by reading our
+source. There is a test asserting the two agree for any question both can serve.
+
+**Pod is dropped on purpose.** It costs 1.6x of the compression (253x with pods, 293x without), which
+is not the argument. A pod name is not a stable identity: a Deployment rollout replaces every pod, so a
+per-pod daily series fragments on every deploy. Per-pod detail lives in `/api/v1/allocations`.
+
+### The UTC-day grain, and what it costs
+
+`date_trunc('day', ts)` depends on the session timezone, so the same rows bucket differently for
+different readers. Fixing it at UTC makes the rollup deterministic and byte-reproducible.
+
+The cost, stated plainly: an IST month boundary falls at 18:30 UTC the previous day, so an IST-aligned
+month is 30 UTC days plus two half-days this table has already merged into their neighbours. **That is
+unrecoverable from the rollup** — the fact table is the only thing that can answer it, which is another
+reason retention matters.
+
+## Monthly statements: not "what is true now" but "what we said"
+
+Every other table here answers *what is true now*. This one is stored, because a statement must not
+change after it is issued: backfill a missing day, correct a price, or fix a rollup bug, and a
+computed-on-demand figure for last August silently becomes a different number from the one somebody
+already reported.
+
+`finalised_at` is the line — `null` is provisional and regenerable, set is frozen. **Frozen is enforced
+by database trigger**, not only by the writer. The upsert carries `WHERE finalised_at IS NULL` so the
+normal path skips signed-off rows gracefully and reports how many it left alone; the trigger is the
+backstop for every *other* writer, because an invariant enforced only by the one function that
+currently writes a table lasts exactly until the second writer appears.
+
+**Coverage is what separates a statement from a chart.** A month containing a collector outage produces
+a figure that is confidently too low, and nothing about the figure reveals it. Coverage is
+`days_with_data / days_in_month`, so it is day-level — a day the collector ran for one hour counts as
+full — which is why `window_count` is reported alongside and documented as the way to see a partial day.
+
+Three scopes in **one pass** via `GROUPING SETS`. Three separate queries would scan the month three
+times and could see different data between them, so a cluster statement might not equal the sum of its
+namespace statements for no reason a reader could discover.
+
+An unlabelled container gets **no team statement** rather than one belonging to `""`. So the gap between
+a cluster statement and the sum of its team statements *is* the unattributed spend — on this cluster,
+half the bill, because kube-system and monitoring carry no team label.
+
+## The batch job: idempotency, backfill, and one lock
+
+`cmd/rollup` is a third binary rather than a ticker in the collector, and the reasons are lifecycle:
+
+- **A batch job completes.** It has an exit code, so "did last night's rollup succeed" is answerable. A
+  goroutine in a service has no exit code — its failures are visible only if someone reads the logs.
+- **Backfill is a CLI invocation.** A daemon cannot be asked "roll up July", so it grows a second code
+  path for backfill, and two code paths for the same computation eventually disagree.
+- **Failure domains.** A rollup that OOMs must not stop collection. Collection cannot be caught up —
+  Prometheus retention expires — whereas a rollup recomputes from facts at any time. The recoverable
+  job must not be able to kill the unrecoverable one.
+
+**One transaction per day, not one per range.** A failure on day 40 of a 60-day backfill must keep the
+39 days already written, and a failing day is recorded and the run *continues* — the same decision
+`internal/costing` makes for a failing namespace. Then a non-zero exit, after doing everything possible.
+
+**Yesterday, never today.** Today is incomplete, so rolling it up writes a figure correct for the hours
+so far and wrong for the day — and because the rollup is a projection, the next run replaces it, so the
+value flickers instead of converging.
+
+**A Postgres advisory lock, not a Kubernetes Lease.** `concurrencyPolicy: Forbid` is not a guarantee.
+A Lease needs new RBAC and a TTL you wait out after a crash. The contested resource *is* the database,
+and an advisory lock dies with its connection — so a hard crash releases it immediately. A contended run
+**exits 0**: the holder is already doing the work, and a CronJob whose failure count increments every
+time it overlaps a backfill has a failure count that means nothing.
+
+The subtlety worth knowing: *session*-scoped locks need a **pinned connection**. The obvious
+`pool.Exec(...pg_try_advisory_lock...)` then `pool.Exec(...unlock...)` takes the lock on one pooled
+connection and releases on another. `pg_advisory_unlock` returns false and warns rather than raising, so
+nothing appears to fail — the lock stays held until that connection recycles, and every later run exits
+"another process holds the lock" while no process does. **A job that stops working by succeeding.**
+Measured, that leak really does happen: releasing on a cancelled context fails with
+`context already done`, the connection returns to the pool healthy, and `pg_locks` still shows the lock.
+
 ## API design decisions
 
 **Cursor pagination, not offset.** `OFFSET 5000` makes Postgres produce and discard 5,000 rows, and
@@ -402,6 +551,10 @@ the key one position at a time, in linear rather than exponential attempts.
 ```bash
 make migrate-up    # apply migrations
 make migrate-reset # drop and re-apply from scratch
+make rollup            # roll up yesterday (what the Phase 10 CronJob will run)
+make rollup-backfill   # roll up every day with fact rows. Safe to re-run: it is a projection
+make rollup-month MONTH=2026-07   # roll up a month and write its statements
+make rollup-close MONTH=2026-07   # ...and FREEZE them. Irreversible without a deliberate un-finalise
 make check         # fmt + vet + lint + test — everything CI runs
 make test          # go test -race
 make docker-build  # container image
@@ -445,7 +598,7 @@ there is code that reads them.
 | **4** ✅ | Cost engine + Prometheus collector (worker pools, channels, context) |
 | **5** ✅ | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |
 | **6** ✅ | Idle detection + recommendation engine (p95 right-sizing, evidence gates) |
-| 7 | Rollups, historical trends, monthly reports |
+| **7** ✅ | Daily rollups, trends, immutable monthly statements, advisory-lock batch job |
 | 8 | Next.js frontend |
 | 9 | Observability — own metrics, recording rules, Grafana dashboards as code |
 | 10 | Helm chart + GitHub Actions |

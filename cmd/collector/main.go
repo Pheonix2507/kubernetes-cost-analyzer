@@ -6,10 +6,28 @@
 //   - SCALING. The API scales with user traffic. The collector must NOT: two collectors would
 //     compute every sample twice. The upsert makes that harmless rather than catastrophic --
 //     the second write updates the first rather than duplicating it -- but they would still
-//     double the Prometheus query load for no benefit. Phase 7 adds leader election so a
-//     highly-available deployment has exactly one ACTIVE collector.
+//     double the Prometheus query load for no benefit.
+//
+//     PHASE 7 DID NOT ADD LEADER ELECTION HERE, and the earlier note claiming it would is
+//     corrected rather than quietly dropped. Phase 7 added a Postgres advisory lock to
+//     cmd/rollup, where the semantics fit exactly: a batch job tries the lock, and exits
+//     successfully if another run holds it.
+//
+//     A CONTINUOUS process needs a different pattern. "Try once, exit if held" would put the
+//     second replica into CrashLoopBackOff; a follower has to keep waiting and take over when
+//     the leader dies, which is renewal, observation and a TTL -- that is what
+//     client-go's leaderelection package and a coordination.k8s.io Lease are for, and it needs
+//     an RBAC grant this service deliberately does not have.
+//
+//     Until then the correct answer is simpler and is a DEPLOYMENT decision rather than a code
+//     one: run this as a single-replica Deployment. Phase 10 owns the Helm chart, so Phase 10 is
+//     where "exactly one active collector" is either enforced by replicas: 1 or earned with a
+//     Lease. Writing the harder mechanism before the chart exists would be building the answer
+//     to a question nothing is yet asking.
+//
 //   - BLAST RADIUS. A collector bug that exhausts memory scraping a huge cluster should not
 //     take the dashboard down with it.
+//
 //   - RESOURCE SHAPE. The API is latency-sensitive and mostly idle; the collector is a
 //     periodic CPU and memory spike. One container sized for both is either wasteful at idle
 //     or throttled during collection.
