@@ -1,0 +1,33 @@
+{{- $name := include "kca.name" . -}}
+# The pricing catalogue.
+#
+# A ConfigMap rather than baked into the image, because rates change independently of code. A new
+# instance type in the catalogue is not a new release of the binary, and requiring one would mean
+# rebuilding and redeploying to correct a price.
+#
+# NOTE the checksum/config annotation on every pod template that mounts this. Kubernetes does NOT restart
+# pods when a mounted ConfigMap changes -- the file updates in place after a delay, and a process that
+# read it at startup keeps the old values forever. Without the annotation, editing rates would appear to
+# work and change nothing.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ $name }}-catalogue
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+data:
+  catalogue.yaml: |
+{{- if .Values.pricingCatalogue }}
+{{ .Values.pricingCatalogue | indent 4 }}
+{{- else }}
+    {{/*
+      .Files.Get reads from the CHART directory, so the catalogue must be inside it -- a relative path
+      escaping the chart root is refused by Helm, deliberately, because a chart that read arbitrary host
+      files could not be packaged.
+      
+      So `make helm-package` copies deploy/pricing/catalogue.yaml into the chart first. The alternative --
+      duplicating the catalogue inside the chart -- would give two files that drift, and the one the CLI
+      reads would stop matching the one the cluster uses.
+    */}}
+{{ .Files.Get "catalogue.yaml" | indent 4 }}
+{{- end }}

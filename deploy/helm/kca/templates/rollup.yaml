@@ -1,0 +1,160 @@
+{{- $name := include "kca.name" . -}}
+{{- if .Values.rollup.enabled }}
+# A CronJob, because the rollup COMPLETES.
+#
+# WHY NOT A DEPLOYMENT WITH A SLEEP LOOP, which is how batch work often ends up running:
+#   - A Deployment restarts its pod forever, so a job that exits 0 having finished is treated as a crash
+#     and run again immediately.
+#   - `restartPolicy: Never` is not even allowed in a Deployment -- the API server rejects it -- which is
+#     Kubernetes telling you the shape is wrong.
+#   - A CronJob has an exit code per run and a success/failure history, so "did last night's rollup work"
+#     is answerable by looking rather than by reading logs.
+#   - And a schedule is a schedule. A ticker inside a service fires N hours from whenever the pod happened
+#     to start, so the run time drifts across the day and eventually straddles the midnight boundary the
+#     rollup grain is defined by.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-rollup
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rollup
+spec:
+  schedule: {{ .Values.rollup.schedule | quote }}
+  # timeZone, added in Kubernetes 1.27 and stated EXPLICITLY.
+  #
+  # Without it a CronJob uses the kube-controller-manager's timezone, so "30 0 * * *" means something
+  # different depending on where the control plane runs -- and worse, it shifts twice a year under DST
+  # while the rollup's day boundary is UTC by definition. The job would then straddle midnight for half
+  # the year.
+  timeZone: {{ .Values.rollup.timeZone | quote }}
+  concurrencyPolicy: {{ .Values.rollup.concurrencyPolicy }}
+  successfulJobsHistoryLimit: {{ .Values.rollup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.rollup.failedJobsHistoryLimit }}
+  startingDeadlineSeconds: {{ .Values.rollup.startingDeadlineSeconds }}
+  jobTemplate:
+    spec:
+      # backoffLimit 2: retry twice, then stop and leave the failure visible.
+      #
+      # The default of 6 with exponential backoff spreads retries over ~10 minutes and can push a run
+      # into the next schedule, where concurrencyPolicy: Forbid then SKIPS it -- so a transient failure
+      # silently costs two nights instead of one. Two attempts covers a blip; more just delays the alert.
+      backoffLimit: 2
+      activeDeadlineSeconds: {{ .Values.rollup.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "kca.labels" . | nindent 12 }}
+            app.kubernetes.io/component: rollup
+        spec:
+          # NEVER, not OnFailure. With OnFailure the kubelet restarts the CONTAINER in place, which keeps
+          # the same pod and hides each attempt's logs behind the next. Never makes the Job controller
+          # create a fresh pod per attempt, so every attempt has its own inspectable logs -- which for a
+          # nightly job you look at after the fact is the whole point.
+          restartPolicy: Never
+          serviceAccountName: {{ include "kca.serviceAccountName" . }}
+          securityContext:
+            {{- include "kca.podSecurityContext" . | nindent 12 }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: rollup
+              image: {{ include "kca.image" (list . "rollup") }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                {{- include "kca.containerSecurityContext" . | nindent 16 }}
+              # NO ARGS: the binary defaults to rolling up YESTERDAY, which is exactly what a nightly run
+              # wants. The image has an ENTRYPOINT and deliberately no CMD, so args supplied here append
+              # to it -- see the note in the Dockerfile.
+              env:
+                {{- include "kca.commonEnv" . | nindent 16 }}
+              volumeMounts:
+                - name: catalogue
+                  mountPath: /etc/kca
+                  readOnly: true
+              resources:
+                {{- toYaml .Values.rollup.resources | nindent 16 }}
+              # NO PROBES ON A JOB POD, and the omission is correct rather than lazy.
+              #
+              # This binary serves no HTTP at all -- it is the one process that genuinely does not need a
+              # listener, because there is nothing to observe live: it runs for seconds and its outcome is
+              # the exit code. Its freshness is exposed by the API reading max(rolled_up_at) from the
+              # database, which is why Phase 9 did not need a Pushgateway.
+              #
+              # A liveness probe here would also be actively harmful: it would restart a job mid-write.
+          volumes:
+            - name: catalogue
+              configMap:
+                name: {{ $name }}-catalogue
+{{- if .Values.rollup.monthlyClose.enabled }}
+---
+# The monthly close: a SECOND CronJob, not a flag on the first.
+#
+# Two schedules, two failure histories, two exit codes. Folding "close last month" into the nightly job
+# as a conditional would mean a failure on the 2nd is indistinguishable from a routine nightly failure --
+# and closing a month is irreversible without a deliberate un-finalise, so it deserves its own visible
+# outcome.
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: {{ $name }}-monthly-close
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: rollup
+spec:
+  schedule: {{ .Values.rollup.monthlyClose.schedule | quote }}
+  timeZone: {{ .Values.rollup.timeZone | quote }}
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: {{ .Values.rollup.successfulJobsHistoryLimit }}
+  failedJobsHistoryLimit: {{ .Values.rollup.failedJobsHistoryLimit }}
+  jobTemplate:
+    spec:
+      # ZERO retries. Finalising is irreversible: the database triggers refuse to modify or delete a
+      # frozen statement. A blind retry of a partially-applied close is not obviously safe, so it fails
+      # loudly and a human runs `make rollup-close MONTH=...` having looked.
+      backoffLimit: 0
+      activeDeadlineSeconds: {{ .Values.rollup.activeDeadlineSeconds }}
+      template:
+        metadata:
+          labels:
+            {{- include "kca.labels" . | nindent 12 }}
+            app.kubernetes.io/component: rollup
+        spec:
+          restartPolicy: Never
+          serviceAccountName: {{ include "kca.serviceAccountName" . }}
+          securityContext:
+            {{- include "kca.podSecurityContext" . | nindent 12 }}
+          {{- with .Values.image.pullSecrets }}
+          imagePullSecrets: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          containers:
+            - name: monthly-close
+              image: {{ include "kca.image" (list . "rollup") }}
+              imagePullPolicy: {{ .Values.image.pullPolicy }}
+              securityContext:
+                {{- include "kca.containerSecurityContext" . | nindent 16 }}
+              # THE MONTH IS COMPUTED IN THE SHELL, which these distroless images have no shell for -- so
+              # it is computed by the ENTRYPOINT's own flag parsing instead.
+              #
+              # `-close-previous-month` rather than `-month $(date -d 'last month' +%Y-%m)`: there is no
+              # `date` and no `sh` in a distroless-static image, deliberately, and adding one to compute a
+              # string would trade the attack surface of a shell for the convenience of a subshell.
+              #
+              # It also removes a real bug class. `date -d 'last month'` on the 31st gives the WRONG month
+              # in several months of the year, because "one month before 31 March" is not a date.
+              args: ["-close-previous-month"]
+              env:
+                {{- include "kca.commonEnv" . | nindent 16 }}
+              volumeMounts:
+                - name: catalogue
+                  mountPath: /etc/kca
+                  readOnly: true
+              resources:
+                {{- toYaml .Values.rollup.resources | nindent 16 }}
+          volumes:
+            - name: catalogue
+              configMap:
+                name: {{ $name }}-catalogue
+{{- end }}
+{{- end }}

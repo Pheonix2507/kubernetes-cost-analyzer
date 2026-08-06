@@ -1,0 +1,46 @@
+{{ include "kca.name" . }} {{ .Chart.AppVersion }} installed into namespace {{ .Release.Namespace }}.
+
+{{- if not .Values.existingSecret }}
+
+  ⚠  CHART-MANAGED SECRET IN USE.
+     The database URL came from a values file, so it is now recoverable from the Helm release Secret by
+     anyone who can read Secrets in this namespace -- whether or not they can read the app's own Secret.
+     For anything real, create a Secret out of band and set `existingSecret`.
+{{- end }}
+{{- if .Values.postgresql.enabled }}
+
+  ⚠  IN-CHART POSTGRES IN USE. `helm uninstall` deletes the StatefulSet, and depending on the reclaim
+     policy the PVC and your data with it. Development only.
+{{- end }}
+{{- if eq .Values.env "development" }}
+
+  ⚠  APP_ENV=development, so API authentication is not enforced. Anyone who can reach the Service can
+     read cost data.
+{{- end }}
+
+MIGRATIONS ARE NOT RUN BY THIS CHART, and that is deliberate.
+
+  There is no init container and no Helm hook that applies them. A migration is a schema change with a
+  lock, and running it automatically from every pod start means N replicas racing on the same DDL --
+  golang-migrate takes an advisory lock so they serialise rather than corrupt, but the losers then block
+  on startup and the rollout stalls without saying why.
+
+  More importantly, a migration is a decision. It should be a reviewed, deliberate step you can time,
+  not a side effect of a deploy that happened to restart a pod.
+
+    kubectl run kca-migrate --rm -it --restart=Never \
+      --namespace {{ .Release.Namespace }} \
+      --image=migrate/migrate --command -- \
+      migrate -path /migrations -database "$DATABASE_URL" up
+
+CHECK IT WORKED:
+
+  kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "kca.name" . }}-api
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "kca.name" . }}-api {{ .Values.api.service.port }}:{{ .Values.api.service.port }}
+  curl localhost:{{ .Values.api.service.port }}/readyz
+
+  Or run the whole verification: make helm-verify
+
+THE COLLECTOR IS PINNED TO ONE REPLICA and the chart refuses to render otherwise. Two collectors compute
+every window twice, doubling the Prometheus query load. Proper leader election needs a
+coordination.k8s.io Lease and an RBAC grant this service deliberately does not have.

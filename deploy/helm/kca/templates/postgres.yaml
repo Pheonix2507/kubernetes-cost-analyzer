@@ -1,0 +1,151 @@
+{{- if .Values.postgresql.enabled }}
+{{- $name := include "kca.name" . -}}
+# Postgres as a StatefulSet. DEVELOPMENT ONLY -- see the warning on postgresql.enabled in values.yaml.
+#
+# A STATEFULSET RATHER THAN A DEPLOYMENT, and the reason is the VOLUME rather than the data.
+#
+# A Deployment's replicas share whatever PVC you give them. Two Postgres processes on one data directory
+# corrupt it immediately -- and a RollingUpdate deliberately runs old and new pods together, so a
+# Deployment would attempt exactly that on every upgrade.
+#
+# A StatefulSet gives each replica its OWN PVC through volumeClaimTemplates, plus a stable ordinal name.
+# So storage is per-replica by construction, and the DSN can name kca-postgres-0 rather than chasing a
+# random suffix across reschedules.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $name }}-postgres
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  # The headless Service below. A StatefulSet REQUIRES one -- it is what provides the per-pod DNS records
+  # that give each replica its stable identity.
+  serviceName: {{ $name }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "kca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        {{- include "kca.labels" . | nindent 8 }}
+        app.kubernetes.io/component: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        # The postgres user in the official image.
+        runAsUser: 70
+        runAsGroup: 70
+        # fsGroup IS set here, unlike the application pods, and this is the one place it belongs.
+        #
+        # A dynamically-provisioned volume arrives owned by root. Postgres refuses to start on a data
+        # directory it cannot write -- and refuses on one that is world-readable, so a blanket chmod is not
+        # the answer either. fsGroup makes the kubelet chown the volume to this GID on mount.
+        #
+        # It is absent from the application pods because they mount no writable volume, so setting it there
+        # would ask the kubelet to recursively chown nothing.
+        fsGroup: 70
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: {{ .Values.postgresql.image }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            # readOnlyRootFilesystem is FALSE here, and it has to be: Postgres writes its socket to
+            # /var/run/postgresql and temporary files outside the data directory. The application
+            # containers can be read-only because they are distroless-static Go binaries that write
+            # nothing; a database cannot.
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop: ["ALL"]
+          env:
+            - name: POSTGRES_DB
+              value: kca
+            - name: POSTGRES_USER
+              value: kca
+            - name: POSTGRES_PASSWORD
+              # Read from the SAME Secret as the DSN, so the two cannot disagree. Templating the password
+              # into two places is how a chart ends up with an app that cannot log into its own database.
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kca.secretName" . }}
+                  key: postgres-password
+            - name: PGDATA
+              # A SUBDIRECTORY of the mount, not the mount root.
+              #
+              # A dynamically-provisioned volume often contains a `lost+found` directory, and Postgres
+              # refuses to initialise into a non-empty directory. This is the single commonest reason a
+              # hand-written Postgres StatefulSet fails on first boot, and the error -- "directory exists
+              # but is not empty" -- does not obviously point at it.
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          # pg_isready, NOT a TCP check.
+          #
+          # The port is open and accepting connections long before Postgres will answer a query -- during
+          # recovery it listens and rejects. A TCP probe would mark it ready and the API would fail its own
+          # readiness against a database that is up and refusing work.
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "kca", "-d", "kca"]
+            periodSeconds: 5
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "kca", "-d", "kca"]
+            # Generous, because a busy Postgres can be slow to answer without being broken -- and
+            # restarting a database because it was busy is how a load spike becomes an outage.
+            periodSeconds: 30
+            failureThreshold: 5
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+      # 60s: Postgres needs time for a clean shutdown checkpoint. SIGKILL mid-checkpoint means recovery on
+      # next start, which is survivable but slow, and repeated often enough it is how corruption stories
+      # begin.
+      terminationGracePeriodSeconds: 60
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        {{- if .Values.postgresql.persistence.storageClass }}
+        storageClassName: {{ .Values.postgresql.persistence.storageClass | quote }}
+        {{- end }}
+        {{/*
+          storageClassName OMITTED when empty, which is NOT the same as setting it to "".
+          
+          An empty string explicitly means "no StorageClass, bind to a pre-provisioned PV" -- so the PVC
+          would sit Pending forever waiting for a volume nobody created. Omitting the field means "use the
+          cluster default", which is `standard` (rancher.io/local-path) in kind and gp2/pd-standard on a
+          cloud. That distinction is a real footgun and the YAML for the two is one character apart.
+        */}}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-postgres
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+spec:
+  # HEADLESS, which a StatefulSet requires: it is what creates the per-pod DNS records
+  # (kca-postgres-0.kca-postgres.<ns>.svc) that give each replica a stable address.
+  clusterIP: None
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+  selector:
+    {{- include "kca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: postgres
+{{- end }}

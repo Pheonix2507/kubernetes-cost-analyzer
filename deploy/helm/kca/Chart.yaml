@@ -1,0 +1,31 @@
+apiVersion: v2
+name: kca
+description: |
+  Kubernetes Cost Analyzer: attributes cluster spend to the teams, namespaces and workloads that
+  cause it, and recommends what to change.
+type: application
+
+# THE VERSIONS ARE TWO DIFFERENT THINGS, and conflating them is a common mistake.
+#
+# `version` is the CHART's version and changes when the templates change. `appVersion` is the version
+# of the software it deploys. A values-only fix bumps the first and not the second; a new binary with
+# an unchanged chart bumps the second and not the first.
+#
+# Neither is the image tag. That comes from values.yaml, so a deployment can pin a specific build
+# without editing the chart -- see the note on image.tag.
+version: 0.1.0
+appVersion: "0.1.0"
+
+keywords: [cost, finops, kubernetes]
+home: https://github.com/Pheonix2507/kubernetes-cost-analyzer
+
+# NO DEPENDENCIES, and the absence is deliberate.
+#
+# The obvious one to add is bitnami/postgresql, and it is the wrong call for this chart. A database
+# declared as a subchart shares the application's release lifecycle, so `helm uninstall` deletes the
+# data along with the deployment -- and Helm will not warn you. Production Postgres belongs outside the
+# application's blast radius entirely.
+#
+# There IS an optional StatefulSet in templates/postgres.yaml, off by default and documented as
+# development-only. Hand-written rather than a subchart precisely so it cannot be mistaken for the
+# production path.

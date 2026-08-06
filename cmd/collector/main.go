@@ -36,6 +36,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -70,6 +71,15 @@ import (
 const scrapeLag = 90 * time.Second
 
 func main() {
+	// Before run(), which loads configuration. See the note in cmd/api/main.go and
+	// buildinfo.PrintVersionAndExit: a version request has to work in a pod whose config is
+	// wrong, because that is the pod you are asking about.
+	showVersion := flag.Bool("version", false, "print build information and exit")
+	flag.Parse()
+	if *showVersion {
+		buildinfo.PrintVersionAndExit()
+	}
+
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "fatal: %v\n", err)
 		os.Exit(1)
@@ -163,7 +173,7 @@ func run() error {
 	// The collector's dependencies are the database, Prometheus and the informer cache -- the same three
 	// the API checks, minus nothing. A collector that cannot reach Prometheus cannot collect, so it should
 	// say so at a URL rather than only in a log line.
-	readiness := health.NewAggregator(2*time.Second, db, promClient, store)
+	readiness := health.NewAggregator(2*time.Second, db, postgres.NewSchemaChecker(db.Pool()), promClient, store)
 
 	// -------------------------------------------------------------------------
 	// Run the informers and the collection loop together.

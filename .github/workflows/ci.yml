@@ -1,0 +1,408 @@
+# Continuous integration.
+#
+# WHY THIS FILE EXISTS
+# --------------------
+# `make check-all` already runs every check this project has. The problem is that it runs them on
+# ONE machine, at a time of that person's choosing, against whatever they happen to have installed.
+# This file makes the same checks run on a machine nobody owns, on every push, before review.
+#
+# The design rule throughout: CI CALLS THE SAME MAKE TARGETS A HUMAN CALLS. It does not reimplement
+# `go test` flags in YAML. The moment CI has its own copy of a command, the two drift, and the
+# divergence is discovered as "it passes locally but fails in CI" -- or much worse, the reverse.
+# Where a step below cannot call make, there is a comment saying why.
+#
+# WHAT THIS DELIBERATELY DOES NOT DO
+# It does not deploy. There is no cluster to deploy to, no registry to push to, and no environment
+# to promote through, so a deploy job would be unrunnable YAML pretending to be a pipeline. The
+# chart job proves the chart RENDERS and the image job proves it BUILDS, which is the honest
+# boundary of what can be verified without infrastructure. Phase 11 can add the rest when there is
+# somewhere for it to go.
+
+name: CI
+
+on:
+  push:
+    # dev -> uat -> main, so all three are protected by the same checks. A push to uat that skipped
+    # CI would mean the promotion itself was unverified, which defeats having the branches.
+    branches: [main, uat, dev]
+  pull_request:
+    branches: [main, uat, dev]
+
+# WHY A CONCURRENCY GROUP
+# Pushing three commits in a minute otherwise starts three full runs of five jobs. The older two
+# are already obsolete -- nobody will read them -- but they still occupy runners, so the run you
+# actually care about queues behind results nobody wants.
+#
+# cancel-in-progress is CONDITIONAL, and that condition is the interesting part. On a pull request,
+# cancelling is free: only the newest commit matters. On a push to main it is NOT free, because
+# main's history should have a result for every commit -- if a later push cancels an earlier one,
+# main has a commit with no CI verdict, and "when did this break" becomes unanswerable.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+# WHY DECLARE PERMISSIONS AT ALL
+# Because the default is generous. Without this block GITHUB_TOKEN gets whatever the repository
+# default is, historically read-WRITE on contents, meaning any step -- including a transitive
+# dependency of a third-party action -- can push commits or move tags. None of these jobs write
+# anything, so they get read and nothing else. This is the single highest-value line in the file
+# from a supply-chain standpoint, and it costs nothing.
+permissions:
+  contents: read
+
+env:
+  # Pinned to the versions this project is actually developed against, not "latest".
+  #
+  # `latest` in CI means an upstream release can break the build of a commit that has not changed,
+  # which turns a red tick into noise that people learn to ignore. A pin means upgrades are a commit
+  # with a diff and a reviewer -- and if the upgrade breaks something, git blame says who and when.
+  #
+  # golangci-lint in particular MUST be pinned: .golangci.yml declares `version: "2"`, so a v1
+  # binary cannot read the config at all, and a newer v2 can enable new checks that fail code
+  # nobody touched.
+  GOLANGCI_LINT_VERSION: v2.12.2
+  # The same image and tag used to migrate the kind cluster by hand, which is the reason for this
+  # exact tag: it is verified to apply THESE migrations, not merely to exist.
+  MIGRATE_IMAGE: migrate/migrate:v4.18.1
+
+jobs:
+  # ===========================================================================
+  # 1. Static analysis. No database, no network, fastest feedback.
+  # ===========================================================================
+  go-static:
+    name: Go static analysis
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # From go.mod rather than a literal here. A literal is a second place to record the Go
+          # version, and the two only have to disagree once for CI to be testing a different
+          # language version than the one the module declares.
+          go-version-file: go.mod
+          # Caches the module and build caches keyed on go.sum. Worth roughly a minute per job.
+          cache: true
+
+      - name: Install golangci-lint
+        # Installed from the upstream script rather than via golangci/golangci-lint-action, so that
+        # the next step can be a plain `make lint`. Using the action would mean CI lints through a
+        # code path no human ever exercises, with its own flag handling and its own idea of which
+        # config file to read -- exactly the CI/local divergence this file is trying to avoid.
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" "${GOLANGCI_LINT_VERSION}"
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Formatting
+        # `make fmt` REWRITES files, so it cannot fail on its own -- it fixes the problem and exits
+        # 0. The check is therefore two steps: format, then assert nothing changed. `git diff` also
+        # prints exactly which files were wrong, which a boolean pass/fail would not.
+        #
+        # Done this way rather than with a check-only flag because the flag name has changed across
+        # golangci-lint releases, and `git diff --exit-code` cannot.
+        run: |
+          make fmt
+          git diff --exit-code || {
+            echo "::error::Unformatted code. Run \`make fmt\` and commit the result."
+            exit 1
+          }
+
+      - name: Vet
+        run: make vet
+
+      - name: Lint
+        run: make lint
+
+  # ===========================================================================
+  # 2. Tests, against a real PostgreSQL.
+  # ===========================================================================
+  go-test:
+    name: Go tests
+    runs-on: ubuntu-latest
+
+    # WHY A SERVICE CONTAINER RATHER THAN testcontainers-go
+    # helpers_test.go weighs this up and defers the decision to "when CI arrives in Phase 10".
+    # It has arrived, and the answer is: keep the service container.
+    #
+    # testcontainers would make `go test ./...` self-sufficient, which is genuinely nicer. But it
+    # adds a large dependency tree to the module and ~10s of container startup to EVERY local run,
+    # including the hundreds of runs that touch no SQL at all. A service container puts that cost
+    # in the one place that is already paying for a fresh machine.
+    services:
+      postgres:
+        # The same major version as local dev (`PG_IMAGE` in the Makefile). Testing against a
+        # different major than production runs is how you discover a version-specific behaviour
+        # difference in production rather than in CI. Postgres 18 is what the chart's StatefulSet
+        # and `make db-up` both use.
+        image: postgres:18-alpine
+        env:
+          POSTGRES_USER: kca
+          # A throwaway credential for an ephemeral container that is destroyed with the job and
+          # reachable only from it. It is committed deliberately: pushing it through a secret would
+          # imply it protects something, and a fake secret teaches the wrong instinct about which
+          # values actually matter.
+          POSTGRES_PASSWORD: kca_ci_only
+          POSTGRES_DB: kca_test
+        ports:
+          - 5432:5432
+        # THE HEALTH CHECK IS NOT OPTIONAL.
+        # Without it the job proceeds as soon as the container has STARTED, which is several seconds
+        # before Postgres is accepting connections. The migration step then fails maybe one run in
+        # four, and the failure looks like a network flake rather than a missing health check. This
+        # is the single commonest cause of "flaky" CI involving a database.
+        options: >-
+          --health-cmd "pg_isready -U kca -d kca_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # Points at the mapped port on the runner, not at a docker hostname, because the Go tests run
+      # directly on the runner rather than inside a container.
+      #
+      # sslmode=disable is correct HERE and would be wrong anywhere else: the connection never
+      # leaves the machine, and the alpine image ships no certificate. In the chart, TLS is the
+      # operator's to configure.
+      DATABASE_URL: postgres://kca:kca_ci_only@localhost:5432/kca_test?sslmode=disable
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Prove the skip guard still works
+        # A META-TEST, and the reason it earns a place in CI: everything below depends on
+        # KCA_REQUIRE_DB turning "no database" into a failure. If a future refactor of TestMain
+        # dropped that guard, every step below would keep passing -- and the day CI lost its
+        # database, the persistence layer would silently stop being tested while the tick stayed
+        # green. So CI verifies its own safety net, with the database deliberately hidden.
+        run: |
+          if env -u DATABASE_URL -u TEST_DATABASE_URL KCA_REQUIRE_DB=1 \
+               go test -count=1 ./internal/store/postgres/ >/dev/null 2>&1; then
+            echo "::error::KCA_REQUIRE_DB no longer fails when the database is absent."
+            echo "The guard in internal/store/postgres/helpers_test.go has regressed, which means"
+            echo "a CI run without Postgres would report success having tested nothing."
+            exit 1
+          fi
+          echo "PASS: an absent database fails when KCA_REQUIRE_DB is set."
+
+      - name: Apply migrations
+        # Run through the pinned image rather than `make migrate-up`, which needs the `migrate` CLI
+        # installed. Installing a Go binary to run four files of SQL costs more than the container.
+        # The path is /migrations inside the container, hence the explicit -path.
+        run: |
+          docker run --rm --network host \
+            -v "$PWD/migrations:/migrations" \
+            "${MIGRATE_IMAGE}" \
+            -path /migrations -database "${DATABASE_URL}" up
+
+      - name: Tests
+        # THE POINT OF THIS WHOLE JOB.
+        #
+        # KCA_REQUIRE_DB turns the database tests from skippable into mandatory. Without it, a
+        # missing service container, an unapplied migration, or a typo in DATABASE_URL each produce
+        # a green run in which the entire persistence layer -- partition routing, ON CONFLICT
+        # behaviour, numeric precision, advisory locks, the rollup projection -- was never executed.
+        #
+        # `go test` exits 0 on a skip. That is not a bug in Go; a skip legitimately means "not
+        # applicable here". It is only wrong in the one context where the tests are known to be
+        # applicable and their absence means the build is lying, which is precisely this one.
+        env:
+          KCA_REQUIRE_DB: "1"
+        run: make test
+
+  # ===========================================================================
+  # 3. The Helm chart.
+  # ===========================================================================
+  chart:
+    name: Helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Chart version
+        # helm is pre-installed on the GitHub-hosted ubuntu images, and using it unpinned is a
+        # conscious trade: one less dependency, at the cost of a runner image upgrade being able to
+        # change the renderer. Acceptable because the only Helm features this chart relies on
+        # (`required`, `fail`, `include`, `toYaml`) have been stable for the whole of Helm 3. The
+        # version is printed so that if rendering ever does change, the run that changed it says so.
+        run: helm version
+
+      - name: Lint
+        # `make helm-lint` is far more than `helm lint`. It also asserts that the chart REFUSES to
+        # render with clusterName missing, with image.tag missing, and with two collector replicas.
+        # Those three negative tests are the ones that matter: `helm lint` is happy to bless a
+        # chart that silently deploys :latest into an unnamed cluster.
+        run: make helm-lint
+
+      - name: Render with development values
+        # A chart that lints can still fail to render, because lint does not exercise every branch
+        # of every conditional. This renders the real values file, which is the configuration
+        # actually installed by `make helm-install`.
+        run: make helm-template > /dev/null
+
+      - name: Render with everything switched on
+        # The opposite corner of the values space from values-dev.yaml. The optional pieces -- HPA,
+        # PDB, the bundled StatefulSet Postgres, ServiceMonitor -- are off by default, so the
+        # default render never type-checks their templates. A syntax error inside
+        # `{{- if .Values.api.autoscaling.enabled }}` would ship undetected and only surface for the
+        # first operator who turned it on.
+        #
+        # `postgresql`, not `postgres` -- and that distinction is why this step is worth having.
+        # `--set postgres.enabled=true` renders happily, because Helm simply creates the key
+        # nobody reads, and the StatefulSet stays absent. A --set with a misspelt path is silent,
+        # so the assertion below counts what actually rendered rather than trusting exit 0.
+        run: |
+          helm template kca deploy/helm/kca \
+            --set clusterName=ci \
+            --set image.tag=ci \
+            --set secrets.databaseUrl=postgres://ci \
+            --set secrets.postgresPassword=ci \
+            --set api.autoscaling.enabled=true \
+            --set postgresql.enabled=true \
+            --set serviceMonitor.enabled=true > /tmp/all-on.yaml
+
+          # Prove the optional objects are PRESENT, not merely that rendering exited 0. Without
+          # this the step passes when a typo means the flags did nothing, which is the failure it
+          # is meant to catch.
+          for kind in HorizontalPodAutoscaler PodDisruptionBudget StatefulSet ServiceMonitor; do
+            if ! grep -q "^kind: ${kind}$" /tmp/all-on.yaml; then
+              echo "::error::${kind} did not render with every toggle enabled."
+              exit 1
+            fi
+            echo "PASS: ${kind} rendered"
+          done
+
+  # ===========================================================================
+  # 4. The frontend.
+  # ===========================================================================
+  web:
+    name: Frontend
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        # BEFORE setup-node, and the order is load-bearing. setup-node's `cache: pnpm` works by
+        # running `pnpm store path`, so pnpm has to already be on PATH. Reversing these two steps
+        # produces "Unable to locate executable file: pnpm", which reads like a missing install
+        # rather than a sequencing mistake.
+        #
+        # No version here: the action reads `packageManager` from package.json, so the version is
+        # declared once, in the file npm/pnpm/yarn all already respect.
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: web/.nvmrc
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Install
+        # --frozen-lockfile makes a lockfile that does not match package.json a FAILURE rather than
+        # something pnpm quietly fixes by resolving new versions. Without it, CI can install a
+        # different dependency tree than any developer has, which makes a CI-only failure
+        # essentially undebuggable. (pnpm defaults to frozen in CI, but relying on an implicit
+        # environment sniff for something this important is not worth the saved characters.)
+        run: pnpm install --frozen-lockfile
+
+      - name: Check
+        # typecheck, then lint, then check:api -- and the last is the interesting one. It
+        # regenerates src/lib/api/schema.d.ts from api/openapi.yaml and fails if the result differs
+        # from what is committed. That closes the final link of the drift chain: openapi_test.go
+        # asserts the spec matches the Go handlers, and this asserts the TypeScript matches the spec.
+        run: pnpm check
+
+      - name: Build
+        # Verified to work with no API reachable, because every data route renders on demand rather
+        # than being prerendered. That property is worth protecting: if a page ever became static,
+        # Next would fetch costs AT BUILD TIME and bake one moment's numbers into the bundle
+        # permanently. This step would then fail here with a connection error, which is the good
+        # outcome -- the alternative is a dashboard that shows the same figures forever.
+        run: pnpm build
+
+  # ===========================================================================
+  # 5. The container images.
+  # ===========================================================================
+  image:
+    name: Container images
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        # fetch-depth is left at the default 1. The Makefile stamps VERSION with
+        # `git describe --tags --always`, and --always falls back to the short SHA when no tags are
+        # present, so a shallow clone produces a usable version rather than an error.
+
+      - name: Build all three targets
+        # `make docker-build` builds api, collector AND rollup from the one multi-stage Dockerfile.
+        # Building all three matters because they share a builder stage: a compile error in
+        # cmd/rollup breaks the image build while `go build ./...` in another job stays green only
+        # if that job also builds it. Cheap insurance against a Dockerfile that has drifted from the
+        # binaries it claims to package.
+        run: make docker-build
+
+      - name: Prove the images are what they claim to be
+        # A built image is not a working image. These assertions are the ones that would have caught
+        # real mistakes: a distroless base with no shell cannot run a shell-form ENTRYPOINT, and a
+        # `USER` line lost in a rebase turns a non-root container into a root one silently.
+        run: |
+          set -x
+          # --version is the only thing that can be verified without a database or a cluster; it
+          # proves the binary is present, executable, dynamically satisfied, and that the ldflags
+          # actually reached it rather than leaving "unknown".
+          docker run --rm kca/api:latest --version
+          docker run --rm kca/collector:latest --version
+          docker run --rm kca/rollup:latest --version
+          set +x
+          for img in api collector rollup; do
+            user="$(docker image inspect "kca/${img}:latest" --format '{{.Config.User}}')"
+            if [ "$user" != "nonroot:nonroot" ] && [ "$user" != "65532:65532" ]; then
+              echo "::error::kca/${img} runs as '${user}', expected nonroot."
+              exit 1
+            fi
+            echo "PASS: kca/${img} runs as ${user}"
+          done
+
+  # ===========================================================================
+  # 6. The single check to require in branch protection.
+  # ===========================================================================
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    needs: [go-static, go-test, chart, web, image]
+    # `always()` so this job runs even when a dependency failed -- without it, a failed dependency
+    # SKIPS this job, and a skipped required check leaves a pull request stuck on "expected" forever
+    # rather than showing red.
+    if: always()
+    steps:
+      - name: Verify every job succeeded
+        # WHY NOT JUST RELY ON `needs`
+        # Because `if: always()` disables the implicit "all dependencies succeeded" gate. Combine
+        # the two carelessly and you get a job that always passes, i.e. a required check that
+        # certifies nothing -- a trap that has waved plenty of broken code through.
+        #
+        # Checking the aggregate `needs.*.result` also catches SKIPPED, not just failed. A job
+        # skipped by a mistaken `if:` condition has not passed, and treating "not failed" as
+        # "passed" is how a whole job quietly stops running.
+        #
+        # WHY THIS JOB EXISTS AT ALL: branch protection requires checks BY NAME. Requiring five
+        # names means every new job needs a settings change nobody remembers to make, so a new job
+        # can fail without blocking a merge. Requiring this one name means the job list is
+        # maintained in this file, under review, next to the code it guards.
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "job results: ${RESULTS}"
+          for result in ${RESULTS}; do
+            if [ "$result" != "success" ]; then
+              echo "::error::A required job did not succeed (${RESULTS})."
+              exit 1
+            fi
+          done
+          echo "All checks passed."

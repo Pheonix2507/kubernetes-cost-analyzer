@@ -1,0 +1,80 @@
+# Development values: what `make helm-install` uses against the kind cluster.
+#
+# EVERY DEPARTURE FROM THE DEFAULTS IS A DELIBERATE DOWNGRADE, listed here so the production defaults stay
+# production defaults. A chart whose defaults are tuned for a laptop is a chart that ships a laptop
+# configuration to production.
+
+clusterName: kca-dev
+
+image:
+  # The locally-built images, loaded into kind by `make kind-load`. No registry involved.
+  registry: kca
+  tag: dev
+  # NEVER for local images: kind has them loaded into its node, and Always would make the kubelet try to
+  # pull `kca/api:dev` from Docker Hub and fail with ImagePullBackOff.
+  pullPolicy: Never
+
+# DEVELOPMENT, so API authentication is not enforced and `curl` works without a key. config.Validate
+# refuses this combination when APP_ENV=production, so it cannot leak into a real deployment by accident.
+env: development
+logLevel: debug
+
+prometheus:
+  url: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
+
+# In-chart Postgres, which the defaults deliberately disable. Fine here: this is a throwaway kind cluster
+# and the point is to exercise the StatefulSet, the PVC and the StorageClass wiring end to end.
+postgresql:
+  enabled: true
+  persistence:
+    # 1Gi rather than 8: kind's local-path provisioner writes to the node's filesystem, which is a Docker
+    # volume on a laptop.
+    size: 1Gi
+
+secrets:
+  # Points at the in-chart Postgres by its stable StatefulSet DNS name. sslmode=disable because there is no
+  # certificate inside a kind cluster -- and would be wrong to disable against anything real.
+  databaseUrl: "postgres://kca:kca_local_dev_only@kca-postgres:5432/kca?sslmode=disable"
+  postgresPassword: "kca_local_dev_only"
+  # Empty: authentication off, which env=development permits.
+  apiKeys: ""
+
+api:
+  # ONE replica, down from two. A single-node-ish kind cluster has no room to spread them, and the
+  # anti-affinity is only `preferred` so the second would co-locate anyway and prove nothing.
+  replicaCount: 1
+  resources:
+    requests:
+      cpu: 25m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  podDisruptionBudget:
+    # OFF with one replica. `minAvailable: 1` against a single replica means the eviction API can never
+    # evict it, so `kubectl drain` blocks forever -- the same trap that is the reason the collector has no
+    # PDB at all. Worth avoiding even in a throwaway cluster, because it teaches the wrong reflex.
+    enabled: false
+
+collector:
+  # Faster than the 5m default so a demo produces several windows while you watch.
+  interval: 2m
+  resources:
+    requests:
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      memory: 512Mi
+
+rollup:
+  # Every 10 minutes rather than nightly, so the CronJob demonstrably fires during a session instead of
+  # requiring somebody to wait until 00:30.
+  schedule: "*/10 * * * *"
+  monthlyClose:
+    # OFF. Finalising is irreversible without a deliberate un-finalise, and a 10-minute demo schedule
+    # would freeze a month on its first firing.
+    enabled: false
+
+serviceMonitor:
+  # OFF, because deploy/monitoring/scrape.yaml already ships a ServiceMonitor applied by
+  # `make observability-up`. Two selecting the same Service means every metric is scraped twice.
+  enabled: false

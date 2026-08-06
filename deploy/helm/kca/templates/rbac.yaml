@@ -1,0 +1,75 @@
+{{- $name := include "kca.name" . -}}
+{{- if .Values.serviceAccount.create }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kca.serviceAccountName" . }}
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+  {{- with .Values.serviceAccount.annotations }}
+  annotations: {{- toYaml . | nindent 4 }}
+  {{- end }}
+# automountServiceAccountToken stays TRUE, unlike most hardening advice, because this service genuinely
+# talks to the API server: the informers need a token. Disabling it would break the inventory entirely.
+#
+# The mitigation is that the token grants almost nothing -- see the ClusterRole below.
+automountServiceAccountToken: true
+{{- end }}
+{{- if .Values.rbac.create }}
+---
+# The ClusterRole. FOUR RESOURCES, READ-ONLY.
+#
+# A ClusterRole rather than a Role, because cost attribution is cluster-wide by definition: a tool that
+# could only see one namespace could not tell you what the cluster costs. That is a real privilege
+# increase, so the verbs matter more than usual.
+#
+# The verb set is exactly `get`, `list`, `watch` -- what informers need and nothing else. There is no
+# `create`, `update`, `patch` or `delete` anywhere, which makes this service STRUCTURALLY incapable of
+# mutating the cluster it observes. That is a stronger guarantee than a code review: even a fully
+# compromised container cannot change anything through this token.
+#
+# THE FOUR RESOURCES, and why not more. A Phase 6 audit found nine further resources granted on the
+# reasoning that they were "the remaining pieces of the cost picture" -- and the code read NONE of them,
+# which contradicted the least-privilege argument written three paragraphs above them in the same file.
+# They were removed, and deploy/rbac/verify.sh now asserts each one is DENIED so the removal is enforced
+# rather than claimed.
+#
+# Notably absent: SECRETS. This service never reads one through the API server; its own credentials arrive
+# as environment variables from a Secret the kubelet mounts, which needs no API permission at all.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    # nodes    -- capacity, allocatable, instance-type labels. Where cost originates.
+    # namespaces -- the primary cost-allocation dimension, and its team/cost-centre labels.
+    # pods     -- requests, limits, QoS class, and which node each is on.
+    resources: [nodes, namespaces, pods]
+    verbs: [get, list, watch]
+  - apiGroups: [apps]
+    # replicasets ONLY, not deployments.
+    #
+    # Pod ownership is two hops: Pod -> ReplicaSet -> Deployment. The middle hop is the one that needs a
+    # lookup, because a ReplicaSet's ownerReference already NAMES the Deployment -- so reading the
+    # Deployment itself would add a permission to learn something we already have.
+    resources: [replicasets]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ $name }}
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ $name }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kca.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}

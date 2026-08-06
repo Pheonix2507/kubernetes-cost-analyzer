@@ -32,6 +32,7 @@ package main
 import (
 	"context"
 	"errors"
+	"flag"
 	"fmt"
 	"log/slog"
 	"os"
@@ -71,6 +72,20 @@ import (
 // logic in a function that RETURNS, means defers always run. It also makes the
 // startup sequence testable, because run() is an ordinary function.
 func main() {
+	// -version is handled here, in main, rather than inside run(). That is not stylistic:
+	// run() begins by loading configuration, and a version request must be answerable by a
+	// process whose configuration is broken. See buildinfo.PrintVersionAndExit.
+	//
+	// flag.Parse also means this binary now REJECTS arguments it does not understand instead
+	// of ignoring them. It is configured entirely from the environment, so any argument at all
+	// is a mistake -- most likely a container spec that meant to set an env var -- and failing
+	// loudly at startup beats running with the caller's intent silently discarded.
+	showVersion := flag.Bool("version", false, "print build information and exit")
+	flag.Parse()
+	if *showVersion {
+		buildinfo.PrintVersionAndExit()
+	}
+
 	if err := run(); err != nil {
 		// Written to stderr directly rather than through slog: this path includes
 		// config failures that happen BEFORE a logger exists.
@@ -185,7 +200,7 @@ func run() error {
 	// data out of Postgres; it never queries Prometheus. Adding a check for a dependency this
 	// process does not use would take it out of service during a monitoring outage it is
 	// entirely unaffected by. The COLLECTOR is the process that depends on Prometheus.
-	readiness := health.NewAggregator(2*time.Second, db, store)
+	readiness := health.NewAggregator(2*time.Second, db, postgres.NewSchemaChecker(db.Pool()), store)
 
 	// -------------------------------------------------------------------------
 	// 5. Run the HTTP server and the informers together.

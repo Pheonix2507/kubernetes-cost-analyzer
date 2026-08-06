@@ -46,6 +46,17 @@ func (m Month) String() string { return m.t.Format("2006-01") }
 // Next is the following month, which is the exclusive upper bound of this one.
 func (m Month) Next() Month { return Month{m.t.AddDate(0, 1, 0)} }
 
+// Previous is the preceding month.
+//
+// SAFE ON EVERY DAY OF THE MONTH, which is the whole reason it exists rather than the caller doing date
+// arithmetic. AddDate(0, -1, 0) on the FIRST of a month is always the first of the previous month, and
+// Month values are normalised to the first by their constructors -- so there is no 31st to overflow.
+//
+// Compare `date -d 'last month'` in a shell, which on 31 March returns 3 March: GNU date computes 31
+// February and normalises the overflow forwards. A monthly close scheduled on the 31st would silently
+// freeze the wrong month, and a finalised statement is immutable by database trigger.
+func (m Month) Previous() Month { return Month{m.t.AddDate(0, -1, 0)} }
+
 // IsComplete reports whether the month has finished, relative to now.
 //
 // The guard on finalising. A statement closed while its month is still running would be missing days

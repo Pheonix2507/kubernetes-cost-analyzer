@@ -1,0 +1,306 @@
+# Default values for the Kubernetes Cost Analyzer.
+#
+# HOW TO READ THIS FILE: anything without a default is REQUIRED and the chart refuses to render without
+# it. That is deliberate — a template that fails is noticed before anything is deployed, whereas a
+# plausible default gets deployed and discovered later.
+
+# =============================================================================
+# Required
+# =============================================================================
+
+# clusterName is denormalised onto EVERY cost row.
+#
+# No default, and the reason is a Phase 7 audit finding: this silently defaulted to the placeholder
+# "default" and wrote 74,925 rows attributed to a cluster nobody would recognise. It must be stable for
+# the life of the cluster — changing it makes yesterday's rows look like a different cluster, so a report
+# grouped by cluster shows one estate as two. And in Phase 11's multi-cluster world, two clusters that
+# both defaulted would MERGE, silently summing unrelated spend.
+clusterName: ""
+
+prometheus:
+  # Where usage comes from. In-cluster DNS, so the default matches a kube-prometheus-stack install in
+  # the `monitoring` namespace.
+  url: "http://kps-kube-prometheus-stack-prometheus.monitoring.svc:9090"
+  timeout: 30s
+
+# =============================================================================
+# Image
+# =============================================================================
+
+image:
+  registry: ghcr.io/pheonix2507/kubernetes-cost-analyzer
+  # NO DEFAULT TAG, AND NEVER `latest`.
+  #
+  # `latest` breaks three things at once. It is not reproducible: two installs a week apart deploy
+  # different code from identical values. It makes rollback impossible, because `helm rollback` restores
+  # the values — and the values still say `latest`, which still resolves to the broken build. And with
+  # `imagePullPolicy: Always` a pod restart silently upgrades the code, so a node eviction becomes an
+  # unplanned deploy.
+  #
+  # CI sets this to the git SHA, which makes every deployment traceable to a commit.
+  tag: ""
+  # IfNotPresent, which is correct BECAUSE the tag is immutable. With `latest` you need `Always` and
+  # then every restart is a deploy; with a SHA the image can never change, so pulling once is enough and
+  # a registry outage cannot stop a pod restarting.
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# =============================================================================
+# Credentials
+# =============================================================================
+
+# existingSecret is the name of a Secret you created OUT OF BAND, holding:
+#   database-url  the Postgres DSN
+#   api-keys      comma-separated API keys
+#
+# THIS IS THE PRODUCTION PATH. Set it, and the chart templates no credentials at all.
+#
+# Leave it empty and the chart creates a Secret from `secrets` below — which puts a password in a values
+# file, and values files end up in git. See templates/secret.yaml.
+existingSecret: ""
+
+secrets:
+  # DEVELOPMENT ONLY. See existingSecret above.
+  databaseUrl: ""
+  # Only used when postgresql.enabled is true. Read from the same Secret as databaseUrl so the two cannot
+  # disagree -- templating a password into two places is how a chart ends up with an app that cannot log
+  # into its own database.
+  postgresPassword: ""
+  # Empty means authentication is DISABLED, which config.Validate permits only outside production. With
+  # env=production the API refuses to start, so this cannot be forgotten into a real deployment.
+  apiKeys: ""
+
+# =============================================================================
+# Global
+# =============================================================================
+
+# production enables the strict validation path: API_KEYS required, CLUSTER_NAME must not be the
+# placeholder. Defaults to production, so the safe configuration is the one you get by default and the
+# insecure one has to be asked for.
+env: production
+logLevel: info
+
+nameOverride: ""
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+rbac:
+  # The ClusterRole is `get`/`list`/`watch` on nodes, namespaces, pods and replicasets — the four the
+  # code actually reads. A Phase 6 audit removed nine further resources granted "for the future"; see
+  # deploy/rbac/rbac.yaml for the argument and deploy/rbac/verify.sh for the proof.
+  create: true
+
+# =============================================================================
+# api — a Deployment, because it is stateless and scales with traffic
+# =============================================================================
+
+api:
+  replicaCount: 2
+  # 2 rather than 1 as the DEFAULT, so a single node drain does not take the dashboard down. Combined
+  # with the PDB below and podAntiAffinity, that is what makes a rolling node upgrade invisible to users.
+
+  service:
+    type: ClusterIP
+    port: 8080
+    # NAMED, because the ServiceMonitor selects `port: http-metrics` by name. A number here would need
+    # changing in two places at once — see deploy/monitoring/scrape.yaml.
+    portName: http-metrics
+
+  resources:
+    requests:
+      # REQUESTS ARE SET, and on this project that is not optional. The whole tool exists to find
+      # containers that declare nothing, and shipping a chart whose own pods are BestEffort would be
+      # embarrassing — they would appear in our own `set_requests` recommendations.
+      cpu: 50m
+      memory: 128Mi
+    limits:
+      # NO CPU LIMIT, deliberately, and this is the most contested line in the file.
+      #
+      # A CPU limit is enforced by CFS throttling: once the quota is used the container is descheduled
+      # until the next 100ms period, even when the node is idle. For a latency-sensitive API that means
+      # p99 spikes caused entirely by the limit rather than by load. The REQUEST already guarantees a
+      # share under contention, which is what actually protects neighbours.
+      #
+      # A MEMORY limit IS set, because memory is incompressible: without one, a leak takes the whole
+      # node rather than one pod. The asymmetry is the same one internal/recommend reasons about — CPU
+      # throttles, memory gets OOMKilled.
+      memory: 512Mi
+
+  autoscaling:
+    # OFF by default. An HPA on a chart nobody has load-tested is a guess about a scaling curve, and a
+    # badly-tuned one flaps — scaling up on a transient spike, down before the new pods are warm, and up
+    # again. Enable it once you have measured what a replica actually serves.
+    enabled: false
+    minReplicas: 2
+    maxReplicas: 6
+    targetCPUUtilizationPercentage: 70
+    # 70 rather than 80+: the API's own metrics show p99 around 250ms for a cost summary, and CPU is a
+    # lagging signal for latency. Scaling at 70 leaves room for the new pod to become ready before the
+    # existing ones saturate.
+
+  podDisruptionBudget:
+    enabled: true
+    # minAvailable rather than maxUnavailable, so the guarantee survives a replica-count change: with 2
+    # replicas both express the same thing, but if someone scales to 5, `minAvailable: 1` still permits
+    # draining 4 nodes at once while `maxUnavailable: 1` would not.
+    minAvailable: 1
+
+  # SOFT anti-affinity, not required.
+  #
+  # `requiredDuringScheduling` on a 2-replica Deployment in a single-node cluster leaves the second pod
+  # Pending FOREVER, and the failure reads as a scheduling mystery rather than as a policy someone chose.
+  # `preferred` spreads across nodes when it can and degrades to co-location when it cannot.
+  podAntiAffinity: soft
+
+  nodeSelector: {}
+  tolerations: []
+
+# =============================================================================
+# collector — a Deployment with ONE replica and Recreate
+# =============================================================================
+
+collector:
+  # NOT CONFIGURABLE ABOVE 1, and the chart enforces it.
+  #
+  # Two collectors compute every window twice. The upsert makes that harmless to the DATA — the second
+  # write updates the first — but it doubles the Prometheus query load for no benefit, and it breaks the
+  # single-active-collector property the code's comments claim.
+  #
+  # The proper fix is leader election, which needs a coordination.k8s.io Lease and an RBAC grant this
+  # service deliberately does not have. Until then the honest answer is exactly what Phase 7 and 9 said
+  # it was: one replica, enforced here rather than hoped for.
+  replicaCount: 1
+
+  service:
+    port: 8081
+    portName: http-metrics
+
+  interval: 5m
+  workers: 8
+
+  resources:
+    requests:
+      # Higher CPU than the API: a cycle is a burst of concurrent Prometheus queries and decimal
+      # arithmetic, unlike the API's mostly-idle request handling.
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+  # NO PodDisruptionBudget, and the absence is the interesting decision — see templates/collector.yaml.
+
+  nodeSelector: {}
+  tolerations: []
+
+# =============================================================================
+# rollup — a CronJob, because it completes
+# =============================================================================
+
+rollup:
+  enabled: true
+  # 00:30 UTC. After midnight so yesterday is a complete UTC day — the rollup grain — and offset by 30
+  # minutes so it is not competing with every other cron on the hour.
+  schedule: "30 0 * * *"
+  # UTC explicitly. A CronJob without this uses the kube-controller-manager's timezone, so "00:30" means
+  # something different depending on where the cluster runs — and the rollup's day boundary is UTC by
+  # definition, so a local-time schedule would drift across it twice a year.
+  timeZone: "Etc/UTC"
+
+  # Forbid: never two rollups at once.
+  #
+  # A backfill can run for minutes, and two concurrent runs would DELETE and INSERT the same day
+  # simultaneously — duplicating rows or deadlocking. Belt-and-braces with the Postgres advisory lock in
+  # the code, because CronJob concurrency guarantees are weak: the controller can double-fire on clock
+  # skew or a missed schedule.
+  concurrencyPolicy: Forbid
+
+  # Kept for post-mortems. A failed rollup's logs are the only record of why, and the default of 1 means
+  # the second failure destroys the evidence from the first.
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 3
+
+  # Six hours. Long enough for a large backfill, short enough that a wedged job is reaped rather than
+  # blocking tomorrow's run via concurrencyPolicy: Forbid — which is the failure this bounds.
+  activeDeadlineSeconds: 21600
+
+  # startingDeadlineSeconds: if the controller was down at 00:30, run late rather than skip. One hour,
+  # because a rollup that ran at 01:15 is fine and one that never ran leaves a permanent hole in trends.
+  startingDeadlineSeconds: 3600
+
+  # The monthly close: a SECOND CronJob that generates and freezes the previous month's statements.
+  monthlyClose:
+    enabled: true
+    # 03:00 on the 2nd. Not the 1st: the rollup for the last day of the month runs at 00:30 on the 1st,
+    # so closing on the 1st would freeze a month missing its final day — and finalised statements are
+    # immutable by database trigger, so that mistake is not correctable without a deliberate un-finalise.
+    schedule: "0 3 2 * *"
+
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+# =============================================================================
+# postgres — OFF, and read the comment before turning it on
+# =============================================================================
+
+postgresql:
+  # FALSE, and this is the most important default in the file.
+  #
+  # A database in the application's chart shares the application's lifecycle. `helm uninstall` deletes
+  # the StatefulSet, and depending on the reclaim policy the PVC and the data with it — with no warning,
+  # because Helm cannot know the volume matters more than the release.
+  #
+  # Production Postgres belongs outside this blast radius: RDS, Cloud SQL, a CloudNativePG cluster, or
+  # anything with its own backup and lifecycle. Set `existingSecret` to a Secret holding its DSN.
+  #
+  # This StatefulSet exists so the chart is installable end-to-end in kind for development and so the
+  # PVC/StorageClass wiring is reviewable. It is hand-written rather than a bitnami subchart precisely so
+  # it cannot be mistaken for the production path.
+  enabled: false
+
+  image: postgres:18-alpine
+  # A StatefulSet, NOT a Deployment, and the reason is the VOLUME rather than the data.
+  #
+  # A Deployment's pods share one PVC if you give them one, and two Postgres processes on the same data
+  # directory corrupt it immediately. A StatefulSet gives each replica its own PVC via
+  # volumeClaimTemplates and a stable name, which is what makes storage per-replica rather than shared.
+  #
+  # (Also stable DNS: kca-postgres-0 rather than a random suffix, so the DSN does not change when the pod
+  # is rescheduled.)
+  persistence:
+    size: 8Gi
+    # EMPTY means "use the cluster default", which is `standard` (rancher.io/local-path) in kind.
+    #
+    # Naming one explicitly is the right call in production and the wrong default here: a chart that
+    # hard-coded `gp3` would fail on GKE, and one that hard-coded `standard` would silently get a
+    # different provisioner on every cloud. Empty inherits whatever the cluster considers default.
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      memory: 1Gi
+
+# =============================================================================
+# Monitoring
+# =============================================================================
+
+serviceMonitor:
+  # Whether the CHART creates a ServiceMonitor. Off by default because deploy/monitoring/scrape.yaml
+  # already ships one, applied by `make observability-up` — two ServiceMonitors selecting the same
+  # Service means every metric is scraped twice, which double-counts nothing but wastes Prometheus.
+  enabled: false
+  interval: 30s
+
+# The pricing catalogue, mounted as a ConfigMap.
+#
+# Left empty here so the chart reads deploy/pricing/catalogue.yaml at package time — see
+# templates/configmap.yaml. Overriding it inline is supported for a cluster whose rates differ.
+pricingCatalogue: ""

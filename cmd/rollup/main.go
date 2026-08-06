@@ -70,10 +70,36 @@ type options struct {
 	all   bool
 	month string
 	close bool
+	// closePreviousMonth is the scheduled monthly close: work out the previous month, roll up its days,
+	// generate its statements and freeze them.
+	//
+	// WHY THE BINARY COMPUTES THE MONTH RATHER THAN THE CALLER
+	// ------------------------------------------------------
+	// The obvious CronJob arg is `-month $(date -d 'last month' +%Y-%m)`, and it fails twice.
+	//
+	// These images are distroless-static: no shell, no coreutils, no `date`. A subshell in the args would
+	// need a shell in the image, which is exactly the attack surface distroless removes -- so the
+	// convenience of `$( )` would cost the property that a compromised container cannot run anything.
+	//
+	// And `date -d 'last month'` is WRONG on the 31st. On 31 March it yields 3 March, because "one month
+	// before 31 March" is not a date and GNU date normalises the overflow forwards. So a monthly close
+	// scheduled for the 31st would silently close the wrong month in several months of the year -- and a
+	// finalised statement is immutable by database trigger, so that mistake needs a deliberate
+	// un-finalise to correct.
+	//
+	// Computing it here means the arg is a constant, the image needs no shell, and the calendar
+	// arithmetic is the same tested code the CLI uses.
+	closePreviousMonth bool
+
+	// version short-circuits everything else. Registered as a real flag here, rather than
+	// sniffed out of os.Args as it would have to be in a binary with no flag set, so that it
+	// appears in the usage text `flag` generates for -h.
+	version bool
 }
 
 func parseFlags() options {
 	var o options
+	flag.BoolVar(&o.version, "version", false, "print build information and exit")
 	flag.StringVar(&o.from, "from", "", "first day to roll up, YYYY-MM-DD (default: yesterday)")
 	flag.StringVar(&o.to, "to", "", "last day to roll up, inclusive, YYYY-MM-DD (default: same as -from)")
 	flag.BoolVar(&o.all, "all", false, "roll up every day that has fact rows")
@@ -82,12 +108,21 @@ func parseFlags() options {
 	// something else, and because the verb describes what happens to the statement.
 	flag.BoolVar(&o.close, "close", false,
 		"freeze the -month statements. Requires the month to have ENDED. This is irreversible without a deliberate un-finalise")
+	flag.BoolVar(&o.closePreviousMonth, "close-previous-month", false,
+		"roll up the PREVIOUS calendar month, write its statements and freeze them. What the monthly CronJob runs; needs no date argument, so the image needs no shell")
 	flag.Parse()
 	return o
 }
 
 func run() error {
 	opts := parseFlags()
+
+	// Checked here, immediately after parsing and BEFORE config.Load on the next line. That one
+	// line of ordering is the whole fix: this binary runs as a CronJob, so the pod that needs
+	// identifying is often one that failed before it could reach a database.
+	if opts.version {
+		buildinfo.PrintVersionAndExit()
+	}
 
 	cfg, err := config.Load()
 	if err != nil {
@@ -149,6 +184,19 @@ func run() error {
 
 	// The clock is passed in rather than read inside, so the branch that decides WHICH DAY a scheduled
 	// run processes is testable. UTC, because the rollup grain is a UTC calendar day.
+	// -close-previous-month resolves to the equivalent explicit flags before anything else runs.
+	//
+	// Rewritten into `-month <prev> -close` rather than handled as a separate code path, so the scheduled
+	// job and a human typing the flags by hand take the SAME path through resolveRange, RollupRange and
+	// RunMonth. Two code paths for one operation is the failure cmd/rollup's own doc comment argues
+	// against, and it is how a backfill ends up disagreeing with a nightly run.
+	if opts.closePreviousMonth {
+		prev := postgres.MonthOf(time.Now().UTC()).Previous()
+		opts.month = prev.String()
+		opts.close = true
+		log.Info("closing the previous month", slog.String("month", opts.month))
+	}
+
 	from, to, err := resolveRange(opts, time.Now().UTC())
 	if err != nil {
 		return err

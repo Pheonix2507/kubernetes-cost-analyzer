@@ -29,3 +29,14 @@ out/
 # Local scratch space
 /tmp/
 /scratch/
+
+# The chart's copy of the pricing catalogue is a BUILD ARTEFACT, produced by `make helm-prepare`.
+#
+# Helm's .Files.Get can only read inside the chart directory -- a relative path escaping the chart root is
+# refused, deliberately, because a chart that read arbitrary host files could not be packaged. So the
+# catalogue has to be copied in.
+#
+# Gitignored rather than committed, because committing it would give two files that drift: the one the CLI
+# and `make run-collector` read, and the one the cluster actually uses. One source of truth in git,
+# copied at package time.
+deploy/helm/kca/catalogue.yaml

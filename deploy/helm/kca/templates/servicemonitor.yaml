@@ -1,0 +1,85 @@
+{{- if .Values.serviceMonitor.enabled -}}
+# Tells prometheus-operator to scrape this release's two metrics endpoints.
+#
+# WHY THIS FILE EXISTS SEPARATELY FROM deploy/monitoring/scrape.yaml
+# -----------------------------------------------------------------
+# scrape.yaml ships a ServiceMonitor too, and it is the right one for THIS repository's development
+# loop: it lives in the `monitoring` namespace next to the alert rules, is applied by
+# `make observability-up`, and selects across all namespaces so it works wherever the app happens to
+# be running.
+#
+# It is the wrong one for somebody who has only the chart. A person running `helm install kca` has
+# not cloned this repository and cannot apply a file from it, so without this template the chart's
+# advertised `serviceMonitor.enabled` toggle is a lie -- which is exactly what it was until now. The
+# values file described a switch that no template read, so setting it did nothing and reported
+# nothing. A CI step that asserts the object actually RENDERS, rather than that `helm template`
+# exited 0, is what surfaced that.
+#
+# Off by default because the two overlap: with scrape.yaml already applied, enabling this scrapes
+# every series twice. Double scraping does not corrupt a counter or a gauge, but it doubles
+# Prometheus's ingest for no information, and it makes `up` return two rows per target, which is
+# confusing the first time you see it.
+#
+# WHY NOT ALSO GATE ON `.Capabilities.APIVersions.Has "monitoring.coreos.com/v1"`
+# The instinct is to refuse to render when the CRD is absent, and for a DEFAULT-ON resource that
+# would be right. It is wrong here, for a reason worth internalising: `helm template` runs without a
+# cluster, so Capabilities reports a minimal fixed set and the check is always false. The object
+# would then be missing from every rendered manifest a human or a CI job inspects, while appearing
+# on `helm install` -- so the artefact under review would differ from the artefact deployed. Since
+# this toggle is opt-in, `enabled: true` IS the operator's assertion that the CRD exists.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: {{ include "kca.name" . }}
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+spec:
+  # No namespaceSelector: a ServiceMonitor selects within its OWN namespace by default, and this one
+  # is installed alongside the Services it selects. That is the simplest correct thing.
+  #
+  # WHAT AN OPERATOR STILL HAS TO CHECK, because it is not in the chart's gift:
+  # Prometheus only discovers ServiceMonitors in namespaces its own
+  # `serviceMonitorNamespaceSelector` permits. Left unset, prometheus-operator restricts discovery
+  # to Prometheus's own namespace, and this object -- correct in every respect -- is simply never
+  # read. kube-prometheus-stack sets it to `{}` (all namespaces), which is why this works on the
+  # kind cluster this chart is developed against; a hand-rolled Prometheus may not.
+  #
+  # A ServiceMonitor that matches nothing, or is never read, produces NO error and NO targets. It
+  # just quietly does not work, and that silence is the commonest prometheus-operator mistake.
+  selector:
+    matchLabels:
+      {{- include "kca.selectorLabels" . | nindent 6 }}
+    # matchExpressions rather than relying on the labels above alone, because the bundled Postgres
+    # StatefulSet's Service carries the same name and instance labels and exposes no metrics port.
+    # Selecting it would add a Service with no `http-metrics` endpoint -- harmless, since there is
+    # nothing to scrape, but it puts a permanently-absent target in the discovery list and invites
+    # the reader to wonder which of the three is broken.
+    matchExpressions:
+      - key: app.kubernetes.io/component
+        operator: In
+        values: [api, collector]
+  endpoints:
+    # ONE endpoint entry covers both binaries, because both Services name the port `http-metrics`
+    # even though the numbers differ (8080 and 8081). That is the payoff for naming ports: the name
+    # is the contract, so this stays a single entry instead of one per component.
+    - port: http-metrics
+      path: /metrics
+      interval: {{ .Values.serviceMonitor.interval }}
+      # Comfortably under the interval. A scrape that outlives its own interval overlaps the next
+      # one, and Prometheus begins reporting the target as down while the process is perfectly fine.
+      scrapeTimeout: 10s
+      relabelings:
+        # `component` copied off the Service, so one ServiceMonitor covers both binaries and a
+        # dashboard can still tell them apart. Without it they are distinguishable only by port
+        # number, which is exactly the sort of thing that is obvious today and cryptic in a year.
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_component]
+          targetLabel: component
+          action: replace
+        # `job` set explicitly from the Service name, giving kca-api and kca-collector. The alert
+        # rules in deploy/monitoring/rules.yaml match on `job=~".*kca.*"`, and the operator's
+        # default job label is close enough to be tempting and different enough to break every one
+        # of those rules without a word of warning.
+        - sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: job
+          action: replace
+{{- end }}

@@ -1,0 +1,212 @@
+{{- $name := include "kca.name" . -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-api
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  {{- if not .Values.api.autoscaling.enabled }}
+  # replicas is OMITTED when the HPA is enabled, and that omission is essential.
+  #
+  # With both set, Helm and the HPA fight: `helm upgrade` writes replicas back to the values figure, the
+  # HPA scales it out again, and the deployment oscillates on every release. Kubernetes has no
+  # server-side arbitration for this -- whoever wrote last wins.
+  replicas: {{ .Values.api.replicaCount }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "kca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+  template:
+    metadata:
+      labels:
+        {{- include "kca.labels" . | nindent 8 }}
+        app.kubernetes.io/component: api
+      annotations:
+        # THE CONFIG HASH: this is what makes a ConfigMap change actually take effect.
+        #
+        # Kubernetes does not restart pods when a mounted ConfigMap changes. The file updates in place
+        # after a delay, and a process that read it at startup -- as this one does -- keeps the old
+        # values indefinitely. So editing the pricing catalogue would appear to work and change nothing.
+        #
+        # Hashing the rendered ConfigMap into a pod annotation changes the pod template, which makes the
+        # Deployment roll. The pods then re-read the file on start.
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "kca.serviceAccountName" . }}
+      securityContext:
+        {{- include "kca.podSecurityContext" . | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- if eq .Values.api.podAntiAffinity "soft" }}
+      affinity:
+        podAntiAffinity:
+          # PREFERRED, not required. `requiredDuringScheduling` on a 2-replica Deployment in a
+          # single-node cluster leaves the second pod Pending forever, and it reads as a scheduling
+          # mystery rather than as a policy somebody chose.
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    {{- include "kca.selectorLabels" . | nindent 20 }}
+                    app.kubernetes.io/component: api
+      {{- end }}
+      containers:
+        - name: api
+          image: {{ include "kca.image" (list . "api") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "kca.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: {{ .Values.api.service.portName }}
+              containerPort: {{ .Values.api.service.port }}
+          env:
+            {{- include "kca.commonEnv" . | nindent 12 }}
+            - name: API_HTTP_ADDR
+              value: ":{{ .Values.api.service.port }}"
+            - name: API_KEYS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "kca.secretName" . }}
+                  key: api-keys
+                  # OPTIONAL, so a development install with no keys still starts. config.Validate refuses
+                  # an empty API_KEYS when APP_ENV=production, so the strict check lives in the code
+                  # where it applies to every deployment method rather than only to Helm.
+                  optional: true
+          volumeMounts:
+            - name: catalogue
+              mountPath: /etc/kca
+              readOnly: true
+
+          # THE THREE PROBES DO THREE DIFFERENT JOBS, and conflating any two of them causes an outage.
+          #
+          # STARTUP: gates the other two. Informer cache sync on a large cluster takes tens of seconds,
+          # and without this the liveness probe would start failing during a perfectly normal startup and
+          # the kubelet would kill the container -- a CrashLoopBackOff caused entirely by probe timing.
+          # failureThreshold x periodSeconds is the startup budget: 30 x 2s = 60s.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.api.service.portName }}
+            periodSeconds: 2
+            failureThreshold: 30
+
+          # LIVENESS checks NOTHING beyond "the process answers", by design.
+          #
+          # If it checked Postgres, a database blip would make Kubernetes restart every replica -- which
+          # cannot fix a database and throws away warm informer caches, turning a dependency outage into
+          # a self-inflicted one. A restart only fixes a broken PROCESS, so liveness only asks about the
+          # process.
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.api.service.portName }}
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # READINESS checks dependencies, and its action is targeted: failing removes the pod from
+          # Service endpoints so traffic goes to a replica that CAN serve. That is useful during a
+          # database blip in a way that restarting is not.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.api.service.portName }}
+            periodSeconds: 5
+            # 2, so a single slow check does not drain the pod. Readiness flapping is worse than a slow
+            # pod: it removes and re-adds endpoints, and every removal resets in-flight connections.
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.api.resources | nindent 12 }}
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+      {{- with .Values.api.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.api.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # terminationGracePeriodSeconds must EXCEED the app's own shutdown timeout.
+      #
+      # internal/httpapi.Server drains in-flight requests for API_SHUTDOWN_TIMEOUT (30s default). If the
+      # grace period were shorter, the kubelet would SIGKILL mid-drain and the graceful shutdown built in
+      # Phase 0 would be decorative. 45 gives it room plus the endpoint-removal race.
+      terminationGracePeriodSeconds: 45
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-api
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    # The ServiceMonitor copies this onto every scraped series as `component`, so one ServiceMonitor
+    # covers both binaries and a dashboard can still tell them apart.
+    app.kubernetes.io/component: api
+spec:
+  type: {{ .Values.api.service.type }}
+  ports:
+    - name: {{ .Values.api.service.portName }}
+      port: {{ .Values.api.service.port }}
+      targetPort: {{ .Values.api.service.portName }}
+  selector:
+    {{- include "kca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+{{- if .Values.api.autoscaling.enabled }}
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: {{ $name }}-api
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: {{ $name }}-api
+  minReplicas: {{ .Values.api.autoscaling.minReplicas }}
+  maxReplicas: {{ .Values.api.autoscaling.maxReplicas }}
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          # Utilization is a percentage OF THE REQUEST, which is why requests are mandatory for an HPA to
+          # work at all. A BestEffort pod has no request, so utilisation is undefined and the HPA reports
+          # "unknown" and never scales -- silently.
+          type: Utilization
+          averageUtilization: {{ .Values.api.autoscaling.targetCPUUtilizationPercentage }}
+  behavior:
+    scaleDown:
+      # FIVE MINUTES of stabilisation before scaling down, against the default of 300s -- stated
+      # explicitly because it is the setting that stops flapping. Scaling down eagerly after a spike
+      # means the next spike finds too few replicas, and the cycle repeats with users in it.
+      stabilizationWindowSeconds: 300
+    scaleUp:
+      # Zero, so scale-up is immediate. The asymmetry is the point: being slow to add capacity costs
+      # latency now, being slow to remove it costs a little money. Those are not equally bad.
+      stabilizationWindowSeconds: 0
+{{- end }}
+{{- if .Values.api.podDisruptionBudget.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ $name }}-api
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: api
+spec:
+  minAvailable: {{ .Values.api.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "kca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: api
+{{- end }}

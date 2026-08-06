@@ -19,6 +19,7 @@ package buildinfo
 
 import (
 	"fmt"
+	"os"
 	"runtime"
 )
 
@@ -45,6 +46,35 @@ var (
 func String() string {
 	return fmt.Sprintf("version=%s commit=%s built=%s go=%s %s/%s",
 		Version, Commit, BuildTime, runtime.Version(), runtime.GOOS, runtime.GOARCH)
+}
+
+// PrintVersionAndExit writes the build summary to stdout and terminates successfully.
+// Every binary calls it on -version, before doing anything else.
+//
+// WHY "BEFORE ANYTHING ELSE" IS THE ENTIRE POINT
+// ---------------------------------------------
+// The comment at the top of this file says the question is always "which version is
+// actually running?". The situation in which you ask it is a pod that is misbehaving --
+// and a misbehaving pod is very often one whose CONFIGURATION is wrong.
+//
+// So a --version that loads configuration first is broken in exactly the case it exists
+// to serve. This is not hypothetical: before this function existed, both binaries did
+// load config first, and `docker run kca/api:latest --version` answered
+//
+//	fatal: invalid configuration: DATABASE_URL: required environment variable is not set
+//
+// which tells you nothing about the version and is the least helpful possible reply to
+// "what is deployed here". The CI step that runs --version against each built image is
+// what surfaced it.
+//
+// WHY STDOUT AND EXIT 0
+// A satisfied --version is a SUCCESS, so it belongs on stdout with status 0. Sending it
+// to stderr, or exiting non-zero, breaks `img=$(docker run ... --version)` and makes
+// every CI check of it look like a failure. The rest of this project writes startup
+// failures to stderr; this is deliberately the other case.
+func PrintVersionAndExit() {
+	fmt.Println(String())
+	os.Exit(0)
 }
 
 // LogAttrs returns the fields we attach to every log line, so that any log we

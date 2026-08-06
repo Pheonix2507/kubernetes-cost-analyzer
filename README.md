@@ -23,12 +23,13 @@ Measured on real data, `kube-system` reported **0 GiB-hours** of memory waste wh
 50, and `team-search` was understated by 126%. The more under-requested a team's workloads were, the
 more efficient it looked.
 
-## Status: Phase 9 complete — it can be operated
+## Status: Phase 10 complete — it can be installed
 
 The collector produces cost data, the API serves it, the recommendation engine says what to change, a
 nightly rollup makes history cheap (**292.7x compression, measured**), a Next.js dashboard reads all of
-it with the API key held server-side, and both binaries expose their own metrics with alerts that fire
-on the failures that actually destroy data.
+it with the API key held server-side, both binaries expose their own metrics with alerts that fire
+on the failures that actually destroy data, and a Helm chart installs the whole thing into a cluster
+with CI that refuses to go green on an untested database.
 
 What works today:
 
@@ -67,6 +68,12 @@ What works today:
   server-side proxy and TypeScript types generated from the OpenAPI spec
 - RED metrics on the API, batch metrics on the collector, freshness gauges read from the
   database, 9 alert rules and a Grafana dashboard — all as code, all verified by a script
+- A Helm chart that installs all four components in their correct workload forms, refuses to
+  render without a cluster name or an image tag, and refuses to run two collectors
+- A readiness probe that checks the schema, so an unmigrated database stalls a rollout
+  instead of serving 500s from a pod marked Ready
+- GitHub Actions across five parallel jobs, including a job that fails when the database
+  tests would silently skip and a step that verifies that guard still works
 
 ### Endpoints
 
@@ -812,12 +819,133 @@ configuration is the one that will not run. Development starts open and warns lo
 differing byte, so it takes measurably longer the more of the prefix matched — an attacker recovers
 the key one position at a time, in linear rather than exponential attempts.
 
+## Deployment: four components, four different workload forms
+
+The chart is in `deploy/helm/kca`. The interesting part is not the YAML, it is that each component
+gets a **different** Kubernetes workload type, for a reason specific to what it does.
+
+| Component | Form | Why not something else |
+|---|---|---|
+| api | Deployment, HPA-ready | Stateless and idempotent, so N replicas are strictly better than 1 |
+| collector | Deployment, `strategy: Recreate`, exactly 1 replica | Two collectors compute every window twice |
+| rollup | Two CronJobs (nightly, monthly close) | It exits. A Deployment would restart it forever |
+| postgres | StatefulSet, **off by default** | Stable identity and a PVC per pod, but a real deployment should use managed Postgres |
+
+**Nothing here is a DaemonSet**, and that is worth stating because a cost tool feels like it should
+be one. A DaemonSet runs a copy per node, which is right when you must read something only
+obtainable locally — a kubelet, a container runtime, a host filesystem. This collector reads the
+Kubernetes API and Prometheus, both of which are cluster-scoped. A per-node copy would multiply
+identical queries by the node count and write every fact N times.
+
+Three guards are enforced by the chart rather than documented:
+
+- `clusterName` is `required`, because a missing one silently attributes every row to `default` and
+  the mistake only becomes visible when a second cluster arrives and the data is already mixed
+- `image.tag` is `required`, so the chart cannot deploy `latest` — a tag that means "whatever was
+  pushed most recently", which is not a version
+- `collector.replicaCount > 1` calls `fail`, so the double-counting configuration cannot be
+  installed at all
+
+`make helm-lint` asserts all three by **trying to render without them and requiring failure**.
+`helm lint` alone is happy to bless a chart that deploys `latest` into an unnamed cluster.
+
+### The readiness probe that stalls a rollout on purpose
+
+Installing the chart the first time produced a pod that was `READY` and completely broken.
+`/readyz` returned 200 because it pinged Postgres and the ping succeeded; every real endpoint
+returned 500 because the database had **zero tables**.
+
+That is the standard readiness mistake: probing the *process* (`SELECT 1`) rather than the
+*contract* (can I serve a request). The fix is `internal/store/postgres/schema_check.go`, which
+reads `schema_migrations` and reports down when it is absent, empty, or `dirty`.
+
+The behaviour this buys is worth the file. Under `RollingUpdate`, a pod that lies about being ready
+gets the healthy old pod terminated underneath it, and you have a total outage with every pod
+showing green. Refusing readiness instead produces:
+
+```
+kca-api-86b95ff57-r8bj2   0/1   Running     # new pod, correctly refusing
+kca-api-7d45fb48cd-jx9hr  1/1   Running     # old pod, still serving
+```
+
+and `/readyz` on the new pod says exactly what is wrong:
+
+```json
+{ "name": "schema", "status": "down",
+  "error": "cannot read schema_migrations (run `make migrate-up`): relation \"schema_migrations\" does not exist" }
+```
+
+Apply the migrations and the stalled rollout completes on its own, with nobody touching Kubernetes.
+A silent outage became a loud, safe, self-healing stall.
+
+One deployment trap this also exposed: `helm upgrade` did **not** restart the pod, because `:dev` is
+a mutable tag and the pod spec had not changed, so there was nothing to roll. `make helm-install`
+now runs an explicit `kubectl rollout restart`. In a real pipeline the tag would be a git SHA and
+this would not arise — which is the actual argument for immutable tags, beyond tidiness.
+
+## CI: five jobs, and one that guards the others
+
+`.github/workflows/ci.yml`. The design rule is that **CI calls the same `make` targets a human
+calls** — the moment CI has its own copy of a command, the two drift, and you get "passes locally,
+fails in CI" or, far worse, the reverse.
+
+| Job | What it proves |
+|---|---|
+| `go-static` | Formatted, vetted, linted — with a pinned golangci-lint, because `.golangci.yml` declares `version: "2"` |
+| `go-test` | Race-enabled tests against a real Postgres 18 service container, migrations applied |
+| `chart` | The chart lints, refuses to render without required values, and renders with every optional toggle on |
+| `web` | Typecheck, lint, generated types match the spec, and the app builds |
+| `image` | All three images build, report their version, and run as non-root |
+| `ci` | One check to require in branch protection |
+
+### The trap: a green build that tested nothing
+
+The database tests skip when no database is reachable, which is right for a developer who has not
+run `make db-up`. But **`go test` exits 0 on a skip**. So a CI job that forgot its Postgres service,
+or had a typo in `DATABASE_URL`, or ran before migrations, would print forty `SKIP` lines nobody
+reads and hand back a green tick — with the entire persistence layer untested.
+
+The fix lives in Go, not in YAML: `KCA_REQUIRE_DB` turns "no database, so skip" into "no database,
+so **fail**". CI sets it; developers do not. And because a future refactor could quietly delete that
+guard, CI has a step that **runs the suite with the database deliberately hidden and requires it to
+fail**. A safety net nobody tests is not a safety net.
+
+### Three more things that would otherwise pass silently
+
+- **`if: always()` plus `needs:`** makes a job that *always succeeds*, because `always()` disables
+  the implicit all-dependencies-succeeded gate. The aggregate job therefore inspects
+  `needs.*.result` itself, and treats `skipped` as failure — a job skipped by a mistaken `if:` has
+  not passed.
+- **`--set postgres.enabled=true` renders happily** and does nothing, because Helm creates the key
+  nobody reads. `postgresql` is the real name. So the chart job counts the objects that actually
+  rendered instead of trusting exit 0.
+- **`serviceMonitor.enabled` was a lie.** `values.yaml` documented the toggle; no template
+  implemented it. Setting it did nothing and reported nothing. The assertion above caught it on its
+  first run, and `templates/servicemonitor.yaml` now exists.
+
+### Two bugs the CI step found in code it was only meant to check
+
+Asserting `docker run kca/api:latest --version` uncovered that `--version` did not exist — and
+`buildinfo.String()`'s own doc comment said it was "for `--version` output". Worse, adding it
+naively would have kept the real defect: both binaries loaded configuration first, so
+
+```
+$ docker run kca/api:latest --version
+fatal: invalid configuration: DATABASE_URL: required environment variable is not set
+```
+
+A version flag exists to answer "what is running in this broken pod", and a broken pod is very
+often one whose configuration is wrong. So it is handled in `main()` before `config.Load()` in all
+three binaries. `flag.Parse()` also means the two env-configured binaries now **reject** unknown
+arguments instead of ignoring them, which turns a container spec that meant to set an env var into
+a startup failure rather than silently discarded intent.
+
 ## Development
 
 ```bash
 make migrate-up    # apply migrations
 make migrate-reset # drop and re-apply from scratch
-make rollup            # roll up yesterday (what the Phase 10 CronJob will run)
+make rollup            # roll up yesterday (what the nightly CronJob runs)
 make rollup-backfill   # roll up every day with fact rows. Safe to re-run: it is a projection
 make rollup-month MONTH=2026-07   # roll up a month and write its statements
 make rollup-close MONTH=2026-07   # ...and FREEZE them. Irreversible without a deliberate un-finalise
@@ -829,6 +957,12 @@ make env-check     # report .env keys that .env.example has gained since you cre
 make rbac-up       # apply the ServiceAccount, ClusterRole and binding
 make rbac-verify   # prove the RBAC grants reads and denies every write
 make reset         # tear down and rebuild everything
+
+make helm-lint     # lint the chart AND prove the required values are really required
+make helm-template # render with development values
+make helm-install  # build, load into kind, install, and roll the pods
+make helm-verify   # 15 assertions against what is actually running
+make helm-uninstall
 ```
 
 ### On RBAC verification
@@ -867,6 +1001,5 @@ there is code that reads them.
 | **7** ✅ | Daily rollups, trends, immutable monthly statements, advisory-lock batch job |
 | **8** ✅ | Next.js dashboard — RSC/client split, server-side credential, generated types |
 | **9** ✅ | Observability — own metrics, recording/alert rules, Grafana dashboard as code |
-| 9 | Observability — own metrics, recording rules, Grafana dashboards as code |
-| 10 | Helm chart + GitHub Actions |
+| **10** ✅ | Helm chart (Deployment / CronJob / StatefulSet), schema-aware readiness, GitHub Actions |
 | 11+ | Multi-cluster; AWS, GCP and Azure pricing |

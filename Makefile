@@ -288,6 +288,42 @@ run-collector: ## Run the collector locally
 # Frontend (web/)
 # =============================================================================
 
+# =============================================================================
+# Helm chart
+# =============================================================================
+
+.PHONY: helm-prepare
+helm-prepare: ## Copy the pricing catalogue into the chart (Helm cannot read outside the chart dir)
+	@cp deploy/pricing/catalogue.yaml deploy/helm/kca/catalogue.yaml
+
+.PHONY: helm-lint
+helm-lint: helm-prepare ## Lint the chart, and prove the required values are actually required
+	helm lint deploy/helm/kca --set clusterName=lint --set image.tag=lint --set secrets.databaseUrl=postgres://lint
+	# The NEGATIVE test, which `helm lint` alone does not do: rendering with a value MISSING must FAIL.
+	# Without this, a `required` that was accidentally given a default would silently stop being required
+	# and the chart would deploy with clusterName unset -- the exact Phase 7 audit finding.
+	@if helm template deploy/helm/kca --set image.tag=x --set secrets.databaseUrl=y >/dev/null 2>&1; then 		echo "FAIL: the chart rendered without clusterName, which must be required"; exit 1; 	else echo "  PASS: a missing clusterName refuses to render"; fi
+	@if helm template deploy/helm/kca --set clusterName=x --set secrets.databaseUrl=y >/dev/null 2>&1; then 		echo "FAIL: the chart rendered without image.tag -- it would deploy :latest"; exit 1; 	else echo "  PASS: a missing image.tag refuses to render"; fi
+	@if helm template deploy/helm/kca --set clusterName=x --set image.tag=y --set collector.replicaCount=2 >/dev/null 2>&1; then 		echo "FAIL: the chart accepted two collector replicas"; exit 1; 	else echo "  PASS: two collector replicas refuses to render"; fi
+
+.PHONY: helm-template
+helm-template: helm-prepare ## Render the chart to stdout with development values
+	helm template kca deploy/helm/kca -f deploy/helm/values-dev.yaml
+
+.PHONY: helm-install
+helm-install: helm-prepare kind-load ## Install the chart into the kind cluster with development values
+	helm upgrade --install kca deploy/helm/kca 		--namespace kca --create-namespace 		-f deploy/helm/values-dev.yaml 		--wait --timeout 5m
+	@echo
+	@kubectl get all -n kca
+
+.PHONY: helm-uninstall
+helm-uninstall: ## Remove the release
+	helm uninstall kca --namespace kca || true
+
+.PHONY: helm-verify
+helm-verify: ## Prove the deployed release actually works
+	@./deploy/helm/verify.sh
+
 .PHONY: observability-up
 observability-up: ## Apply the ScrapeConfig, PrometheusRule and Grafana dashboard
 	kubectl apply -f deploy/monitoring/scrape.yaml
@@ -429,6 +465,14 @@ docker-build: ## Build the container image
 	@docker images $(IMAGE_REPO)/rollup
 
 .PHONY: kind-load
-kind-load: docker-build ## Load both images into the kind cluster (no registry needed)
-	kind load docker-image $(IMAGE_REPO)/api:latest --name $(CLUSTER_NAME)
-	kind load docker-image $(IMAGE_REPO)/collector:latest --name $(CLUSTER_NAME)
+kind-load: docker-build ## Load all three images into the kind cluster (no registry needed)
+	# Retagged to :dev, matching deploy/helm/values-dev.yaml.
+	#
+	# NOT :latest, and not because of tidiness. values-dev.yaml sets pullPolicy: Never so the kubelet uses
+	# the loaded image -- and with a :latest tag it is impossible to tell whether the running pod has the
+	# build you just made or one from last week, because the tag moved. A distinct tag makes "did my change
+	# deploy" answerable.
+	@for c in api collector rollup; do \
+		docker tag $(IMAGE_REPO)/$$c:$(VERSION) kca/$$c:dev; \
+		kind load docker-image kca/$$c:dev --name $(CLUSTER_NAME); \
+	done

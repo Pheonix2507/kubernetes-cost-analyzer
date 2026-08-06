@@ -1,0 +1,161 @@
+{{- $name := include "kca.name" . -}}
+{{- if gt (int .Values.collector.replicaCount) 1 -}}
+{{- fail "collector.replicaCount must be 1: two collectors compute every window twice, which doubles the Prometheus query load. Proper leader election needs a coordination.k8s.io Lease and an RBAC grant this service deliberately does not have." -}}
+{{- end -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $name }}-collector
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  replicas: {{ .Values.collector.replicaCount }}
+  # RECREATE, NOT RollingUpdate. THE MOST IMPORTANT LINE IN THIS FILE.
+  #
+  # RollingUpdate starts the new pod BEFORE terminating the old one -- that is the whole point of it, and
+  # it is right for the API. For a single-active process it is wrong: during every deploy there are
+  # briefly TWO collectors, both querying Prometheus for the same window.
+  #
+  # The upsert makes that harmless to the data (the second write updates the first rather than
+  # duplicating it), so nothing looks broken. But it doubles the Prometheus query load exactly when a
+  # deploy is already adding load, and it contradicts the single-active-collector property the code's own
+  # comments claim. A property that is true except during deploys is not a property.
+  #
+  # Recreate terminates the old pod first, so there is a gap with no collector rather than an overlap with
+  # two. The gap costs one collection window -- which the aligned-window design makes recoverable, since
+  # re-running the same window is idempotent -- and the overlap costs correctness of a stated invariant.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "kca.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: collector
+  template:
+    metadata:
+      labels:
+        {{- include "kca.labels" . | nindent 8 }}
+        app.kubernetes.io/component: collector
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+    spec:
+      serviceAccountName: {{ include "kca.serviceAccountName" . }}
+      securityContext:
+        {{- include "kca.podSecurityContext" . | nindent 8 }}
+      {{- with .Values.image.pullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: collector
+          image: {{ include "kca.image" (list . "collector") }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- include "kca.containerSecurityContext" . | nindent 12 }}
+          ports:
+            - name: {{ .Values.collector.service.portName }}
+              containerPort: {{ .Values.collector.service.port }}
+          env:
+            {{- include "kca.commonEnv" . | nindent 12 }}
+            - name: COLLECTOR_HTTP_ADDR
+              value: ":{{ .Values.collector.service.port }}"
+            - name: COLLECTOR_INTERVAL
+              value: {{ .Values.collector.interval | quote }}
+            - name: COLLECTOR_WORKERS
+              value: {{ .Values.collector.workers | quote }}
+          volumeMounts:
+            - name: catalogue
+              mountPath: /etc/kca
+              readOnly: true
+
+          # THESE PROBES ONLY EXIST BECAUSE PHASE 9 GAVE THE COLLECTOR A LISTENER.
+          #
+          # Before that, Kubernetes had exactly one liveness signal for this process -- whether it had
+          # exited -- so a collector wedged on a hung Prometheus query looked perfectly healthy
+          # indefinitely. A wedge that never restarts is worse than a crash, because a crash is visible in
+          # the restart count and a wedge is visible nowhere.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.collector.service.portName }}
+            periodSeconds: 2
+            # 60 x 2s = 120s, twice the API's budget. The collector waits for informer caches before its
+            # FIRST cycle -- deliberately, because an unsynced informer returns an empty list with no
+            # error, and a cycle collected from one would record a cluster that cost nothing.
+            failureThreshold: 60
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: {{ .Values.collector.service.portName }}
+            periodSeconds: 15
+            failureThreshold: 3
+          # READINESS ON A POD IN NO SERVICE, which looks pointless and is not.
+          #
+          # Failing readiness routes no traffic away here -- there is none. It does two other things. A
+          # rollout will not proceed past a pod that never becomes ready, so a collector that cannot reach
+          # Postgres does not silently replace a working one. And it gives an operator a URL that answers
+          # "why is this not collecting" without reading logs.
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: {{ .Values.collector.service.portName }}
+            periodSeconds: 10
+            failureThreshold: 3
+          resources:
+            {{- toYaml .Values.collector.resources | nindent 12 }}
+      volumes:
+        - name: catalogue
+          configMap:
+            name: {{ $name }}-catalogue
+      {{- with .Values.collector.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.collector.tolerations }}
+      tolerations: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      # Shorter than the API's: the collector has no in-flight user requests to drain. It needs enough to
+      # finish or abandon the current cycle cleanly, and internal/costing checks for cancellation between
+      # namespaces, so it stops promptly.
+      terminationGracePeriodSeconds: 30
+---
+# A Service for a pod nothing calls, which exists ONLY so Prometheus can find it.
+#
+# The ServiceMonitor in deploy/monitoring/scrape.yaml discovers ENDPOINTS, and endpoints come from a
+# Service. Without one there is nothing to select, so the collector's metrics would be unscrapeable even
+# though the port is open -- exactly the situation Phase 9 was fixing.
+#
+# ClusterIP with no consumers is the right shape: it is a discovery record rather than a load balancer.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $name }}-collector
+  labels:
+    {{- include "kca.labels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+spec:
+  type: ClusterIP
+  # HEADLESS, deliberately. There is one replica and nothing balances across it, so a cluster IP would be
+  # a virtual address and a round of kube-proxy NAT for no purpose. `None` makes the DNS name resolve
+  # straight to the pod, which is also what a human wants when port-forwarding to check /readyz.
+  clusterIP: None
+  ports:
+    - name: {{ .Values.collector.service.portName }}
+      port: {{ .Values.collector.service.port }}
+      targetPort: {{ .Values.collector.service.portName }}
+  selector:
+    {{- include "kca.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: collector
+
+# NO PodDisruptionBudget FOR THE COLLECTOR, and the omission is the decision.
+#
+# The instinct is to protect it -- it is the component whose downtime destroys data, since Prometheus
+# retention is 7 days and samples missed beyond that are gone forever. So a PDB feels obviously right.
+#
+# It is a trap. With ONE replica, `minAvailable: 1` or `maxUnavailable: 0` means the eviction API can
+# never evict this pod, so `kubectl drain` BLOCKS FOREVER on the node hosting it. Cluster upgrades stall.
+# The autoscaler cannot scale down. And the operator's fix is to delete the PDB under time pressure,
+# which is worse than not having had one.
+#
+# The protection that actually works is elsewhere: the alert fires on data age within 15 minutes, and a
+# collector rescheduled onto another node resumes from the aligned window it left -- because
+# re-collecting a window is idempotent by design. A brief gap during a drain is recoverable; a node that
+# cannot be drained is an operational dead end.

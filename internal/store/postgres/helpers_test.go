@@ -59,9 +59,33 @@ var (
 	//
 	// Calling t.Skip per test instead means `go test -v` prints an explicit SKIP line for
 	// each one, and `-run` still works. The skip is visible, countable, and impossible to
-	// mistake for a pass.
+	// mistake for a pass -- BY A HUMAN READING THE OUTPUT.
+	//
+	// It is emphatically NOT impossible for a machine to mistake for a pass, which is the
+	// whole reason requireDBEnv below exists. `go test` exits 0 on a skip. A CI job that
+	// forgot the Postgres service would print forty SKIP lines nobody reads and hand back a
+	// green tick, and the repository would have a passing build with the entire persistence
+	// layer untested. See the comment on requireDBEnv.
 	skipReason string
 )
+
+// requireDBEnv, when set to a non-empty value, converts "no database, so skip" into "no
+// database, so FAIL".
+//
+// WHY AN ENVIRONMENT VARIABLE AND NOT A BUILD TAG
+// -----------------------------------------------
+// A build tag (`//go:build requiredb`) would also work and is arguably more idiomatic. It is
+// worse here for one reason: a tag changes which files COMPILE, so a typo in the tag name
+// silently excludes the file and the guard vanishes -- the same class of silent-nothing-ran
+// failure this variable exists to prevent. An env var is read at runtime by code that always
+// compiles, so a typo in CI makes the guard inert but leaves the skip message visible, and a
+// typo in the Go string fails the CI job that expects it to bite.
+//
+// WHY THE DEFAULT IS OFF
+// A developer who has not run `make db-up` should get a fast green run of the 200-odd tests
+// that need no database, not a wall of red. The strictness belongs in the one place that must
+// never lie about coverage, and it is opt-in there.
+const requireDBEnv = "KCA_REQUIRE_DB"
 
 // requireDB skips the calling test when no database is available.
 func requireDB(t *testing.T) {
@@ -72,14 +96,46 @@ func requireDB(t *testing.T) {
 }
 
 func TestMain(m *testing.M) {
+	skipReason = connectTestDB()
+
+	// THE GUARD. One check covering every reason the suite might not run, which is why
+	// connectTestDB returns the reason rather than exiting: three separate os.Exit sites meant
+	// three places to remember this, and the one that got forgotten would be the one that let a
+	// green build through.
+	if skipReason != "" && os.Getenv(requireDBEnv) != "" {
+		fmt.Fprintf(os.Stderr,
+			"FATAL: %s is set, so the database tests must run, but they cannot: %s\n",
+			requireDBEnv, skipReason)
+		os.Exit(1)
+	}
+
+	code := m.Run()
+
+	// Closed explicitly, not with defer. os.Exit does NOT run deferred functions, so the
+	// `defer testPool.Close()` an earlier version of this file had never once executed. It was
+	// harmless here -- the process was ending and the OS reclaims sockets -- but the same
+	// pattern loses data whenever the deferred call is a flush, a commit, or a container
+	// teardown, and it is worth not keeping the habit.
+	if testPool != nil {
+		testPool.Close()
+	}
+	os.Exit(code)
+}
+
+// connectTestDB establishes testPool, returning a human-readable reason when it cannot. An
+// empty return means the pool is usable and migrated.
+//
+// A returned reason means "not available", which is a skip by default. Anything that indicates
+// a MISCONFIGURATION rather than an absence still exits non-zero from here, because no amount
+// of starting containers will fix a malformed URL.
+func connectTestDB() string {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
 		url = os.Getenv("DATABASE_URL")
 	}
 	if url == "" {
-		skipReason = "no TEST_DATABASE_URL or DATABASE_URL set; run `make test` (loads .env) " +
+		return "no TEST_DATABASE_URL or DATABASE_URL set; run `make test` (loads .env) " +
 			"or `make db-up && make migrate-up`"
-		os.Exit(m.Run())
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -103,27 +159,24 @@ func TestMain(m *testing.M) {
 		fmt.Fprintf(os.Stderr, "cannot create pool: %v\n", err)
 		os.Exit(1)
 	}
-	defer testPool.Close()
 
 	// A configured-but-unreachable database is a SKIP, not a failure: it usually means the
 	// container is simply not running. A misconfigured URL, by contrast, failed above.
 	if pingErr := testPool.Ping(ctx); pingErr != nil {
-		skipReason = fmt.Sprintf("postgres unreachable at the configured URL (%v); run `make db-up`", pingErr)
-		os.Exit(m.Run())
+		return fmt.Sprintf("postgres unreachable at the configured URL (%v); run `make db-up`", pingErr)
 	}
 
-	// Fail with an ACTIONABLE message if the schema is missing, rather than letting every
-	// test fail with "relation container_allocations does not exist".
+	// Report an ACTIONABLE reason if the schema is missing, rather than letting every test fail
+	// with "relation container_allocations does not exist".
 	var exists bool
 	err = testPool.QueryRow(ctx,
 		`SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_name = 'container_allocations')`,
 	).Scan(&exists)
 	if err != nil || !exists {
-		skipReason = "schema is not migrated; run `make migrate-up`"
-		os.Exit(m.Run())
+		return "schema is not migrated; run `make migrate-up`"
 	}
 
-	os.Exit(m.Run())
+	return ""
 }
 
 // withTx gives a test a Querier bound to a transaction that is rolled back on cleanup.
