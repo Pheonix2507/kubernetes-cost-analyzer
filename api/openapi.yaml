@@ -183,6 +183,7 @@ paths:
             Maximum rows. **Refused, not clamped**, if too large: silently returning 100 rows to a
             caller who asked for 10,000 would make them believe they had the whole result set.
           schema: { type: integer, minimum: 1, maximum: 1000, default: 100 }
+        - $ref: "#/components/parameters/Cluster"
         - $ref: "#/components/parameters/Namespace"
         - $ref: "#/components/parameters/Team"
         - $ref: "#/components/parameters/Environment"
@@ -237,6 +238,7 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 500, default: 100 }
+        - $ref: "#/components/parameters/Cluster"
         - $ref: "#/components/parameters/Namespace"
         - $ref: "#/components/parameters/Team"
         - $ref: "#/components/parameters/Environment"
@@ -286,6 +288,7 @@ paths:
         - name: limit
           in: query
           schema: { type: integer, minimum: 1, maximum: 1000, default: 200 }
+        - $ref: "#/components/parameters/Cluster"
         - $ref: "#/components/parameters/Namespace"
         - $ref: "#/components/parameters/Team"
         - $ref: "#/components/parameters/Environment"
@@ -374,6 +377,7 @@ paths:
           description: |
             Caps SERIES, not points. A truncated series would draw a chart that stops partway through
             the range with nothing to say why.
+        - $ref: "#/components/parameters/Cluster"
         - $ref: "#/components/parameters/Namespace"
         - $ref: "#/components/parameters/Team"
         - $ref: "#/components/parameters/Environment"
@@ -482,6 +486,32 @@ paths:
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
 
+  /api/v1/clusters:
+    get:
+      tags: [inventory]
+      summary: Clusters reporting into this database
+      description: |
+        The fleet, as recorded in Postgres. Unlike the other inventory endpoints this does NOT read the
+        informer cache: informers watch only the cluster this process runs in, whereas the fleet is
+        whatever has reported cost data. That distinction is what lets one API serve many clusters.
+
+        `provider` and `region` are derived from the nodes and may be empty, which means the nodes do
+        not agree on one answer -- a cluster spanning two regions has no single region, and naming the
+        commonest one would attribute the whole cluster to a region hosting only part of it.
+
+        Use `currencies` and `aggregatable` to decide whether fleet-wide totals are meaningful. When
+        more than one currency is present, the aggregating endpoints refuse an unscoped query with
+        `409`.
+      responses:
+        "200":
+          description: Every known cluster, ordered by name.
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ClusterList" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
+
   /api/v1/namespaces:
     get:
       tags: [inventory]
@@ -554,6 +584,20 @@ components:
 
         Defaults to now. The range may span at most 400 days.
       schema: { type: string, format: date-time }
+    Cluster:
+      name: cluster
+      in: query
+      description: |
+        Restrict to one cluster, by the name it reports itself under (`CLUSTER_NAME`). List the
+        available names with `GET /api/v1/clusters`.
+      
+        Cluster names are unique across a fleet, so this parameter identifies a cluster on its
+        own. Provider, account and region describe a cluster rather than forming part of its
+        identity.
+      
+        Omitting it aggregates across every cluster, which is refused with `409` when they do
+        not all report in the same currency: summing 100 USD and 100 EUR gives 200 of nothing.
+      schema: { type: string }
     Namespace:
       { name: namespace, in: query, schema: { type: string } }
     Team:
@@ -581,6 +625,49 @@ components:
       schema: { type: boolean, default: false }
 
   schemas:
+    ClusterList:
+      type: object
+      required: [items, count, currencies, aggregatable]
+      properties:
+        items:
+          type: array
+          items: { $ref: "#/components/schemas/Cluster" }
+        count: { type: integer }
+        currencies:
+          type: array
+          description: Every distinct currency in the fleet, sorted.
+          items: { type: string, example: USD }
+        aggregatable:
+          type: boolean
+          description: |
+            Whether costs may be summed across the fleet, i.e. whether exactly one currency is
+            present. Stated as a boolean as well as a list because it is a rule the server owns and
+            every client would otherwise re-derive, differently.
+    Cluster:
+      type: object
+      required: [name, provider, region, account, currency, first_seen, last_seen]
+      properties:
+        name: { type: string, example: kca-dev }
+        provider:
+          type: string
+          description: Derived from the scheme of the nodes' providerID. Empty when the nodes disagree.
+          example: kind
+        region:
+          type: string
+          description: Derived from the nodes' topology label. Empty when the nodes disagree.
+          example: ap-south-1
+        account:
+          type: string
+          description: Billing account, project or subscription. Configured; empty means not recorded.
+        currency: { type: string, example: USD }
+        first_seen: { type: string, format: date-time }
+        last_seen:
+          type: string
+          format: date-time
+          description: |
+            Last time a collector touched this row. A cluster untouched for hours has a collector that
+            has stopped reporting, which is invisible in the cost figures alone -- they simply stop
+            growing, which looks identical to a cluster that got cheaper.
     InventoryList:
       type: object
       required: [items, count, total]

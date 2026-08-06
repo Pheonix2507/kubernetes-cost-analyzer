@@ -87,11 +87,24 @@ type summaryTotals struct {
 // handleCostSummary serves GET /api/v1/costs/summary.
 //
 // The primary reporting endpoint: aggregated cost over a time range, grouped by one dimension.
-func handleCostSummary(reports Reports) http.HandlerFunc {
+func handleCostSummary(reports Reports, clusters Clusters) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		params, verr := summaryParams(r)
 		if verr != nil {
 			writeValidationError(w, r, verr)
+			return
+		}
+
+		// Refuse a fleet-wide total that would sum different currencies. Placed after validation
+		// (a malformed request should be told so first) and before the query (there is no point
+		// spending a database round trip on an answer that cannot be returned).
+		if status, cerr := guardCurrency(r.Context(), clusters, params.Filters.Cluster); cerr != nil {
+			if status == http.StatusConflict {
+				writeError(w, r, status, "mixed_currencies", cerr.Error())
+			} else {
+				logError(r, "checking fleet currencies", cerr)
+				writeError(w, r, status, "internal_error", "could not check fleet currencies")
+			}
 			return
 		}
 
@@ -161,11 +174,25 @@ func totals(rows []postgres.CostSummaryRow, limit int) summaryTotals {
 // The escape hatch beneath the summary. When a figure looks wrong, this is where you go to see the
 // rows it was computed from -- which is why it returns requested, used AND billable separately
 // rather than only the billable amount the cost was derived from.
-func handleAllocations(reports Reports) http.HandlerFunc {
+func handleAllocations(reports Reports, clusters Clusters) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		params, verr := allocationsParams(r)
 		if verr != nil {
 			writeValidationError(w, r, verr)
+			return
+		}
+
+		// Refuse a response that would mix currencies. The rule the API keeps is simple and
+		// explainable: no single response returns money in more than one currency, because no
+		// response carries a per-row currency, so a client has no way to tell them apart. When
+		// rows gain a currency of their own, this can be relaxed for the listing endpoints.
+		if status, cerr := guardCurrency(r.Context(), clusters, params.Filters.Cluster); cerr != nil {
+			if status == http.StatusConflict {
+				writeError(w, r, status, "mixed_currencies", cerr.Error())
+			} else {
+				logError(r, "checking fleet currencies", cerr)
+				writeError(w, r, status, "internal_error", "could not check fleet currencies")
+			}
 			return
 		}
 

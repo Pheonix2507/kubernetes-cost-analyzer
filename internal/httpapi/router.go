@@ -23,6 +23,9 @@ type RouterOptions struct {
 	Pricer    pricing.Provider
 	Reports   Reports
 	Stats     Stats
+	// Clusters lists the fleet. Also consulted by the currency guard on every aggregating
+	// endpoint, which is why it is a dependency of more than just GET /api/v1/clusters.
+	Clusters Clusters
 	// Trends reads the daily rollup and the monthly statements. A fourth read interface rather than a
 	// wider one, so a handler depends only on the queries it calls.
 	Trends Trends
@@ -94,6 +97,19 @@ func NewRouter(opts RouterOptions) http.Handler {
 	//
 	// These are all GET and all read-only, which mirrors the RBAC in deploy/rbac: this
 	// service is structurally incapable of mutating the cluster it observes.
+	// Listed with inventory rather than under costs, because it answers "what is out there".
+	// Unlike the other three it reads POSTGRES, not the informer cache: the informers watch only
+	// the cluster this process runs in, whereas the fleet is whatever has reported into the
+	// database. That distinction is the whole reason a central API can serve many clusters.
+	// The fleet port, substituted rather than nil-checked in four handlers. See unknownFleet.
+	clusters := opts.Clusters
+	if clusters == nil {
+		log.Warn("no cluster repository wired: the mixed-currency guard is INACTIVE, " +
+			"so a fleet reporting in more than one currency would be summed silently")
+		clusters = unknownFleet{}
+	}
+
+	mux.HandleFunc("GET /api/v1/clusters", handleListClusters(clusters))
 	mux.HandleFunc("GET /api/v1/nodes", handleListNodes(inv, pricer))
 	mux.HandleFunc("GET /api/v1/namespaces", handleListNamespaces(inv))
 	mux.HandleFunc("GET /api/v1/pods", handleListPods(inv))
@@ -103,16 +119,16 @@ func NewRouter(opts RouterOptions) http.Handler {
 	// /costs/summary is aggregated and is what a dashboard renders. /allocations is the raw fact
 	// rows behind it, cursor-paginated -- the escape hatch for "that figure looks wrong, show me
 	// what it was computed from".
-	mux.HandleFunc("GET /api/v1/costs/summary", handleCostSummary(opts.Reports))
-	mux.HandleFunc("GET /api/v1/allocations", handleAllocations(opts.Reports))
+	mux.HandleFunc("GET /api/v1/costs/summary", handleCostSummary(opts.Reports, clusters))
+	mux.HandleFunc("GET /api/v1/allocations", handleAllocations(opts.Reports, clusters))
 
 	// Advice, as distinct from data. The endpoint that says what to CHANGE.
-	mux.HandleFunc("GET /api/v1/recommendations", handleRecommendations(opts.Stats, opts.Recommender))
+	mux.HandleFunc("GET /api/v1/recommendations", handleRecommendations(opts.Stats, opts.Recommender, clusters))
 
 	// History. /trend is cost THROUGH TIME, served from the daily rollup -- the same question
 	// /costs/summary answers for a single period, asked repeatedly. /reports/monthly is the frozen
 	// statement, which is a different thing again: not "what is true now" but "what did we say".
-	mux.HandleFunc("GET /api/v1/costs/trend", handleTrend(opts.Trends))
+	mux.HandleFunc("GET /api/v1/costs/trend", handleTrend(opts.Trends, clusters))
 	mux.HandleFunc("GET /api/v1/reports/monthly", handleMonthlyReports(opts.Trends))
 
 	// MIDDLEWARE ORDER IS A CORRECTNESS CONCERN, NOT A STYLE CHOICE.

@@ -204,6 +204,18 @@ export interface paths {
                      *     caller who asked for 10,000 would make them believe they had the whole result set.
                      */
                     limit?: number;
+                    /**
+                     * @description Restrict to one cluster, by the name it reports itself under (`CLUSTER_NAME`). List the
+                     *     available names with `GET /api/v1/clusters`.
+                     *
+                     *     Cluster names are unique across a fleet, so this parameter identifies a cluster on its
+                     *     own. Provider, account and region describe a cluster rather than forming part of its
+                     *     identity.
+                     *
+                     *     Omitting it aggregates across every cluster, which is refused with `409` when they do
+                     *     not all report in the same currency: summing 100 USD and 100 EUR gives 200 of nothing.
+                     */
+                    cluster?: components["parameters"]["Cluster"];
                     namespace?: components["parameters"]["Namespace"];
                     team?: components["parameters"]["Team"];
                     environment?: components["parameters"]["Environment"];
@@ -294,6 +306,18 @@ export interface paths {
                     /** @description Opaque position from a previous response's `next_cursor`. Omit for the first page. */
                     cursor?: string;
                     limit?: number;
+                    /**
+                     * @description Restrict to one cluster, by the name it reports itself under (`CLUSTER_NAME`). List the
+                     *     available names with `GET /api/v1/clusters`.
+                     *
+                     *     Cluster names are unique across a fleet, so this parameter identifies a cluster on its
+                     *     own. Provider, account and region describe a cluster rather than forming part of its
+                     *     identity.
+                     *
+                     *     Omitting it aggregates across every cluster, which is refused with `409` when they do
+                     *     not all report in the same currency: summing 100 USD and 100 EUR gives 200 of nothing.
+                     */
+                    cluster?: components["parameters"]["Cluster"];
                     namespace?: components["parameters"]["Namespace"];
                     team?: components["parameters"]["Team"];
                     environment?: components["parameters"]["Environment"];
@@ -382,6 +406,18 @@ export interface paths {
                      */
                     to?: components["parameters"]["To"];
                     limit?: number;
+                    /**
+                     * @description Restrict to one cluster, by the name it reports itself under (`CLUSTER_NAME`). List the
+                     *     available names with `GET /api/v1/clusters`.
+                     *
+                     *     Cluster names are unique across a fleet, so this parameter identifies a cluster on its
+                     *     own. Provider, account and region describe a cluster rather than forming part of its
+                     *     identity.
+                     *
+                     *     Omitting it aggregates across every cluster, which is refused with `409` when they do
+                     *     not all report in the same currency: summing 100 USD and 100 EUR gives 200 of nothing.
+                     */
+                    cluster?: components["parameters"]["Cluster"];
                     namespace?: components["parameters"]["Namespace"];
                     team?: components["parameters"]["Team"];
                     environment?: components["parameters"]["Environment"];
@@ -479,6 +515,18 @@ export interface paths {
                      *     the range with nothing to say why.
                      */
                     limit?: number;
+                    /**
+                     * @description Restrict to one cluster, by the name it reports itself under (`CLUSTER_NAME`). List the
+                     *     available names with `GET /api/v1/clusters`.
+                     *
+                     *     Cluster names are unique across a fleet, so this parameter identifies a cluster on its
+                     *     own. Provider, account and region describe a cluster rather than forming part of its
+                     *     identity.
+                     *
+                     *     Omitting it aggregates across every cluster, which is refused with `409` when they do
+                     *     not all report in the same currency: summing 100 USD and 100 EUR gives 200 of nothing.
+                     */
+                    cluster?: components["parameters"]["Cluster"];
                     namespace?: components["parameters"]["Namespace"];
                     team?: components["parameters"]["Team"];
                     environment?: components["parameters"]["Environment"];
@@ -643,6 +691,58 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/clusters": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * Clusters reporting into this database
+         * @description The fleet, as recorded in Postgres. Unlike the other inventory endpoints this does NOT read the
+         *     informer cache: informers watch only the cluster this process runs in, whereas the fleet is
+         *     whatever has reported cost data. That distinction is what lets one API serve many clusters.
+         *
+         *     `provider` and `region` are derived from the nodes and may be empty, which means the nodes do
+         *     not agree on one answer -- a cluster spanning two regions has no single region, and naming the
+         *     commonest one would attribute the whole cluster to a region hosting only part of it.
+         *
+         *     Use `currencies` and `aggregatable` to decide whether fleet-wide totals are meaningful. When
+         *     more than one currency is present, the aggregating endpoints refuse an unscoped query with
+         *     `409`.
+         */
+        get: {
+            parameters: {
+                query?: never;
+                header?: never;
+                path?: never;
+                cookie?: never;
+            };
+            requestBody?: never;
+            responses: {
+                /** @description Every known cluster, ordered by name. */
+                200: {
+                    headers: {
+                        [name: string]: unknown;
+                    };
+                    content: {
+                        "application/json": components["schemas"]["ClusterList"];
+                    };
+                };
+                401: components["responses"]["Unauthorized"];
+                429: components["responses"]["RateLimited"];
+                500: components["responses"]["InternalError"];
+            };
+        };
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/namespaces": {
         parameters: {
             query?: never;
@@ -729,6 +829,45 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        ClusterList: {
+            items: components["schemas"]["Cluster"][];
+            count: number;
+            /** @description Every distinct currency in the fleet, sorted. */
+            currencies: string[];
+            /**
+             * @description Whether costs may be summed across the fleet, i.e. whether exactly one currency is
+             *     present. Stated as a boolean as well as a list because it is a rule the server owns and
+             *     every client would otherwise re-derive, differently.
+             */
+            aggregatable: boolean;
+        };
+        Cluster: {
+            /** @example kca-dev */
+            name: string;
+            /**
+             * @description Derived from the scheme of the nodes' providerID. Empty when the nodes disagree.
+             * @example kind
+             */
+            provider: string;
+            /**
+             * @description Derived from the nodes' topology label. Empty when the nodes disagree.
+             * @example ap-south-1
+             */
+            region: string;
+            /** @description Billing account, project or subscription. Configured; empty means not recorded. */
+            account: string;
+            /** @example USD */
+            currency: string;
+            /** Format: date-time */
+            first_seen: string;
+            /**
+             * Format: date-time
+             * @description Last time a collector touched this row. A cluster untouched for hours has a collector that
+             *     has stopped reporting, which is invisible in the cost figures alone -- they simply stop
+             *     growing, which looks identical to a cluster that got cheaper.
+             */
+            last_seen: string;
+        };
         /**
          * @description The envelope every inventory endpoint returns. One component rather than three inline copies:
          *     the three were duplicated, and an audit found they had already drifted -- two of them omitted
@@ -1235,6 +1374,18 @@ export interface components {
          *     Defaults to now. The range may span at most 400 days.
          */
         To: string;
+        /**
+         * @description Restrict to one cluster, by the name it reports itself under (`CLUSTER_NAME`). List the
+         *     available names with `GET /api/v1/clusters`.
+         *
+         *     Cluster names are unique across a fleet, so this parameter identifies a cluster on its
+         *     own. Provider, account and region describe a cluster rather than forming part of its
+         *     identity.
+         *
+         *     Omitting it aggregates across every cluster, which is refused with `409` when they do
+         *     not all report in the same currency: summing 100 USD and 100 EUR gives 200 of nothing.
+         */
+        Cluster: string;
         Namespace: string;
         Team: string;
         Environment: string;

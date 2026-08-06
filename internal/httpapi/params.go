@@ -137,6 +137,7 @@ func filters(q url.Values, v *validationError) postgres.Filters {
 	}
 
 	f := postgres.Filters{
+		Cluster:      get("cluster"),
 		Namespace:    get("namespace"),
 		Team:         get("team"),
 		Environment:  get("environment"),

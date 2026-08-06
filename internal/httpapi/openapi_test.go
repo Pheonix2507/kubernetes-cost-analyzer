@@ -317,7 +317,7 @@ func TestOpenAPISpec_DocumentsEveryRoute(t *testing.T) {
 	// the mux would drift in lockstep with the router and prove nothing.
 	routes := []string{
 		"/healthz", "/readyz", "/version",
-		"/api/v1/nodes", "/api/v1/namespaces", "/api/v1/pods",
+		"/api/v1/clusters", "/api/v1/nodes", "/api/v1/namespaces", "/api/v1/pods",
 		"/api/v1/costs/summary", "/api/v1/allocations", "/api/v1/recommendations",
 		"/api/v1/costs/trend", "/api/v1/reports/monthly",
 	}

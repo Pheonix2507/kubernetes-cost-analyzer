@@ -76,11 +76,25 @@ type trendComparison struct {
 }
 
 // handleTrend serves GET /api/v1/costs/trend.
-func handleTrend(trends Trends) http.HandlerFunc {
+func handleTrend(trends Trends, clusters Clusters) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		params, compare, verr := trendParams(r)
 		if verr != nil {
 			writeValidationError(w, r, verr)
+			return
+		}
+
+		// Refuse a response that would mix currencies. The rule the API keeps is simple and
+		// explainable: no single response returns money in more than one currency, because no
+		// response carries a per-row currency, so a client has no way to tell them apart. When
+		// rows gain a currency of their own, this can be relaxed for the listing endpoints.
+		if status, cerr := guardCurrency(r.Context(), clusters, params.Filters.Cluster); cerr != nil {
+			if status == http.StatusConflict {
+				writeError(w, r, status, "mixed_currencies", cerr.Error())
+			} else {
+				logError(r, "checking fleet currencies", cerr)
+				writeError(w, r, status, "internal_error", "could not check fleet currencies")
+			}
 			return
 		}
 

@@ -221,6 +221,7 @@ func run() error {
 	// implementation: each handler declares only what it needs, and there is still one place that
 	// knows how to talk to the database.
 	reportRepo := postgres.NewReportRepository(db.Pool())
+	clusterRepo := postgres.NewClusterRepository(db.Pool())
 	// A SECOND repository, not a wider first one. RollupRepository reads
 	// container_allocations_daily and monthly_reports; nothing served by reportRepo touches either.
 	// Folding them together would make every existing handler depend on tables it never reads, and
@@ -240,6 +241,7 @@ func run() error {
 		Inventory: store,
 		Pricer:    pricer,
 		Reports:   reportRepo,
+		Clusters:  clusterRepo,
 		Stats:     reportRepo,
 		// The SAME pool, a different repository. The trend endpoint reads container_allocations_daily
 		// and monthly_reports, which no other handler touches -- so it gets its own repository rather

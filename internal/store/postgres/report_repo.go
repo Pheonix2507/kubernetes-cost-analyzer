@@ -149,6 +149,22 @@ func SortFieldOptions() []string {
 // join. That is the payoff for the denormalisation decision in Phase 2: the dashboard's main
 // query touches one table.
 type Filters struct {
+	// Cluster scopes a query to one cluster, and it is listed first because it is the broadest
+	// scope: every other filter narrows within a cluster, never across them.
+	//
+	// WHY THERE IS NO INDEX LEADING WITH cluster_name ON THE FACT TABLE
+	// ---------------------------------------------------------------
+	// Every existing index leads with namespace_name, team, workload or node. Adding
+	// (cluster_name, ...) variants is the obvious next step and is deliberately NOT taken yet:
+	// with a single cluster the predicate matches 100% of rows, so an index on it can only cost
+	// write throughput on the hottest table in the schema while saving nothing.
+	//
+	// The trigger for revisiting it is concrete rather than a feeling: when a second cluster's
+	// data lands and EXPLAIN shows a cluster-scoped query reading substantially more rows than it
+	// returns. At that point the right change is probably to make cluster_name the LEADING column
+	// of the existing composites rather than to add new indexes beside them, since in a fleet
+	// every query is cluster-scoped and a scan of one cluster's namespaces is the common case.
+	Cluster      string
 	Namespace    string
 	Team         string
 	Environment  string
@@ -165,6 +181,7 @@ type Filters struct {
 
 // filterColumns maps each filter to its column. Fixed strings, never caller input.
 var filterColumns = map[string]string{
+	"cluster":       "cluster_name",
 	"namespace":     "namespace_name",
 	"team":          "team",
 	"environment":   "environment",
@@ -193,6 +210,7 @@ func FilterOptions() []string {
 // shaped query whose predicates happen to be listed differently.
 func (f Filters) values() [][2]string {
 	pairs := [][2]string{
+		{"cluster", f.Cluster},
 		{"namespace", f.Namespace},
 		{"team", f.Team},
 		{"environment", f.Environment},
