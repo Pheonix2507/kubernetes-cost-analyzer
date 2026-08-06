@@ -74,12 +74,12 @@ func (d Date) After(other Date) bool { return d.Time().After(other.Time()) }
 // Before reports whether d is earlier than other.
 func (d Date) Before(other Date) bool { return d.Time().Before(other.Time()) }
 
-// Equal reports whether d is the same calendar day as other.
+// No Equal method, deliberately -- an audit removed one written here with no caller.
 //
-// Provided so callers never reach for == on the struct. It works today because every field is
-// comparable, and it would silently stop working the moment a field is added -- so the method exists
-// to make the comparison a decision rather than a coincidence of the struct's layout.
-func (d Date) Equal(other Date) bool { return d == other }
+// The argument for it was that == on the struct works only by coincidence of its layout. True, and
+// still not a reason to ship a method nothing calls: an unused method is untested by construction, and
+// the first caller would be the one to discover whether it does what the doc comment claims. Add it
+// with its first real use, and a test.
 
 // AddDays returns the date n days later.
 func (d Date) AddDays(n int) Date { return DayOf(d.Time().AddDate(0, 0, n)) }

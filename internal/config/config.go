@@ -64,6 +64,13 @@ const (
 	EnvProduction  Environment = "production"
 )
 
+// defaultClusterName is the development placeholder for CLUSTER_NAME.
+//
+// A named constant rather than a literal, and that is the whole reason it exists: "is this still the
+// placeholder?" is a question Validate has to be able to ask, and the same string written in the loader
+// and in the validator is two places for them to drift apart.
+const defaultClusterName = "default"
+
 // Config is the fully validated configuration for every binary in this project.
 //
 // It is grouped into nested structs rather than being one flat list of thirty
@@ -75,6 +82,9 @@ type Config struct {
 	Env      Environment
 	LogLevel string
 
+	// ClusterName names the cluster on every fact row. See defaultClusterName for why production must
+	// set it explicitly.
+	//
 	// ClusterName is denormalised onto every fact row, so it must be stable for the life of
 	// the cluster: changing it makes yesterday's rows look like they belong to a different
 	// cluster, and a report grouping by cluster would show one estate as two.
@@ -243,7 +253,7 @@ func Load() (*Config, error) {
 	cfg := &Config{
 		Env:         Environment(l.str("APP_ENV", string(EnvDevelopment))),
 		LogLevel:    l.str("LOG_LEVEL", "info"),
-		ClusterName: l.str("CLUSTER_NAME", "default"),
+		ClusterName: l.str("CLUSTER_NAME", defaultClusterName),
 
 		API: API{
 			Addr:            l.str("API_HTTP_ADDR", ":8080"),
@@ -444,6 +454,29 @@ func (c *Config) Validate() error {
 
 	if strings.TrimSpace(c.ClusterName) == "" {
 		errs = append(errs, fmt.Errorf("CLUSTER_NAME: %w (must not be blank; it is stored on every cost row)", ErrInvalid))
+	}
+	// PRODUCTION MUST NAME ITS CLUSTER, and an audit is why this check exists.
+	//
+	// The default is the placeholder "default", and validation only rejected BLANK -- so a deployment
+	// that simply never set the variable passed every check and wrote 74,925 rows attributed to a
+	// cluster called "default". The monthly statements read "cluster/default", which is not a name
+	// anybody would recognise as their estate.
+	//
+	// Why it is worth failing startup over rather than warning. Migration 000001 states the rule:
+	// cluster_name is denormalised onto every fact row and must be stable for the life of the cluster,
+	// because changing it makes yesterday's rows look like they belong to a different cluster and a
+	// report grouped by cluster shows one estate as two. So the placeholder is not merely untidy -- it
+	// is a value someone will eventually correct, and correcting it splits history permanently.
+	//
+	// Phase 11 makes it worse rather than better: two real clusters that both defaulted would MERGE
+	// into one, silently summing unrelated spend. A wrong total is worse than a refused startup.
+	//
+	// Development keeps the default so `make run-api` needs no ceremony, exactly as with API_KEYS, and
+	// the collector logs the effective name at startup so it is never a silent choice.
+	if c.IsProduction() && strings.TrimSpace(c.ClusterName) == defaultClusterName {
+		errs = append(errs, fmt.Errorf("CLUSTER_NAME: %w (must be set explicitly when APP_ENV=production; "+
+			"it is denormalised onto every cost row, and %q is a placeholder that splits history the day "+
+			"somebody corrects it)", ErrRequired, defaultClusterName))
 	}
 	if strings.TrimSpace(c.Pricing.CataloguePath) == "" {
 		errs = append(errs, fmt.Errorf("PRICING_CATALOGUE_PATH: %w (must not be blank)", ErrInvalid))

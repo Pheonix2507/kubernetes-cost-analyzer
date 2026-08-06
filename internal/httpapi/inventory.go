@@ -36,30 +36,75 @@ type Inventory interface {
 // Returning `[{...},{...}]` works until the first time you need to add anything
 // alongside the data -- a total count, a pagination cursor, a warning that one
 // informer is stale. At that point the response shape must change from array to
-// object, which breaks every existing client. An envelope costs six characters now and
-// makes Phase 5's pagination a purely additive change.
+// object, which breaks every existing client. An envelope costs six characters now.
+//
+// THAT PREDICTION PAID OFF, though later and differently than expected. Phase 5 added cursor
+// pagination to /allocations and left these three endpoints alone -- so an audit in Phase 7 found them
+// still unbounded, and adding `total` and `truncated` was a purely additive change to a shape clients
+// already parsed. The envelope earned its keep; the claim that Phase 5 would use it here did not.
 //
 // Generic over T so nodes, namespaces and pods share one shape without three near
 // identical structs. This is the case generics are genuinely for: the container's
 // behaviour is identical and only the element type differs.
 type listResponse[T any] struct {
 	Items []T `json:"items"`
-	// Count is the number of items in THIS response. Once Phase 5 adds pagination it
-	// will be joined by a separate total, and the distinction will matter -- so the
-	// name is deliberately not "total".
+	// Count is the number of items in THIS response, which is why the name is deliberately not
+	// "total" -- Total below is the figure before truncation.
 	Count int `json:"count"`
+	// Total is how many items existed before the limit was applied.
+	Total int `json:"total"`
+	// Truncated says the response is incomplete.
+	//
+	// SURFACED RATHER THAN SILENT, for the same reason the cost endpoints refuse an over-large limit
+	// rather than clamping it: a caller who receives 500 of 5,000 pods and is not told will treat the
+	// 500 as the whole cluster. A boolean is cheap; a silently partial inventory is a wrong answer that
+	// looks exactly like a right one.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
-// newListResponse guarantees Items is never nil.
+// maxInventoryItems bounds an inventory response.
+//
+// WHY THIS EXISTS -- AN AUDIT FINDING, NOT A PRECAUTION
+// ----------------------------------------------------
+// These three endpoints were completely unbounded. Measured against the live cluster: 950 bytes per
+// pod, and writeJSON BUFFERS the entire response before writing a byte (deliberately -- see respond.go
+// -- so a serialisation failure cannot produce a half-written 200). At 5,000 pods that is 4.5 MiB
+// allocated per request, and the rate limiter's burst allows many concurrently.
+//
+// The contradiction is what makes it a finding rather than a nitpick. params.go already argues, about
+// the cost endpoints, that an unbounded range is "a denial of service a single curl can trigger", and
+// caps them at 400 days and 1,000 rows. The inventory endpoints -- older, and written before that
+// reasoning existed -- were left open. A principle applied to some endpoints and not others is not a
+// principle, it is a habit that stopped.
+//
+// 500 rather than the cost endpoints' 1,000: an inventory item is far larger than an aggregate row, so
+// 500 pods is roughly the same number of BYTES as 1,000 summary rows. The limit that matters is the
+// response size, not the row count.
+const maxInventoryItems = 500
+
+// newListResponse guarantees Items is never nil and bounds the response.
 //
 // A nil slice marshals to JSON `null`, not `[]`, and `null.length` throws in
 // JavaScript. The frontend would need a defensive check on every list it renders,
 // forever, because of a Go representation detail. Fix it once, here.
+//
+// TRUNCATION IS APPLIED HERE rather than in each handler, so a future list endpoint cannot forget it.
+// The three current callers all route through this constructor, which is the only reason a single
+// change fixed all three.
 func newListResponse[T any](items []T) listResponse[T] {
 	if items == nil {
 		items = []T{}
 	}
-	return listResponse[T]{Items: items, Count: len(items)}
+	total := len(items)
+	truncated := false
+	if total > maxInventoryItems {
+		// The informer's listers already return sorted results, so a truncated page is the first N in
+		// a stable order rather than an arbitrary subset. Without that this would be non-deterministic
+		// and two identical requests could return different pods.
+		items = items[:maxInventoryItems]
+		truncated = true
+	}
+	return listResponse[T]{Items: items, Count: len(items), Total: total, Truncated: truncated}
 }
 
 // nodeRates is the pricing attached to a node in the API response.

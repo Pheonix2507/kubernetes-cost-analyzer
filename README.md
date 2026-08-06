@@ -381,6 +381,48 @@ for $1.26 a month. The rule read `count(DISTINCT pod_name) = 3` without asking *
 three. The gate is an **allow-list** of kinds, so an unknown CRD defaults to silence rather than to
 confident advice about someone else's resource.
 
+## What the last audit found
+
+Phase 7 closed with a repo-wide audit. Ten findings, each one either fixed or explicitly deferred with
+a reason. The three worth reading:
+
+**The tested code was not the code that ran.** `internal/rollup` had a `RollupYesterday` method with an
+injectable clock and two thorough tests covering month boundaries and leap years. Nothing called it —
+`cmd/rollup` computed yesterday itself, in a `resolveRange` function with five branches, two direct
+`time.Now()` calls, and no tests at all. A green suite describing a path production never takes is worse
+than no suite, because it is evidence about the wrong thing. And it was exactly the failure that
+binary's own doc comment argues against: two code paths for one computation. The duplicate is deleted,
+the clock is injected, and the tests now cover the function that executes.
+
+**Three endpoints were unbounded.** `/pods`, `/nodes` and `/namespaces` had no limit. Measured at 950
+bytes per pod, and `writeJSON` buffers the whole response before writing a byte, so a 5,000-pod cluster
+meant 4.5 MiB allocated per request with the rate limiter's burst allowing several at once. What makes
+it a finding rather than a nitpick is the contradiction: this repo already argues, about the cost
+endpoints, that an unbounded range is "a denial of service a single curl can trigger", and caps them at
+400 days and 1,000 rows. These three were written earlier and never revisited. A principle applied to
+some endpoints and not others is a habit that stopped.
+
+**A drift test was enforcing the lie it existed to prevent.** The OpenAPI spec documented `/version` as
+requiring no authentication. The code authenticated it. The drift test asserted the spec matched a list
+of paths *written inside the test* — so the test and the spec agreed with each other and both disagreed
+with the implementation. Proven by running with auth enabled: probes 200, `/version` 401. The test now
+compares against `middleware.UnauthenticatedPaths()`, so the code is the single source of truth and
+adding an exemption without documenting it fails the build.
+
+Also fixed: a migration that added a `NOT VALID` constraint and never validated it, leaving it invisible
+to the planner on all 26 partitions; `CLUSTER_NAME` silently defaulting to the placeholder `default`,
+which had attributed all 74,925 rows to a cluster nobody would recognise and which Phase 11 would have
+merged with a second cluster doing the same; two indexes nothing reads; a filter allow-list with no
+drift protection despite a function whose comment claimed to provide it; and three false predictions
+about what later phases would need.
+
+Two things were investigated and are **not** bugs, recorded so the next audit does not re-litigate them.
+`pods` shows 77,091 sequential scans against 599 inserts — that is the foreign-key check on a 3-page
+table, where Postgres correctly prefers a scan to an index. And the daily rollup's team and workload
+indexes report zero scans, which means nothing at 256 rows: an index cannot demonstrate its value below
+the volume where the planner would consider it, and dropping one on that evidence would be reading
+noise as signal.
+
 ## Rollups: making history affordable
 
 **The problem, measured before writing anything.** 74,925 fact rows over 8 days of a 23-container

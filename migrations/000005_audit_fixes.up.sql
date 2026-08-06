@@ -1,0 +1,81 @@
+-- Two audit findings: an unfinished migration, and two indexes nothing reads.
+--
+-- Both were found by asking the database rather than by reading the code, which is the point worth
+-- taking from this file. `SELECT ... FROM pg_constraint WHERE NOT convalidated` and
+-- `pg_stat_user_indexes WHERE idx_scan = 0` are two queries that report on the schema as it actually
+-- is, and neither fact is visible in a diff.
+
+-- ============================================================================
+-- 1. FINISH MIGRATION 000003
+-- ============================================================================
+--
+-- 000003 added container_allocations_max_at_least_avg as NOT VALID, which was the right first step:
+-- it skips the check for existing rows, so the ALTER takes a brief lock and returns immediately even
+-- on a large table. New rows are still checked.
+--
+-- It was never followed by the second step, and the audit found the constraint NOT VALID on all 26
+-- partitions plus the parent -- permanently, because nothing in the repo would ever validate it.
+--
+-- WHAT THAT ACTUALLY COSTS. Not correctness of new writes: those are checked either way. Two things:
+--
+--   - The pre-000003 rows are never verified. They all hold max = 0, which the constraint explicitly
+--     tolerates, so there is no hidden violation -- but "we believe there is no violation" and "the
+--     database has confirmed it" are different statements, and only one of them survives someone
+--     later backfilling the peak columns.
+--   - A NOT VALID constraint is INVISIBLE TO THE PLANNER. Postgres will not use it to prove anything,
+--     so it cannot inform constraint exclusion or eliminate a redundant check. A validated constraint
+--     is a fact the optimiser can use; an unvalidated one is only a trigger.
+--
+-- VALIDATE CONSTRAINT takes SHARE UPDATE EXCLUSIVE, not ACCESS EXCLUSIVE: it permits concurrent
+-- SELECT, INSERT, UPDATE and DELETE, and blocks only DDL and VACUUM FULL. That is precisely why the
+-- two-step pattern exists -- the expensive scan happens without blocking traffic. Doing it in a
+-- separate migration from the ADD is the pattern working as intended rather than a correction.
+--
+-- Validating the PARENT cascades to every partition, so this is one statement rather than 26.
+ALTER TABLE container_allocations VALIDATE CONSTRAINT container_allocations_max_at_least_avg;
+
+-- ============================================================================
+-- 2. DROP TWO INDEXES NOTHING READS
+-- ============================================================================
+--
+-- pg_stat_user_indexes reported zero scans for both since the statistics were last reset. Zero scans
+-- is only evidence when you know WHY, so each was checked rather than swept:
+--
+--   namespaces_labels_idx  GIN (labels jsonb_path_ops), 24 kB
+--       No query anywhere reads namespaces.labels. Not one -- the API serves namespace labels from the
+--       informer cache, and every cost query reads the denormalised team/environment/cost_centre
+--       columns off the fact table. This index has never had a caller and none is planned.
+--
+--       GIN is the expensive case to leave lying around: it is maintained on every namespace upsert,
+--       and jsonb_path_ops builds an entry per path in the document. The labels column stays -- the
+--       full label set is genuinely worth recording, and it is what a future "namespaces matching
+--       label x=y" feature would read. The INDEX can come back in the commit that adds that query.
+--
+--   namespaces_team_idx  btree (cluster_id, team) WHERE team <> ''
+--       Team is a cost-allocation dimension, and every query that groups or filters by it reads
+--       team off container_allocations, where it is denormalised precisely so no join is needed. This
+--       index anticipated a lookup that the star schema was designed to avoid.
+--
+-- This is the same discipline the RBAC audit applied: least privilege means what is needed NOW, and a
+-- second review when the need arrives is the point rather than a cost to avoid. An index nothing reads
+-- is a write cost with no reader, and "we might query that one day" is not a reader.
+DROP INDEX IF EXISTS namespaces_labels_idx;
+DROP INDEX IF EXISTS namespaces_team_idx;
+
+-- WHAT IS DELIBERATELY KEPT, so the next audit does not re-litigate it.
+--
+-- pods_namespace_idx, pods_node_idx and pods_workload_idx also report zero scans, and they stay.
+-- They index the REFERENCING side of a foreign key, and that matters for DELETES rather than for
+-- SELECTs: removing a namespace requires finding every pod that references it, which without an index
+-- is a sequential scan of the pods table. Nothing deletes dimension rows today, so the scans are
+-- genuinely zero -- but the retention and cleanup work in a later phase is exactly the caller, and
+-- these are 16 kB each on a table taking a few hundred writes per collection cycle rather than the
+-- fact table's thousands. The trade is not close enough to justify removing them.
+--
+-- The daily rollup's team and workload indexes also report zero scans, and that figure means nothing
+-- yet: the table holds 256 rows, so Postgres correctly prefers a sequential scan for every query. An
+-- index cannot demonstrate its value below the volume where the planner would consider it, and
+-- dropping one on that evidence would be reading noise as signal. Revisit when the rollup passes
+-- roughly a hundred thousand rows.
+COMMENT ON INDEX pods_namespace_idx IS
+    'For DELETE cascade lookups, not SELECTs. Zero scans is expected until retention work exists.';

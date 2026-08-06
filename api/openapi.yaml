@@ -109,7 +109,14 @@ paths:
     get:
       tags: [operations]
       summary: Which build is running
-      security: []
+      description: |
+        **Requires authentication**, unlike the probes. An audit found this documented as `security: []`
+        while the server returned 401 for it -- the spec was wrong, not the code.
+
+        The probe exemption exists because the kubelet cannot present a credential and a 401 on a probe
+        kills the container. Nothing probes `/version`, so it gains nothing from being open, and build
+        version and commit are precisely what an attacker fingerprints to find known CVEs in a
+        dependency tree.
       responses:
         "200":
           description: Build metadata injected at link time.
@@ -460,16 +467,17 @@ paths:
         endpoint useless; omitting it silently would hide capacity that exists and costs money.
       responses:
         "200":
-          description: Every node.
+          description: Every node, up to the response limit.
           content:
             application/json:
               schema:
-                type: object
-                properties:
-                  items:
-                    type: array
-                    items: { $ref: "#/components/schemas/Node" }
-                  count: { type: integer }
+                allOf:
+                  - $ref: "#/components/schemas/InventoryList"
+                  - type: object
+                    properties:
+                      items:
+                        type: array
+                        items: { $ref: "#/components/schemas/Node" }
         "401": { $ref: "#/components/responses/Unauthorized" }
         "429": { $ref: "#/components/responses/RateLimited" }
         "500": { $ref: "#/components/responses/InternalError" }
@@ -480,15 +488,16 @@ paths:
       summary: Namespaces and their cost-allocation dimensions
       responses:
         "200":
-          description: Every namespace.
+          description: Every namespace, up to the response limit.
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  items: { type: array, items: { type: object } }
-                  count: { type: integer }
+              schema: { $ref: "#/components/schemas/InventoryList" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        # 429 and 500 were undocumented here and on /pods while /nodes listed them, though all three
+        # share one middleware chain and one handler shape. An audit found the asymmetry: a client
+        # generated from the spec would have had no branch for a rate-limited namespace listing.
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
 
   /api/v1/pods:
     get:
@@ -501,16 +510,14 @@ paths:
           schema: { type: string }
       responses:
         "200":
-          description: Matching pods.
+          description: Matching pods, up to the response limit.
           content:
             application/json:
-              schema:
-                type: object
-                properties:
-                  items: { type: array, items: { type: object } }
-                  count: { type: integer }
+              schema: { $ref: "#/components/schemas/InventoryList" }
         "400": { $ref: "#/components/responses/ValidationError" }
         "401": { $ref: "#/components/responses/Unauthorized" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+        "500": { $ref: "#/components/responses/InternalError" }
 
 components:
   securitySchemes:
@@ -574,6 +581,35 @@ components:
       schema: { type: boolean, default: false }
 
   schemas:
+    InventoryList:
+      type: object
+      required: [items, count, total]
+      description: |
+        The envelope every inventory endpoint returns. One component rather than three inline copies:
+        the three were duplicated, and an audit found they had already drifted -- two of them omitted
+        the truncation fields and two omitted their 429 and 500 responses.
+      properties:
+        items:
+          type: array
+          items: { type: object }
+        count:
+          type: integer
+          description: Items in THIS response. Equals `total` unless the response was truncated.
+        total:
+          type: integer
+          description: |
+            How many items existed BEFORE the limit was applied. Read this against `count`: a caller
+            given 500 of 5,000 and not told would treat the 500 as the whole cluster.
+        truncated:
+          type: boolean
+          description: |
+            Present and true only when the response is incomplete. These endpoints were unbounded until
+            a Phase 7 audit: at a measured 950 bytes per pod, and with the response buffered before
+            writing, a 5,000-pod cluster meant 4.5 MiB allocated per request.
+
+            Truncation keeps the first N of a stable order -- the informer's listers sort -- so two
+            identical requests agree rather than returning different subsets.
+
     Money:
       type: string
       description: |

@@ -147,7 +147,9 @@ func run() error {
 	store := postgres.NewTxRollupStore(db.Pool())
 	job := rollup.NewJob(store, log)
 
-	from, to, err := resolveRange(opts, job)
+	// The clock is passed in rather than read inside, so the branch that decides WHICH DAY a scheduled
+	// run processes is testable. UTC, because the rollup grain is a UTC calendar day.
+	from, to, err := resolveRange(opts, time.Now().UTC())
 	if err != nil {
 		return err
 	}
@@ -196,7 +198,21 @@ func run() error {
 // The precedence is -all, then -month, then -from/-to, then yesterday. Ordered from widest to
 // narrowest so a combination cannot silently do less than the operator asked for: -all -from X does
 // everything rather than one day.
-func resolveRange(opts options, job *rollup.Job) (from, to postgres.Date, err error) {
+//
+// TAKES `now` RATHER THAN CALLING time.Now, and an audit is the reason.
+//
+// This function is the entry point for every invocation of this binary and has five branches, and it
+// had no tests -- because two branches called time.Now directly, so testing "the default is yesterday"
+// meant changing the system clock. Meanwhile internal/rollup had a RollupYesterday method with an
+// injectable clock and two thorough tests, and NOTHING CALLED IT: main computed yesterday itself, here.
+//
+// So the tested code was not the code that ran, and the code that ran was untested. That is worse than
+// having neither, because the green test suite was evidence about a path production never takes. It was
+// also precisely the failure this binary's own doc comment argues against -- two code paths for one
+// computation, which eventually disagree.
+//
+// RollupYesterday is deleted and its tests moved here, onto the path that actually executes.
+func resolveRange(opts options, now time.Time) (from, to postgres.Date, err error) {
 	switch {
 	case opts.all:
 		earliest, perr := time.Parse("2006-01-02", earliestBackfill)
@@ -206,7 +222,7 @@ func resolveRange(opts options, job *rollup.Job) (from, to postgres.Date, err er
 		// Today as the upper bound rather than yesterday: -all is an explicit catch-up, so including a
 		// partial today is what the operator asked for. The nightly run will replace it tomorrow,
 		// which is safe precisely because the rollup is a projection rather than an accumulation.
-		return postgres.DayOf(earliest), postgres.DayOf(time.Now()), nil
+		return postgres.DayOf(earliest), postgres.DayOf(now), nil
 
 	case opts.month != "":
 		month, perr := postgres.ParseMonth(opts.month)
@@ -235,8 +251,11 @@ func resolveRange(opts options, job *rollup.Job) (from, to postgres.Date, err er
 		return from, to, errors.New("-to requires -from")
 
 	default:
-		// Yesterday. The scheduled default, and the only complete day at the time a nightly run fires.
-		y := postgres.DayOf(time.Now().UTC()).AddDays(-1)
+		// YESTERDAY, NEVER TODAY. The scheduled default, and the only complete day when a nightly run
+		// fires. Rolling up a day still in progress writes a figure correct for the hours so far and
+		// wrong for the day -- and because the rollup is a projection the next run replaces it, so the
+		// value flickers instead of converging.
+		y := postgres.DayOf(now).AddDays(-1)
 		return y, y, nil
 	}
 }

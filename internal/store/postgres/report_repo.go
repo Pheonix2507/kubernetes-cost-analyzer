@@ -43,7 +43,7 @@ func NewReportRepository(db Querier) *ReportRepository {
 //
 // So the request carries a symbolic name, this package maps it to columns it owns, and an
 // unrecognised name is a 400 rather than a query. The user's string never reaches the SQL.
-// Same reasoning as InventoryRepository.CountRows.
+// The same reasoning applies to every identifier interpolated into SQL in this package.
 type GroupBy string
 
 // The dimensions cost may be grouped by.

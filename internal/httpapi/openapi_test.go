@@ -9,6 +9,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi/middleware"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
 )
@@ -233,6 +234,69 @@ func TestOpenAPISpec_MonthlyScopesMatchTheCode(t *testing.T) {
 	assertSameSet(t, got, want, "the response enum must match the request enum and the constraint")
 }
 
+// TestOpenAPISpec_FiltersMatchTheAllowList closes the one drift gap the audit found.
+//
+// group_by, sort, interval and the recommendation enums all had drift tests. FILTERS did not -- despite
+// report_repo.go carrying a FilterOptions() function whose doc comment says it exists "for the OpenAPI
+// spec". Nothing called it. So the function had a stated purpose it did not serve, and the nine filter
+// parameters were documented entirely by hand with no protection at all.
+//
+// That is the worst-covered case rather than the least important one. Filters are the parameters most
+// likely to grow: adding a `zone` filter means adding it to filterColumns, and without this test the
+// spec would simply not mention it, so no client would ever discover it existed.
+//
+// Compared against the parameter components' `name:` fields rather than the component KEYS, because the
+// key is a PascalCase label of our choosing while `name` is the actual query parameter a client sends.
+// Asserting on the label would let the spec document a component called Namespace whose name was
+// "namesapce" and still pass.
+func TestOpenAPISpec_FiltersMatchTheAllowList(t *testing.T) {
+	t.Parallel()
+
+	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
+	if err != nil {
+		t.Fatalf("cannot read the spec: %v", err)
+	}
+	var spec map[string]any
+	if err := yaml.Unmarshal(raw, &spec); err != nil {
+		t.Fatalf("invalid YAML: %v", err)
+	}
+
+	params, ok := navigate(t, spec, "components", "parameters").(map[string]any)
+	if !ok {
+		t.Fatal("the spec has no components.parameters map")
+	}
+
+	// Every query parameter the spec defines as a reusable component.
+	documented := map[string]bool{}
+	for _, node := range params {
+		def, ok := node.(map[string]any)
+		if !ok {
+			continue
+		}
+		name, hasName := def["name"].(string)
+		in, hasIn := def["in"].(string)
+		if hasName && hasIn && in == "query" {
+			documented[name] = true
+		}
+	}
+
+	// Every filter the repository will actually accept must be documented.
+	for _, filter := range postgres.FilterOptions() {
+		if !documented[filter] {
+			t.Errorf("filter %q is accepted by the query builder but has no documented parameter.\n"+
+				"An undocumented filter is one no client can discover, so the feature exists and "+
+				"nobody uses it", filter)
+		}
+	}
+
+	// estimated_only is a filter too -- it lives on the Filters struct as a bool rather than in
+	// filterColumns, because it maps to a predicate rather than a column comparison. Checked explicitly
+	// so the asymmetry is deliberate rather than an omission nobody noticed.
+	if !documented["estimated_only"] {
+		t.Error("estimated_only is accepted but not documented")
+	}
+}
+
 // TestOpenAPISpec_DocumentsEveryRoute catches the commonest drift: a route added to the router and
 // never written down. An undocumented endpoint is one no client can discover and nobody maintains.
 func TestOpenAPISpec_DocumentsEveryRoute(t *testing.T) {
@@ -269,10 +333,19 @@ func TestOpenAPISpec_DocumentsEveryRoute(t *testing.T) {
 	}
 }
 
-// TestOpenAPISpec_ProbesAreUnauthenticated asserts the spec records the security exemption. The
-// kubelet cannot present a credential, so a spec claiming probes need auth would mislead anyone
-// writing a Deployment.
-func TestOpenAPISpec_ProbesAreUnauthenticated(t *testing.T) {
+// TestOpenAPISpec_UnauthenticatedPathsMatchTheCode asserts the spec's security overrides against the
+// middleware's ACTUAL exempt map, not against a list written here.
+//
+// THE BUG THIS REPLACES. The previous version of this test carried its own list of
+// {/healthz, /readyz, /version} and checked the spec matched it. The spec did match -- and the code did
+// not. middleware.unauthenticatedPaths contains only the two probes, so with auth enabled /healthz and
+// /readyz answered 200 while /version answered 401, exactly as the spec said it would not.
+//
+// The test and the spec agreed with each other and both disagreed with the implementation. A drift test
+// that owns its own copy of the expected value is not a drift test; it is a second place for the same
+// mistake to live. Comparing against the exported function makes the code the single source of truth,
+// so adding a path to the exemption without documenting it fails here.
+func TestOpenAPISpec_UnauthenticatedPathsMatchTheCode(t *testing.T) {
 	t.Parallel()
 
 	raw, err := os.ReadFile(filepath.Join("..", "..", "api", "openapi.yaml"))
@@ -284,22 +357,36 @@ func TestOpenAPISpec_ProbesAreUnauthenticated(t *testing.T) {
 		t.Fatalf("invalid YAML: %v", err)
 	}
 
-	for _, probe := range []string{"/healthz", "/readyz", "/version"} {
-		get, ok := navigate(t, spec, "paths", probe, "get").(map[string]any)
+	paths, ok := spec["paths"].(map[string]any)
+	if !ok {
+		t.Fatal("the spec has no paths map")
+	}
+
+	// Every path the spec marks `security: []`.
+	documented := []string{}
+	for path, node := range paths {
+		ops, ok := node.(map[string]any)
 		if !ok {
-			t.Fatalf("%s has no get operation", probe)
+			continue
+		}
+		get, ok := ops["get"].(map[string]any)
+		if !ok {
+			continue
 		}
 		sec, present := get["security"]
 		if !present {
-			t.Errorf("%s does not override security; it would inherit the global bearerAuth "+
-				"requirement, which the kubelet cannot satisfy", probe)
 			continue
 		}
 		list, ok := sec.([]any)
-		if !ok || len(list) != 0 {
-			t.Errorf("%s security = %v, want an empty list meaning no authentication", probe, sec)
+		if ok && len(list) == 0 {
+			documented = append(documented, path)
 		}
 	}
+
+	assertSameSet(t, documented, middleware.UnauthenticatedPaths(),
+		"a path the spec marks security:[] but the code authenticates returns a 401 no client could "+
+			"have predicted -- and a path the code exempts but the spec omits is an undocumented hole "+
+			"in authentication AND rate limiting")
 }
 
 // navigate walks a nested map by key, failing the test with the path so far on a miss.

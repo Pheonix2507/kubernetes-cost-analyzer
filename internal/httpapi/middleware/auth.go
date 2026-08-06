@@ -5,6 +5,7 @@ import (
 	"crypto/subtle"
 	"log/slog"
 	"net/http"
+	"sort"
 	"strings"
 )
 
@@ -23,9 +24,38 @@ const APIKeyHeader = "X-API-Key"
 // readiness returns dependency names and statuses. Note the reasoning is "they leak nothing", NOT
 // "they are internal" -- /readyz does include error strings, which is why internal/health documents
 // that it must never be exposed through a public ingress.
+//
+// /version IS NOT HERE, and an audit found the OpenAPI spec claimed otherwise -- it documented
+// /version as overriding security while the code returned 401 for it. Proven with auth enabled:
+// /healthz and /readyz answered 200, /version answered 401.
+//
+// The code is right and the spec was wrong, for two reasons. The kubelet does not probe /version, so
+// nothing operationally requires it to be open -- and the exemption is justified by operational
+// NECESSITY plus "leaks nothing", not by either alone. And build version and commit are exactly what
+// an attacker fingerprints to look up known CVEs in our dependency tree, so it is the one endpoint
+// here where being closed has a concrete benefit.
+//
+// UnauthenticatedPaths below exists so the spec is checked against THIS map rather than against a
+// hand-written copy in a test. That was the actual defect: the drift test asserted a list of its own,
+// so the test and the spec agreed with each other and both disagreed with the code.
 var unauthenticatedPaths = map[string]struct{}{
 	"/healthz": {},
 	"/readyz":  {},
+}
+
+// UnauthenticatedPaths returns the exempt paths, sorted.
+//
+// Exported for one reason: this map is the single most security-sensitive line in the package. Adding
+// an entry silently disables authentication AND rate limiting for that path, and nothing about the
+// diff would look alarming -- so the openapi drift test and a dedicated middleware test both assert
+// against this function rather than against their own copies of the list.
+func UnauthenticatedPaths() []string {
+	out := make([]string, 0, len(unauthenticatedPaths))
+	for p := range unauthenticatedPaths {
+		out = append(out, p)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // APIKeyAuth requires a valid key on every request outside unauthenticatedPaths.

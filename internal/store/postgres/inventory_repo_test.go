@@ -100,7 +100,7 @@ func TestUpsert_IsIdempotent(t *testing.T) {
 
 	// And exactly one row of each -- COUNTED WITHIN THIS TEST'S OWN CLUSTER.
 	//
-	// An earlier version used CountRows, which counts the WHOLE table. This test runs inside a
+	// An earlier version counted the WHOLE table, via a since-removed CountRows helper. This test runs inside a
 	// rolled-back transaction so its own writes never persist, but it can still SEE rows
 	// committed by anything else -- another process, or the collector having been run against
 	// this database. So the global assertion was only ever true on an empty database, and it
@@ -297,25 +297,6 @@ func TestUpsertPod_RejectsInvalidQoS(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("upsert accepted an invalid QoS class; the CHECK constraint is not doing its job")
-	}
-}
-
-// TestCountRows_RejectsUnknownTable covers the allow-list. Table names cannot be
-// parameterised in SQL, so the identifier must be interpolated -- and the allow-list is the
-// only thing standing between that and injection.
-func TestCountRows_RejectsUnknownTable(t *testing.T) {
-	ctx, tx := withTx(t)
-	inv := NewInventoryRepository(tx)
-
-	for _, bad := range []string{
-		"pg_shadow",
-		"pods; DROP TABLE clusters",
-		"pods WHERE 1=1",
-		"",
-	} {
-		if _, err := inv.CountRows(ctx, bad); err == nil {
-			t.Errorf("CountRows(%q) succeeded; the allow-list must reject it", bad)
-		}
 	}
 }
 

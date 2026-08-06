@@ -52,8 +52,12 @@ type Job struct {
 	store Store
 	log   *slog.Logger
 	// now is injectable so the month-completeness guard is testable without waiting for a month to
-	// end. The alternative -- calling time.Now inside FinaliseMonth -- would make that rule provable
-	// only by changing the system clock.
+	// end. The alternative -- calling time.Now inside RunMonth -- would make that rule provable only by
+	// changing the system clock.
+	//
+	// It is used by RunMonth alone. It also served a RollupYesterday method that an audit found nothing
+	// called: cmd/rollup computed yesterday itself, so the tested code was not the code that ran. That
+	// method is gone and its tests now cover cmd/rollup's resolveRange.
 	now func() time.Time
 }
 
@@ -176,20 +180,6 @@ func (j *Job) RollupRange(ctx context.Context, from, to postgres.Date) (RangeRes
 	}
 
 	return res, nil
-}
-
-// RollupYesterday rolls up the previous complete UTC day. The default for a scheduled run.
-//
-// YESTERDAY, NOT TODAY, and the reason is the same one that made the collector's windows aligned:
-// today is incomplete. Rolling up a day still in progress writes a row that is correct for the hours
-// so far and wrong for the day, and since the rollup is a projection the next run would replace it --
-// so the value flickers rather than converging. A day is rolled up once it can no longer change.
-//
-// This does mean cost is visible in the rollup only after the day closes. The trend endpoint covers
-// the gap by routing hourly queries to the fact table, which is exactly what that routing is for.
-func (j *Job) RollupYesterday(ctx context.Context) (RangeResult, error) {
-	yesterday := postgres.DayOf(j.now()).AddDays(-1)
-	return j.RollupRange(ctx, yesterday, yesterday)
 }
 
 // MonthResult reports monthly statement generation.

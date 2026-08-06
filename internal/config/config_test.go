@@ -106,6 +106,10 @@ func TestLoad_OverridesFromEnvironment(t *testing.T) {
 	// Required in production: see the API_KEYS validation. The test previously passed only
 	// because that rule did not exist yet.
 	env["API_KEYS"] = "0123456789abcdef0123456789abcdef"
+	// Also required in production, and this test caught the rule the moment it was added -- it had been
+	// passing with the placeholder cluster name, which is exactly the deployment an audit found writing
+	// 74,925 rows attributed to a cluster called "default".
+	env["CLUSTER_NAME"] = "prod-eu-west-1"
 	env["LOG_LEVEL"] = "warn"
 	env["API_HTTP_ADDR"] = ":9999"
 	env["API_SHUTDOWN_TIMEOUT"] = "25s"
@@ -393,5 +397,58 @@ func TestLoad_ReportsAllErrorsAtOnce(t *testing.T) {
 		if !strings.Contains(msg, want) {
 			t.Errorf("error message is missing %q; got:\n%s", want, msg)
 		}
+	}
+}
+
+// TestValidate_ProductionMustNameItsCluster is a REGRESSION TEST for an audit finding.
+//
+// CLUSTER_NAME defaulted to the placeholder "default" and validation rejected only BLANK, so a
+// deployment that never set the variable passed every check. The live database had 74,925 rows
+// attributed to cluster "default", and the monthly statements read "cluster/default".
+//
+// Why this is worth failing startup over rather than warning about. Migration 000001 states the rule:
+// cluster_name is denormalised onto every fact row and must be stable for the life of the cluster,
+// because changing it makes yesterday's rows look like a different cluster and a report grouped by
+// cluster shows one estate as two. The placeholder is therefore a value somebody will eventually
+// correct, and correcting it splits history permanently.
+//
+// Phase 11 makes it worse: two real clusters that both defaulted would MERGE, silently summing
+// unrelated spend. A wrong total is worse than a refused startup.
+func TestValidate_ProductionMustNameItsCluster(t *testing.T) {
+	tests := []struct {
+		name        string
+		env         string
+		clusterName string
+		wantErr     bool
+		why         string
+	}{
+		{"production with the placeholder", "production", "default", true,
+			"the deployment never set it, and every cost row would carry a name nobody recognises"},
+		{"production with a real name", "production", "prod-eu-west-1", false,
+			"explicitly named, which is all the rule asks for"},
+		{"development with the placeholder", "development", "default", false,
+			"`make run-api` must need no ceremony, exactly as with API_KEYS"},
+		{"production with a name that merely contains the placeholder", "production", "default-cluster-eu", false,
+			"the check is equality, not a substring match -- a real cluster may legitimately be called " +
+				"default-something, and refusing it would be a rule nobody could satisfy"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			env := validEnv()
+			env["APP_ENV"] = tt.env
+			env["CLUSTER_NAME"] = tt.clusterName
+			if tt.env == "production" {
+				env["API_KEYS"] = "0123456789abcdef0123456789abcdef"
+			}
+			setEnv(t, env)
+
+			_, err := Load()
+			named := err != nil && strings.Contains(err.Error(), "CLUSTER_NAME")
+			if named != tt.wantErr {
+				t.Errorf("CLUSTER_NAME error = %v, want %v\nwhy: %s\nerr: %v",
+					named, tt.wantErr, tt.why, err)
+			}
+		})
 	}
 }

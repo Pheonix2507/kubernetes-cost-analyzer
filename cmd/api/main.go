@@ -8,9 +8,19 @@
 //   - SCALING: the API scales with user traffic. The collector must NOT -- running
 //     two collectors means every cost sample is written twice, and the numbers are
 //     silently wrong. The API wants an HPA; the collector wants exactly one active
-//     instance (Phase 7 adds leader election for HA).
+//     instance.
+//
+//     PHASE 7 DID NOT ADD LEADER ELECTION HERE, and the earlier claim that it would is
+//     corrected rather than dropped. Phase 7 put a Postgres advisory lock in cmd/rollup,
+//     where "try once, exit if held" is exactly right for a batch job. A CONTINUOUS
+//     process needs renewal, observation and a TTL -- a coordination.k8s.io Lease and an
+//     RBAC grant this service deliberately does not have. Until Phase 10 owns the Helm
+//     chart the correct answer is a single-replica Deployment, which is a deployment
+//     decision rather than a code one. See the same note in cmd/collector.
+//
 //   - FAILURE BLAST RADIUS: a collector bug that exhausts memory scraping a huge
 //     cluster should not take the dashboard down with it.
+//
 //   - RESOURCES: the API is latency-sensitive and mostly idle. The collector is a
 //     periodic CPU and memory spike. Sizing one container for both means either
 //     wasting money at idle or being throttled during collection.

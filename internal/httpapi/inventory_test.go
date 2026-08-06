@@ -410,3 +410,86 @@ func TestListNodes_UnpriceableNodeIsStillReported(t *testing.T) {
 			"not zero", byName["exotic"].Pricing.NodeHourly)
 	}
 }
+
+// TestListResponse_BoundsTheResponse is a REGRESSION TEST for an audit finding.
+//
+// /pods, /nodes and /namespaces were unbounded. Measured on the live cluster at 950 bytes per pod, and
+// writeJSON buffers the whole response before writing, so a 5,000-pod cluster meant 4.5 MiB allocated
+// per request with the rate limiter's burst allowing several at once.
+//
+// The reason it counts as a finding rather than a nitpick: params.go already argues that an unbounded
+// range is "a denial of service a single curl can trigger" and caps the cost endpoints. These three
+// were written earlier and never revisited. A principle applied to some endpoints and not others is a
+// habit that stopped.
+func TestListResponse_BoundsTheResponse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name          string
+		items         int
+		wantCount     int
+		wantTruncated bool
+	}{
+		{"under the limit", 10, 10, false},
+		{"exactly at the limit", maxInventoryItems, maxInventoryItems, false},
+		{"one over", maxInventoryItems + 1, maxInventoryItems, true},
+		{"a realistic large cluster", 5000, maxInventoryItems, true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			items := make([]int, tt.items)
+			for i := range items {
+				items[i] = i
+			}
+			got := newListResponse(items)
+
+			if got.Count != tt.wantCount {
+				t.Errorf("Count = %d, want %d", got.Count, tt.wantCount)
+			}
+			if len(got.Items) != tt.wantCount {
+				t.Errorf("len(Items) = %d, want %d", len(got.Items), tt.wantCount)
+			}
+			// TOTAL is the pre-truncation figure, which is the whole point: a caller given 500 of 5,000
+			// and not told would treat the 500 as the entire cluster.
+			if got.Total != tt.items {
+				t.Errorf("Total = %d, want %d (the count BEFORE truncation)", got.Total, tt.items)
+			}
+			if got.Truncated != tt.wantTruncated {
+				t.Errorf("Truncated = %v, want %v", got.Truncated, tt.wantTruncated)
+			}
+			// Truncation keeps the FIRST n of a sorted list, so two identical requests agree. The
+			// informer's listers sort, so this is deterministic rather than an arbitrary subset.
+			if tt.wantTruncated && got.Items[0] != 0 {
+				t.Errorf("Items[0] = %d, want 0: truncation must keep the first n of a stable order",
+					got.Items[0])
+			}
+		})
+	}
+}
+
+// TestListResponse_TruncationIsInvisibleWhenUnnecessary keeps the common case clean.
+//
+// `truncated` carries omitempty, so a response that fits omits the field entirely rather than shipping
+// `"truncated": false` on every list forever.
+func TestListResponse_TruncationIsInvisibleWhenUnnecessary(t *testing.T) {
+	t.Parallel()
+
+	raw, err := json.Marshal(newListResponse([]int{1, 2, 3}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(raw), "truncated") {
+		t.Errorf("a complete response mentions truncation: %s", raw)
+	}
+
+	big := make([]int, maxInventoryItems+1)
+	raw, err = json.Marshal(newListResponse(big))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(raw), `"truncated":true`) {
+		t.Error("a truncated response does not say so, so a client cannot tell it is incomplete")
+	}
+}

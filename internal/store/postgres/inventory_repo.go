@@ -218,35 +218,19 @@ func (r *InventoryRepository) UpsertPod(ctx context.Context, p UpsertPodParams) 
 	return id, nil
 }
 
-// CountRows counts every row in one of the known tables.
+// No CountRows here, and an audit removed one -- worth recording, because deleting it removed a
+// security test and that needs justifying rather than glossing.
 //
-// USED ONLY BY TESTS TODAY. An earlier comment claimed it also backed a "/readyz depth check",
-// which was never true -- readiness checks connectivity via pool.Ping and deliberately does not
-// run a counting query, because a probe polled every few seconds must stay cheap.
+// CountRows counted every row in an allow-listed table. It was honestly documented as test-only and
+// kept on the reasoning that the allow-list pattern is the answer to a real problem: table and column
+// names cannot be parameterised in SQL, so an allow-list is the only safe way to make an identifier
+// dynamic. Its test asserted an unknown table name was refused.
 //
-// It is kept because the allow-list pattern below is the answer to a real problem, and because
-// a whole-table count is genuinely useful for diagnostics. Note the trap it caused:
-// TestUpsert_IsIdempotent asserted on these global counts and so passed only against an empty
-// database. Scope counts to the rows under test.
+// That test proved nothing about production, because production never called the method. Meanwhile the
+// pattern now has four instances on paths that DO run, each with its own rejection test:
+// group_by and sort in CostSummary, the interval unit in Trend, the filter columns in ContainerStats,
+// and scope_kind in MonthlyReports. The lesson is carried by code that executes.
 //
-// The table name is interpolated, which would normally be an injection risk -- so it is
-// validated against an explicit allow-list first. Table and column names CANNOT be
-// parameterised in SQL (placeholders bind values, not identifiers), so an allow-list is
-// the only safe way to make an identifier dynamic. Never format a caller-supplied
-// identifier into SQL without one.
-func (r *InventoryRepository) CountRows(ctx context.Context, table string) (int64, error) {
-	allowed := map[string]struct{}{
-		"clusters": {}, "nodes": {}, "namespaces": {},
-		"workloads": {}, "pods": {}, "container_allocations": {},
-	}
-	if _, ok := allowed[table]; !ok {
-		return 0, fmt.Errorf("count rows: %q is not a known table", table)
-	}
-
-	var n int64
-	// #nosec G201 -- table is constrained to the allow-list above.
-	if err := r.db.QueryRow(ctx, "SELECT count(*) FROM "+table).Scan(&n); err != nil {
-		return 0, fmt.Errorf("count rows in %s: %w", table, err)
-	}
-	return n, nil
-}
+// A security test on a code path production never takes is not defence in depth; it is a green tick
+// with nothing behind it. The rule it demonstrated survives in the four places it matters -- NEVER
+// format a caller-supplied identifier into SQL without an allow-list.

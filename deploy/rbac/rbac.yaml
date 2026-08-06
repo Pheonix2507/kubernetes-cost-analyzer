@@ -119,9 +119,23 @@ rules:
   # arrives is the POINT rather than a cost to be avoided. An RBAC change should be a reviewed
   # event.
   #
-  # Phase 6 will need persistentvolumeclaims and persistentvolumes for orphaned-storage
-  # detection, and services to correlate idle workloads with traffic. It can add them, in a
-  # commit whose diff says exactly that.
+  # That prediction was that Phase 6 would need persistentvolumeclaims, persistentvolumes and
+  # services. PHASE 6 AND PHASE 7 BOTH SHIPPED AND NEITHER NEEDED THEM, so this grant is unchanged
+  # and the prediction is corrected rather than left standing as though it were still pending.
+  #
+  # What the two features actually turned out to require:
+  #
+  #   Orphaned-PVC detection needs a PVC lister in internal/kube plus a domain type. Not written,
+  #   because nothing yet reads it -- which is the same argument that removed the nine unused grants
+  #   above, applied to ourselves.
+  #
+  #   Idle detection wanted traffic data from Services and did NOT get it. Phase 6 shipped a
+  #   memory-floor heuristic instead, and internal/recommend says so in the code: an idle finding
+  #   based on resource usage alone cannot distinguish "no traffic" from "efficient". That is a real
+  #   limitation, stated rather than papered over with a grant that would not have fixed it anyway.
+  #
+  # So: no new grants until there is code that reads them, in a commit whose diff says exactly that.
+  # A predicted need is not a need.
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRoleBinding
