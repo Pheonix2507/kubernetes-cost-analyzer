@@ -73,32 +73,55 @@ ARG TARGETARCH
 # The trade-off: no symbolised stack traces from a core dump. Acceptable because we get
 # stack traces from our panic handler instead. Drop these flags if you need to attach
 # a debugger to a production binary.
-# GOARCH IS PASSED ONLY IF TARGETARCH IS ACTUALLY SET.
+# GOARCH=${TARGETARCH} -- AND THE `=` MUST BE LITERAL. THIS LINE HAS BEEN WRONG TWICE.
 #
-# `${TARGETARCH:+GOARCH=$TARGETARCH}` expands to nothing when the variable is empty, so Go
-# falls back to the build container's native architecture -- which is always correct.
+# An empty TARGETARCH is fine: Go cannot distinguish an empty environment variable from an
+# unset one, so it falls back to the build container's native architecture, which is exactly
+# right for a single-platform build. Verified rather than assumed --
+# `GOARCH= GOOS= go env GOARCH GOOS` prints the container's own pair.
 #
-# An earlier version wrote `GOARCH=${TARGETARCH:-arm64}`. TARGETARCH is only populated by
-# BuildKit, and we build with the legacy builder (see the caching note above), so it was
-# ALWAYS empty and the image was ALWAYS built for arm64. Correct by accident on an Apple
-# Silicon Mac, and silently broken for anyone on an amd64 machine: the image builds, pushes
-# and then fails to start with "exec format error", which names neither the cause nor this
-# file.
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} ${TARGETARCH:+GOARCH=$TARGETARCH} \
+# MISTAKE ONE: `GOARCH=${TARGETARCH:-arm64}`. TARGETARCH is populated only by BuildKit, and
+# the legacy builder leaves it empty (see the caching note above), so the default always won
+# and every image was built for arm64. Correct by accident on an Apple Silicon Mac, and
+# silently broken for anyone else: the image builds, pushes, then dies at startup with
+# "exec format error", which names neither the cause nor this file.
+#
+# MISTAKE TWO, fixing mistake one: `${TARGETARCH:+GOARCH=$TARGETARCH}`, meaning "emit the
+# assignment only when the variable is set". It reads correctly and it cannot work, because
+# of a POSIX rule worth knowing:
+#
+#   A shell recognises assignment prefixes WHEN IT PARSES the command, BEFORE any parameter
+#   expansion. A word is an assignment only if it LITERALLY begins `NAME=`.
+#
+# `CGO_ENABLED=0` qualifies. `GOOS=${TARGETOS:-linux}` qualifies -- the name and `=` are
+# literal and only the value is expanded. But a word starting with `$` does not, so the shell
+# files it as the COMMAND NAME, expands it, and goes looking for an executable called
+# `GOARCH=amd64`:
+#
+#   /bin/sh: 1: GOARCH=amd64: not found        (exit 127)
+#
+# You cannot synthesise an assignment through expansion. And the reason this survived review
+# is the same reason mistake one did: with TARGETARCH empty, the whole word vanishes and the
+# command word becomes `go`, so every local build passed. It failed the first time it ever ran
+# on BuildKit, which populates TARGETARCH -- in CI, on the first push that added CI.
+#
+# The lesson is not about Docker. A conditional that is only ever exercised on one side of its
+# condition is untested code wearing a plausible comment.
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath \
       -ldflags "-s -w \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Version=${VERSION} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Commit=${COMMIT} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.BuildTime=${BUILD_TIME}" \
       -o /out/api ./cmd/api \
- && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} ${TARGETARCH:+GOARCH=$TARGETARCH} \
+ && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath \
       -ldflags "-s -w \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Version=${VERSION} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Commit=${COMMIT} \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.BuildTime=${BUILD_TIME}" \
       -o /out/collector ./cmd/collector \
- && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} ${TARGETARCH:+GOARCH=$TARGETARCH} \
+ && CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} \
     go build -trimpath \
       -ldflags "-s -w \
         -X github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo.Version=${VERSION} \

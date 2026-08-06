@@ -73,9 +73,9 @@ jobs:
     name: Go static analysis
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           # From go.mod rather than a literal here. A literal is a second place to record the Go
           # version, and the two only have to disagree once for CI to be testing a different
@@ -167,9 +167,9 @@ jobs:
       DATABASE_URL: postgres://kca:kca_ci_only@localhost:5432/kca_test?sslmode=disable
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
@@ -222,7 +222,7 @@ jobs:
     name: Helm chart
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Chart version
         # helm is pre-installed on the GitHub-hosted ubuntu images, and using it unpinned is a
@@ -287,9 +287,9 @@ jobs:
       run:
         working-directory: web
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: pnpm/action-setup@v4
+      - uses: pnpm/action-setup@v6
         # BEFORE setup-node, and the order is load-bearing. setup-node's `cache: pnpm` works by
         # running `pnpm store path`, so pnpm has to already be on PATH. Reversing these two steps
         # produces "Unable to locate executable file: pnpm", which reads like a missing install
@@ -308,7 +308,7 @@ jobs:
           # Duplicating it here would create a second place to forget.
           package_json_file: web/package.json
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version-file: web/.nvmrc
           cache: pnpm
@@ -344,7 +344,7 @@ jobs:
     name: Container images
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         # fetch-depth is left at the default 1. The Makefile stamps VERSION with
         # `git describe --tags --always`, and --always falls back to the short SHA when no tags are
         # present, so a shallow clone produces a usable version rather than an error.
