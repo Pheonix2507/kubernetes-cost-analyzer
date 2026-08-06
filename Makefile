@@ -288,6 +288,20 @@ run-collector: ## Run the collector locally
 # Frontend (web/)
 # =============================================================================
 
+.PHONY: observability-up
+observability-up: ## Apply the ScrapeConfig, PrometheusRule and Grafana dashboard
+	kubectl apply -f deploy/monitoring/scrape.yaml
+	kubectl apply -f deploy/monitoring/rules.yaml
+	kubectl apply -f deploy/monitoring/dashboard.yaml
+	@echo
+	@echo "Prometheus: http://localhost:19090   Grafana: http://localhost:13000"
+	@echo "Targets take ~45s to appear. In dev they are scraped over host.docker.internal,"
+	@echo "so `make run-api` and `make run-collector` must be running on the host."
+
+.PHONY: observability-verify
+observability-verify: ## Prove the targets are up, the rules load and the dashboard is registered
+	@./deploy/monitoring/verify.sh
+
 .PHONY: web-install
 web-install: ## Install frontend dependencies
 	cd web && pnpm install

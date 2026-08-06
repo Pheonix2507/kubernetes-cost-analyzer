@@ -123,26 +123,44 @@ func newRequestID() string {
 // responseRecorder wraps http.ResponseWriter to capture the status code and byte
 // count, which the interface itself does not expose.
 //
-// KNOWN LIMITATION, STATED DELIBERATELY: http.ResponseWriter is an interface, and the
-// concrete value the server passes in also implements optional interfaces --
-// http.Flusher (streaming), http.Hijacker (WebSocket upgrades), io.ReaderFrom
-// (sendfile fast path). Wrapping it in a struct that implements ONLY ResponseWriter
-// hides those, so a later WebSocket or SSE endpoint would fail with a confusing
-// "not a Hijacker" error pointing at this file.
+// THE LIMITATION THIS ONCE DOCUMENTED IS NOW FIXED, and the note is kept because the trap is worth
+// recognising rather than quietly closing.
 //
-// The fix when we need it is to forward the optional interfaces explicitly (or use
-// http.ResponseController, added in Go 1.20, which handles the unwrapping). We have
-// no streaming endpoints yet, so the simple version is correct for now -- but this
-// is a real trap and worth recognising before it bites.
+// http.ResponseWriter is an interface, and the concrete value net/http passes in also implements
+// OPTIONAL interfaces that a handler discovers by type assertion: http.Flusher for streaming,
+// http.Hijacker for WebSocket upgrades, io.ReaderFrom for the sendfile fast path. Embedding
+// ResponseWriter promotes only the methods in the interface, so a struct wrapper HIDES all of them --
+// `w.(http.Flusher)` starts failing, and a streaming handler silently falls back to buffering its whole
+// response.
+//
+// That failure is invisible in the worst way: the handler still works, the bytes are still correct, and
+// only the timing changes. Nobody finds it in a test. A user finds it watching a progress indicator that
+// never moves.
+//
+// Flush is forwarded explicitly below, and Unwrap is provided so Go 1.20's http.ResponseController can
+// reach past this wrapper for anything else -- SetWriteDeadline, and the interfaces added after this was
+// written. Unwrap is the modern answer: implementing every optional interface by hand does not survive
+// the standard library adding another one.
+//
+// Hijacker is deliberately NOT forwarded. This service has no upgrade path and RBAC makes it structurally
+// read-only, so a Hijack call here would be a bug; failing the assertion is the honest response to it.
 type responseRecorder struct {
 	http.ResponseWriter
-	status int
-	bytes  int
+	status      int
+	bytes       int
+	wroteHeader bool
 }
 
 // WriteHeader records the status code before delegating to the real writer.
 func (r *responseRecorder) WriteHeader(status int) {
+	// GUARDED against a second call. net/http ignores a repeat WriteHeader and logs a warning, so without
+	// this the recorder would report the second code while the client received the first -- and a metric
+	// or log line that disagrees with what was actually sent is worse than none.
+	if r.wroteHeader {
+		return
+	}
 	r.status = status
+	r.wroteHeader = true
 	r.ResponseWriter.WriteHeader(status)
 }
 
@@ -152,13 +170,24 @@ func (r *responseRecorder) Write(b []byte) (int, error) {
 	// A handler that writes a body without calling WriteHeader gets an implicit
 	// 200 from net/http. We must record the same, or such responses would be
 	// logged with status 0.
-	if r.status == 0 {
+	if !r.wroteHeader {
 		r.status = http.StatusOK
+		r.wroteHeader = true
 	}
 	n, err := r.ResponseWriter.Write(b)
 	r.bytes += n
 	return n, err
 }
+
+// Flush forwards to the underlying writer when it supports flushing. See the type comment.
+func (r *responseRecorder) Flush() {
+	if f, ok := r.ResponseWriter.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+// Unwrap exposes the wrapped writer to http.ResponseController.
+func (r *responseRecorder) Unwrap() http.ResponseWriter { return r.ResponseWriter }
 
 // probePaths are the endpoints Kubernetes polls continuously.
 //

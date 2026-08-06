@@ -33,6 +33,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/signal"
 	"syscall"
@@ -46,6 +47,7 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/kube"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/logging"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/metrics"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
@@ -210,6 +212,13 @@ func run() error {
 	// would give the trend queries access to the fact-table SQL they must not fall back to silently.
 	rollupRepo := postgres.NewRollupRepository(db.Pool())
 
+	// This process's own instrumentation, constructed HERE and injected.
+	//
+	// Not a package-level global in internal/metrics: a global would be shared by every test in the
+	// binary, so two tests incrementing the same counter would see each other's counts. Building it in
+	// main means the lifetime matches the process and a test builds its own.
+	appMetrics := metrics.NewAPI()
+
 	router := httpapi.NewRouter(httpapi.RouterOptions{
 		Log:       logger,
 		Readiness: readiness,
@@ -222,6 +231,7 @@ func run() error {
 		// than widening reportRepo with queries its other callers would never issue.
 		Trends:             rollupRepo,
 		Recommender:        recommend.NewEngine(recommend.DefaultThresholds()),
+		Metrics:            appMetrics,
 		APIKeys:            cfg.API.APIKeys,
 		RateLimitPerSecond: cfg.API.RateLimitPerSecond,
 		RateLimitBurst:     cfg.API.RateLimitBurst,
@@ -269,6 +279,52 @@ func run() error {
 		return nil
 	})
 
+	// The data-freshness gauges, refreshed on a ticker.
+	//
+	// WHY POLL RATHER THAN QUERY DURING THE SCRAPE
+	// -------------------------------------------
+	// The elegant alternative is a custom prometheus.Collector that runs the query when Prometheus
+	// scrapes, so the value is always exactly current. It is worse here, for a reason specific to what
+	// these metrics are FOR.
+	//
+	// If the database is unreachable, a scrape-time collector reports NOTHING -- the series is absent.
+	// And `time() - kca_data_facts_last_window_timestamp_seconds > 900` does not fire on an absent
+	// series; it simply stops evaluating. So a database outage would SILENCE the freshness alert at
+	// exactly the moment the data really has stopped being fresh.
+	//
+	// A ticker keeps the last known value, so the alert keeps evaluating and fires as the gap widens.
+	// The metric goes stale rather than vanishing, which for an alert built on staleness is the correct
+	// failure mode.
+	//
+	// It also keeps the scrape cheap and bounded: Prometheus's scrape_timeout is not hostage to a
+	// database query, however small.
+	g.Go(func() error {
+		freshness := postgres.NewFreshnessRepository(db.Pool())
+		// 30 seconds, matching the Prometheus scrape interval in deploy/monitoring/kps-values.yaml. Any
+		// faster and every second sample is a repeat; any slower and the gauge lags the scrape, adding
+		// error to a metric whose whole job is measuring time.
+		const interval = 30 * time.Second
+
+		tick := time.NewTicker(interval)
+		defer tick.Stop()
+
+		// Once immediately, so the gauges are populated before the first scrape rather than reading zero
+		// for up to half a minute -- and a zero timestamp means 1970, which would make the freshness
+		// alert fire instantly on every start.
+		refreshFreshness(gctx, logger, freshness, appMetrics)
+
+		for {
+			select {
+			case <-gctx.Done():
+				// nil, not gctx.Err(): a cancelled context here is a normal shutdown, and returning the
+				// error would make errgroup report it as the cause of a clean exit.
+				return nil
+			case <-tick.C:
+				refreshFreshness(gctx, logger, freshness, appMetrics)
+			}
+		}
+	})
+
 	if err := g.Wait(); err != nil {
 		return fmt.Errorf("running api: %w", err)
 	}
@@ -281,4 +337,54 @@ func run() error {
 
 	logger.Info("shutdown complete")
 	return nil
+}
+
+// refreshFreshness updates the data-currency gauges.
+//
+// A FAILURE HERE IS LOGGED AND SWALLOWED rather than returned, and that is deliberate: this goroutine
+// runs inside the errgroup, so returning an error would cancel gctx and shut the whole API down. A
+// database blip must not take the service offline when every read path already handles the database
+// being unavailable -- readiness reports it, and the handlers return 503.
+//
+// The gauges keep their previous values, which is exactly what the alerting design wants: the metric goes
+// stale rather than absent, so the freshness alert keeps evaluating and fires as the gap grows.
+func refreshFreshness(
+	ctx context.Context,
+	logger *slog.Logger,
+	repo *postgres.FreshnessRepository,
+	m *metrics.API,
+) {
+	// A tight timeout. This is an index-only max() on a leading column, so it is a single-page read; if
+	// it has not returned in two seconds the database is in trouble and waiting longer just delays the
+	// next attempt.
+	qctx, cancel := context.WithTimeout(ctx, 2*time.Second)
+	defer cancel()
+
+	f, err := repo.Freshness(qctx)
+	if err != nil {
+		// DEBUG rather than ERROR, because readiness already reports an unreachable database at the right
+		// severity. Logging it again per tick would be 2,880 error lines a day for a condition another
+		// signal already covers -- the alert-fatigue argument from the probe logging in
+		// internal/httpapi/middleware, applied here.
+		logger.Debug("could not refresh data-freshness gauges", slog.Any("error", err))
+		return
+	}
+
+	// A zero time means the table is empty, which is a real state on a first run. Left UNSET rather than
+	// written as 0, because 0 is 1970 and would make every freshness alert fire immediately on a fresh
+	// install -- an alert storm caused by there being nothing wrong yet.
+	if !f.LastFactWindow.IsZero() {
+		m.FactsLastWindow.Set(float64(f.LastFactWindow.Unix()))
+	}
+	if !f.LastRollupWrite.IsZero() {
+		m.RollupLastDay.Set(float64(f.LastRollupWrite.Unix()))
+	}
+
+	// The cost gauges ARE set unconditionally, unlike the timestamps above, because zero is a genuine
+	// value here: a cluster whose workloads all scaled to zero really did cost nothing last hour. For a
+	// timestamp, zero means 1970 and is never a real reading -- which is exactly the distinction that made
+	// an unset gauge a false alert in internal/metrics.
+	m.ClusterCost.Set(f.LastHourCost)
+	m.ClusterWaste.WithLabelValues("cpu").Set(f.LastHourWastedCPU)
+	m.ClusterWaste.WithLabelValues("memory").Set(f.LastHourWastedMem)
 }

@@ -1,0 +1,114 @@
+# How Prometheus finds this project's metrics.
+#
+# TWO MECHANISMS, FOR TWO DIFFERENT DEPLOYMENTS, and shipping both is deliberate.
+#
+# In DEVELOPMENT the binaries run on the host -- `make run-api` and `make run-collector` in two
+# terminals -- while Prometheus runs inside kind. So there is no Pod and no Service to discover, and a
+# ServiceMonitor has nothing to select. A ScrapeConfig with static targets solves that.
+#
+# In PRODUCTION (Phase 10's Helm chart) the binaries are Pods behind Services, and a ServiceMonitor is
+# the right mechanism: it discovers endpoints, survives rescheduling, and picks up new replicas
+# automatically.
+#
+# Shipping only the ServiceMonitor would mean shipping YAML that nothing exercises until Phase 10 --
+# unverifiable configuration, which is exactly what Phase 0 set out to avoid. Shipping only the
+# ScrapeConfig would mean the in-cluster path is invented later under time pressure. Both are here, and
+# the ServiceMonitor is inert until the Services it selects exist.
+#
+# Verified on this cluster: the Prometheus CR has `scrapeConfigSelector: {}` and
+# `serviceMonitorSelector: {}` -- empty selectors match everything -- so neither needs a label to be
+# picked up.
+---
+# =============================================================================
+# DEVELOPMENT: static targets on the host
+# =============================================================================
+apiVersion: monitoring.coreos.com/v1alpha1
+kind: ScrapeConfig
+metadata:
+  name: kca-local-dev
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: kubernetes-cost-analyzer
+    app.kubernetes.io/component: monitoring
+spec:
+  # host.docker.internal is how a pod in kind reaches the host, and it is NOT a guess -- probed from
+  # inside this cluster, where it resolves to 192.168.5.2 and a TCP connect to :8080 succeeds. The
+  # docker bridge gateway and 172.17.0.1 were both tried and are NOT reachable, which is worth
+  # recording so the next person does not repeat the experiment.
+  staticConfigs:
+    - targets:
+        - host.docker.internal:8080
+      labels:
+        # The job label a human will type in the expression browser and that the rules match on with
+        # `job=~".*kca.*"`. Set explicitly rather than left to the operator's generated default, which
+        # is derived from the resource name and would change if the file were renamed -- silently
+        # breaking every alert that matches on it.
+        job: kca-api
+        # `component` distinguishes the two binaries on a dashboard without needing to know which port
+        # each listens on.
+        component: api
+    - targets:
+        - host.docker.internal:8081
+      labels:
+        job: kca-collector
+        component: collector
+
+  metricsPath: /metrics
+  # 30s, matching the kube-prometheus-stack scrape interval and the API's own freshness refresh ticker.
+  # A scrape faster than the gauge is refreshed just re-reads the same value; slower and the gauge is
+  # stale relative to the sample, adding error to metrics whose whole job is measuring time.
+  scrapeInterval: 30s
+  # Well under the interval. A scrape that outlives its interval overlaps with the next one, and
+  # Prometheus starts reporting the target as down while the process is fine.
+  scrapeTimeout: 10s
+---
+# =============================================================================
+# PRODUCTION: endpoint discovery via Services
+# =============================================================================
+#
+# Inert until Phase 10 creates the Services this selects. Present now so the in-cluster path is
+# reviewed alongside the code it monitors, rather than written in a hurry when the chart lands.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: kca
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: kubernetes-cost-analyzer
+    app.kubernetes.io/component: monitoring
+spec:
+  # WHY selector PLUS namespaceSelector RATHER THAN A BARE SELECTOR
+  # A ServiceMonitor's selector applies within its own namespace by default. These Services will live
+  # wherever the application is deployed, which is not `monitoring` -- so without namespaceSelector this
+  # would silently match nothing. A ServiceMonitor that matches nothing produces no error and no
+  # targets; it just quietly does not work, which is the commonest prometheus-operator mistake.
+  namespaceSelector:
+    # `any` rather than a fixed list, because the deployment namespace is the operator's choice in
+    # Phase 10 and hard-coding it here would couple this file to a decision not yet made.
+    any: true
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: kubernetes-cost-analyzer
+  endpoints:
+    # BY PORT NAME, not number.
+    #
+    # A named port is indirection that pays: the Service can move from 8080 to something else and this
+    # keeps working, because the name is the contract. A numeric port here would need changing in two
+    # repositories at once.
+    - port: http-metrics
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s
+      # The `component` label is copied from the Service onto every scraped series, so one ServiceMonitor
+      # covers both binaries and a dashboard can still tell them apart. Without this the two would be
+      # distinguishable only by port number.
+      relabelings:
+        - sourceLabels: [__meta_kubernetes_service_label_app_kubernetes_io_component]
+          targetLabel: component
+          action: replace
+        # The job label, again set explicitly so `job=~".*kca.*"` in the alert rules keeps matching. The
+        # operator's default job label is the Service name, which is close enough to be tempting and
+        # different enough to break the rules quietly.
+        - sourceLabels: [__meta_kubernetes_service_name]
+          targetLabel: job
+          action: replace

@@ -1,0 +1,317 @@
+# Recording and alerting rules for the Kubernetes Cost Analyzer.
+#
+# A PrometheusRule custom resource, which the prometheus-operator reconciles into the Prometheus
+# config. Verified against this cluster: the Prometheus CR has `ruleSelector: {}` and
+# `ruleNamespaceSelector: {}` -- empty selectors match EVERYTHING -- so no label plumbing is needed
+# and this is picked up from any namespace.
+#
+# WHY RULES BELONG IN THE REPOSITORY
+# ==================================
+# An alert defined in the Grafana or Prometheus UI is a production behaviour with no diff, no review
+# and no history. When it fires at 03:00 nobody can answer "who added this and why", and when it
+# stops firing nobody notices it was deleted. These are code, reviewed like code.
+#
+# RECORDING RULES VERSUS ALERTING RULES
+# A recording rule pre-computes an expression and stores it as a new series. An alerting rule
+# evaluates a condition and fires. The reason to bother with the former is below.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: kca-rules
+  namespace: monitoring
+  labels:
+    app.kubernetes.io/name: kubernetes-cost-analyzer
+    app.kubernetes.io/component: monitoring
+spec:
+  groups:
+    # =========================================================================
+    # RECORDING RULES
+    # =========================================================================
+    #
+    # WHY PRE-COMPUTE AT ALL
+    # ---------------------
+    # Two reasons, and only the second one really justifies it here.
+    #
+    # COST. `histogram_quantile` over a 12-bucket histogram across 9 routes reads ~108 series and
+    # interpolates. Doing that in a dashboard panel that refreshes every 10 seconds, times six panels,
+    # times every viewer, re-does the same arithmetic constantly. A recording rule does it once per
+    # evaluation interval and every reader gets a single stored series.
+    #
+    # CONSISTENCY, which matters more. Without these, the p99 expression is copy-pasted into a
+    # dashboard panel, an alert rule and whatever an engineer types during an incident -- and those
+    # three copies drift. Then the dashboard says the service is fine while the alert says it is not,
+    # and the argument becomes about which query is right instead of about the outage.
+    #
+    # NAMING: `<level>:<metric>:<operations>` is the Prometheus convention, and it is load-bearing
+    # rather than decorative. `job:kca_http_request_duration_seconds:p99` says "aggregated to the job
+    # level, from that metric, as a p99" -- so a reader knows what has already been summed and cannot
+    # accidentally sum it again.
+    - name: kca.recording
+      # 30s to match the scrape interval. Faster would evaluate the same samples twice; slower would
+      # make the recorded series coarser than the data it summarises.
+      interval: 30s
+      rules:
+        - record: job:kca_http_requests:rate5m
+          expr: sum by (job) (rate(kca_http_requests_total[5m]))
+
+        - record: job:kca_http_requests_errors:rate5m
+          expr: sum by (job) (rate(kca_http_requests_total{status_class="5xx"}[5m]))
+
+        # The error RATIO, recorded rather than left to the reader.
+        #
+        # `or vector(0)` handles the zero-traffic case. Without it, an idle service divides 0 by 0 and
+        # produces NaN -- and NaN compared against a threshold is FALSE, so the alert silently cannot
+        # fire. That is the dangerous direction: an alert that looks configured and never triggers.
+        - record: job:kca_http_error_ratio:rate5m
+          expr: |
+            (
+              sum by (job) (rate(kca_http_requests_total{status_class="5xx"}[5m]))
+              /
+              sum by (job) (rate(kca_http_requests_total[5m]))
+            ) or vector(0)
+
+        # p99 latency, aggregated across replicas.
+        #
+        # THIS IS WHY THE HISTOGRAM IS A HISTOGRAM AND NOT A SUMMARY. Bucket counts are additive, so
+        # summing rate() by (le) across every replica and then interpolating gives a genuine
+        # fleet-wide p99. A summary computes quantiles in-process, and there is no arithmetic that
+        # turns two replicas' p99s into the pair's p99 -- averaging them is simply wrong.
+        - record: job:kca_http_request_duration_seconds:p99
+          expr: |
+            histogram_quantile(
+              0.99,
+              sum by (job, le) (rate(kca_http_request_duration_seconds_bucket[5m]))
+            )
+
+        - record: job:kca_http_request_duration_seconds:p50
+          expr: |
+            histogram_quantile(
+              0.50,
+              sum by (job, le) (rate(kca_http_request_duration_seconds_bucket[5m]))
+            )
+
+        # DATA AGE, recorded once so every alert and panel below shares one definition.
+        #
+        # This is the expression the whole alerting design rests on, and recording it means the
+        # freshness gate used by three separate alerts cannot drift between them.
+        - record: kca:facts_age_seconds
+          expr: time() - kca_data_facts_last_window_timestamp_seconds
+
+        - record: kca:rollup_age_seconds
+          expr: time() - kca_data_rollup_last_write_timestamp_seconds
+
+        - record: kca:collector_age_seconds
+          expr: time() - kca_collector_last_success_timestamp_seconds
+
+    # =========================================================================
+    # ALERTING RULES
+    # =========================================================================
+    #
+    # SEVERITY HERE TRACKS RECOVERABILITY, NOT IMPACT, and that is the organising idea.
+    #
+    # Prometheus retention on this cluster is SEVEN DAYS -- verified from the Prometheus CR. So a
+    # collector outage lasting longer than that destroys the source data permanently: the usage
+    # samples expire and no amount of later effort recovers what the cluster cost during the gap.
+    #
+    # Every other failure here is recoverable. A rollup recomputes from facts. An API outage ends when
+    # the API restarts. So exactly one alert in this file is `critical`, and it is the one that
+    # destroys data rather than the one that annoys users.
+    - name: kca.alerts
+      interval: 30s
+      rules:
+        # ---------------------------------------------------------------------
+        # The one that pages
+        # ---------------------------------------------------------------------
+        - alert: KCACollectorDataStale
+          # The FACTS age, not the collector's own counter.
+          #
+          # A dead collector emits nothing, so `rate(kca_collector_cycles_total[5m]) == 0` never fires
+          # -- the series goes stale and stale series are invisible. This expression uses `time()`,
+          # which keeps advancing whether or not anything is alive to report, so it fires for a
+          # crashed collector, a wedged one, a crash-looping one and a deleted one alike.
+          #
+          # It also reads the DATA rather than the process: a collector that runs happily while
+          # failing to persist anything is caught here and would be missed by its own success counter.
+          expr: kca:facts_age_seconds > 900
+          # 15 minutes of data age with a 5-minute collection interval means roughly three missed
+          # cycles -- past coincidence, short of a nuisance.
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Cost collection has stalled ({{ $value | humanizeDuration }} behind)"
+            description: >-
+              The newest collected window is {{ $value | humanizeDuration }} old. THIS IS THE ONE
+              THAT CANNOT WAIT: Prometheus retention is 7 days, so usage samples for the gap expire
+              and the cost of that period becomes permanently unknowable. Every other failure in this
+              file is recoverable by re-running something; this one is not.
+            runbook: >-
+              Check the collector pod and its /readyz. A failing Prometheus or Postgres check explains
+              it directly. If the collector is up and cycles are completing, look for
+              kca_collector_cycles_total{outcome="partial"} -- a persistently partial cycle does not
+              advance the success timestamp, deliberately.
+
+        # ---------------------------------------------------------------------
+        # Warnings: real problems, recoverable
+        # ---------------------------------------------------------------------
+        - alert: KCACollectorCyclesPartial
+          # A cycle that finished having measured LESS of the cluster than it should.
+          #
+          # internal/costing isolates a failing namespace and carries on, which is the right behaviour
+          # -- partial coverage beats a total blank. But it means a cycle can succeed while silently
+          # covering less, so without this alert the isolation becomes a way of HIDING problems.
+          expr: |
+            sum(rate(kca_collector_cycles_total{outcome="partial"}[15m]))
+            /
+            sum(rate(kca_collector_cycles_total[15m]))
+            > 0.2
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "More than 20% of collection cycles are only partially covering the cluster"
+            description: >-
+              Some namespaces are failing every cycle. The data is usable and INCOMPLETE, so cost is
+              understated for the affected namespaces. Check
+              kca_collector_namespace_errors_total by reason, then the collector's WARN logs -- those
+              name the specific namespace, which the metric deliberately does not.
+
+        - alert: KCARollupStale
+          # 25 hours, not 24: the rollup is a nightly job, so the alert must tolerate one full
+          # inter-run gap plus a little slack. At exactly 24h it would fire briefly every single
+          # night in the moments before the run.
+          expr: kca:rollup_age_seconds > 90000
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "The daily rollup has not run for over 25 hours"
+            description: >-
+              Trends and monthly statements are reading stale data. RECOVERABLE, which is why this is
+              a warning and not a page: the rollup is a projection of the fact table, so
+              `make rollup-backfill` rebuilds everything from source at any time. Nothing is lost by
+              waiting for business hours.
+
+        - alert: KCAAPIErrorRatioHigh
+          # The RECORDED ratio, so this alert and the dashboard panel cannot disagree about what the
+          # error rate is.
+          expr: job:kca_http_error_ratio:rate5m > 0.05
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value | humanizePercentage }} of API requests are returning 5xx"
+            description: >-
+              Sustained server errors. Check the API logs by request ID -- the exact status code is
+              there, deliberately kept out of the metric to bound its cardinality.
+
+        - alert: KCAAPILatencyHigh
+          expr: job:kca_http_request_duration_seconds:p99 > 2
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "API p99 latency is {{ $value | humanizeDuration }}"
+            description: >-
+              Compare kca_http_requests_in_flight. Rising latency with FLAT in-flight is a slow
+              dependency -- usually Postgres. Rising latency WITH rising in-flight is queueing, which
+              means the service is saturated rather than merely slow.
+
+        - alert: KCAPricingIsGuessed
+          # Non-zero means part of the bill is arithmetic on an invented number.
+          #
+          # `for: 1h` rather than something short: a node joining the cluster with an instance type
+          # not yet in the catalogue is a normal, transient event during a node-pool change. An hour
+          # of it means somebody needs to edit deploy/pricing/catalogue.yaml.
+          expr: kca_pricing_fallback_priced_nodes > 0
+          for: 1h
+          labels:
+            severity: warning
+          annotations:
+            summary: "{{ $value }} node(s) are priced from the fallback rate"
+            description: >-
+              These nodes have an instance type missing from the pricing catalogue, so their cost is a
+              guess and every figure derived from them is an estimate. Add the instance type to
+              deploy/pricing/catalogue.yaml. The API already flags affected rows with
+              estimated_rates, so nothing is silently wrong -- it is just approximate.
+
+        # ---------------------------------------------------------------------
+        # Cost: GATED ON FRESHNESS
+        # ---------------------------------------------------------------------
+        - alert: KCAClusterCostSpike
+          # THE `and on()` CLAUSE IS THE WHOLE POINT OF THIS ALERT.
+          #
+          # A stale cluster reads as ZERO cost -- verified on this system: with the collector down 22
+          # hours, kca_cost_cluster_hourly read 0 while the data was simply old. So an ungated cost
+          # comparison produces a storm during every collection outage, and each of those alerts is
+          # about cost when the actual problem is collection.
+          #
+          # Gating on freshness means the collector alert fires alone and the cost alerts stay quiet
+          # until the data they describe is real again. This is alert DEPENDENCY expressed in PromQL:
+          # `and on()` intersects with a condition carrying no labels, so it acts as a plain gate.
+          #
+          # Without it, one root cause produces five alerts and the on-call engineer has to work out
+          # which is the cause -- which is how alert fatigue starts.
+          expr: |
+            (
+              kca_cost_cluster_hourly
+              >
+              3 * avg_over_time(kca_cost_cluster_hourly[24h])
+            )
+            and on() (kca:facts_age_seconds < 900)
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Cluster cost is more than 3x its 24-hour average"
+            description: >-
+              Spend has jumped. This figure is a FLOAT64 approximation exposed for alerting only --
+              read the exact number from /api/v1/costs/summary, which carries exact decimals. Check
+              /api/v1/costs/trend?compare=previous_period to see which namespace moved.
+
+        - alert: KCAWasteHigh
+          # More than half the reserved CPU going unused, sustained.
+          #
+          # Gated on freshness for the same reason as the spike alert, and additionally on there being
+          # any cost at all: a cluster costing nothing has an undefined waste ratio, and dividing by
+          # it would produce NaN -- which compares FALSE against any threshold, so the alert would
+          # silently never fire rather than obviously never firing.
+          expr: |
+            (
+              kca_cost_cluster_wasted_hours{resource="cpu"}
+              /
+              (kca_cost_cluster_wasted_hours{resource="cpu"} + 0.0001)
+              > 0.5
+            )
+            and on() (kca:facts_age_seconds < 900)
+            and on() (kca_cost_cluster_hourly > 0)
+          for: 6h
+          labels:
+            severity: info
+          annotations:
+            summary: "Over half the reserved CPU is going unused"
+            description: >-
+              INFO rather than a warning: this is not a failure, it is the finding the tool exists to
+              produce, and it needs a human with context rather than a pager. See
+              /api/v1/recommendations for what specifically to change and what it would save.
+
+        # ---------------------------------------------------------------------
+        # The meta-alert: is the monitoring itself working?
+        # ---------------------------------------------------------------------
+        - alert: KCATargetDown
+          # `up` is synthesised by Prometheus per target, so it exists even when the target does not
+          # -- which makes it the one signal that survives the process being gone entirely.
+          #
+          # THIS IS THE ALERT THAT MAKES THE OTHERS TRUSTWORTHY. Without it, a scrape that has been
+          # failing for a week looks identical to a service with nothing to report: no series, no
+          # alerts, everything quiet. Silence is only reassuring if you have checked it means what you
+          # think.
+          expr: up{job=~".*kca.*"} == 0
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Prometheus cannot scrape {{ $labels.job }} ({{ $labels.instance }})"
+            description: >-
+              While this is firing, every other alert in this file is BLIND for that target -- their
+              series are stale, so they will neither fire nor resolve. Fix this first.

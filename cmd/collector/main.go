@@ -48,8 +48,10 @@ import (
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/buildinfo"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/config"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/costing"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/kube"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/logging"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/metrics"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/prom"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/store/postgres"
@@ -152,6 +154,17 @@ func run() error {
 
 	w := newWriter(db, store, cfg.ClusterName, logger)
 
+	// This process's own instrumentation, and its readiness aggregator.
+	//
+	// Both constructed here and injected, not reached for as globals. See internal/metrics for why an
+	// explicit registry matters: a package-level one is shared by every test in the binary.
+	appMetrics := metrics.NewCollector()
+
+	// The collector's dependencies are the database, Prometheus and the informer cache -- the same three
+	// the API checks, minus nothing. A collector that cannot reach Prometheus cannot collect, so it should
+	// say so at a URL rather than only in a log line.
+	readiness := health.NewAggregator(2*time.Second, db, promClient, store)
+
 	// -------------------------------------------------------------------------
 	// Run the informers and the collection loop together.
 	//
@@ -178,7 +191,20 @@ func run() error {
 	})
 
 	g.Go(func() error {
-		return collectLoop(gctx, engine, w, pricer, cfg, logger, synced)
+		return collectLoop(gctx, engine, w, pricer, cfg, logger, synced, appMetrics)
+	})
+
+	// The observability listener: /metrics for Prometheus, /healthz and /readyz for the kubelet.
+	//
+	// Started ALONGSIDE the collection loop rather than after it, and before the informers are warm, for
+	// the same reason cmd/api listens before its caches sync: a probe that gets connection-refused during
+	// a slow startup is a probe failure, and enough of those means the kubelet kills a container that was
+	// working perfectly. Liveness passes immediately, readiness reports honestly until the dependencies
+	// are actually up.
+	g.Go(func() error {
+		return runObservabilityServer(gctx, observabilityServer(
+			cfg.Collector.HTTPAddr, logger, appMetrics, readiness,
+		), logger)
 	})
 
 	if err := g.Wait(); err != nil {
@@ -193,7 +219,7 @@ func run() error {
 func collectLoop(
 	ctx context.Context, engine *costing.Engine, w *writer,
 	pricer *pricing.CatalogueProvider, cfg *config.Config, logger *slog.Logger,
-	synced <-chan struct{},
+	synced <-chan struct{}, m *metrics.Collector,
 ) error {
 	// Wait for the informer caches before the first cycle.
 	select {
@@ -220,7 +246,7 @@ func collectLoop(
 
 	// Collect immediately rather than waiting a full interval for the first tick, so a restart
 	// costs one window of data rather than two.
-	runCycle(ctx, engine, w, pricer, cfg, logger)
+	runCycle(ctx, engine, w, pricer, cfg, logger, m)
 
 	for {
 		select {
@@ -232,7 +258,7 @@ func collectLoop(
 			return nil
 
 		case <-ticker.C:
-			runCycle(ctx, engine, w, pricer, cfg, logger)
+			runCycle(ctx, engine, w, pricer, cfg, logger, m)
 		}
 	}
 }
@@ -249,7 +275,7 @@ func collectLoop(
 // row is an outage.
 func runCycle(
 	ctx context.Context, engine *costing.Engine, w *writer, pricer *pricing.CatalogueProvider,
-	cfg *config.Config, logger *slog.Logger,
+	cfg *config.Config, logger *slog.Logger, m *metrics.Collector,
 ) {
 	// Aligned AND lagged: the last interval boundary at least scrapeLag ago. Alignment is what
 	// makes the upsert idempotent across restarts; see costing.AlignedWindow.
@@ -261,9 +287,13 @@ func runCycle(
 		// Cancellation during shutdown is expected and not worth an ERROR line.
 		if errors.Is(err, context.Canceled) {
 			logger.Info("collection cancelled by shutdown", "window", window.String())
+			// NOT counted as a failure. A cycle interrupted by SIGTERM did not fail -- the operator
+			// stopped it -- and counting it would make every rolling deploy look like an incident, which
+			// is how an error metric stops being trusted.
 			return
 		}
 		logger.Error("collection cycle failed", "window", window.String(), "error", err)
+		m.ObserveCycle(metrics.OutcomeFailed, time.Since(started), 0, nil)
 		return
 	}
 
@@ -277,6 +307,10 @@ func runCycle(
 	if err := w.write(ctx, result); err != nil {
 		logger.Error("persisting allocations failed",
 			"window", window.String(), "allocations", len(result.Allocations), "error", err)
+		// FAILED even though Collect succeeded. The cost was computed and then lost, which for this
+		// process is indistinguishable from never having computed it: nothing downstream can read a
+		// result that was not persisted.
+		m.ObserveCycle(metrics.OutcomeFailed, time.Since(started), 0, nil)
 		return
 	}
 
@@ -293,4 +327,63 @@ func runCycle(
 		"fallback_priced_nodes", pricer.FallbackCount(),
 	)
 	logger.Info("collection cycle complete", summary...)
+
+	// PARTIAL when any namespace failed, and the distinction is the whole reason for a third outcome.
+	//
+	// internal/costing deliberately isolates a failing namespace and carries on, so a cycle can finish
+	// having measured less of the cluster than it should. Recording that as "success" would make the
+	// isolation a way of HIDING problems rather than surviving them -- and crucially, ObserveCycle only
+	// advances the last-success timestamp for a clean cycle, so a persistently partial collector still
+	// trips the freshness alert instead of looking healthy forever.
+	outcome := metrics.OutcomeSuccess
+	if len(result.NamespaceErrors) > 0 {
+		outcome = metrics.OutcomePartial
+	}
+	m.ObserveCycle(outcome, time.Since(started), len(result.Allocations), classifyNamespaceErrors(result.NamespaceErrors))
+
+	m.FallbackPricedNodes.Set(float64(pricer.FallbackCount()))
+}
+
+// classifyNamespaceErrors buckets per-namespace failures into a BOUNDED set of reasons.
+//
+// WHY NOT LABEL BY NAMESPACE, WHICH IS THE OBVIOUS THING
+// ----------------------------------------------------
+// A namespace name is unbounded over time in any cluster with per-pull-request preview environments:
+// each one creates and destroys a namespace, so the label churns even though the count at any instant is
+// small. Prometheus keeps a series in memory for hours after its last sample, so churn costs more than
+// breadth -- and the affected namespace is already named in a WARN log line with the full error, which is
+// detail no label could carry anyway.
+//
+// The useful question a metric answers is "what KIND of thing is failing": a Prometheus timeout needs a
+// different response from a query rejection, and both need a different response from a context deadline.
+func classifyNamespaceErrors(errs map[string]error) map[string]int {
+	if len(errs) == 0 {
+		return nil
+	}
+	out := make(map[string]int, 3)
+	for _, err := range errs {
+		out[classifyError(err)]++
+	}
+	return out
+}
+
+// classifyError maps an error to one of a fixed set of reasons.
+//
+// A CLOSED SET, checked in order of specificity. The default is "other" rather than the error's text:
+// error strings contain namespace names, query fragments and driver detail, so using one as a label value
+// is the unbounded-cardinality bug arriving through the back door -- and it is the version people miss,
+// because it does not look like a label decision.
+func classifyError(err error) string {
+	switch {
+	case err == nil:
+		return "none"
+	case errors.Is(err, context.DeadlineExceeded):
+		// The Prometheus query outlived its timeout. Usually means Prometheus is overloaded rather than
+		// that anything is wrong here.
+		return "timeout"
+	case errors.Is(err, context.Canceled):
+		return "cancelled"
+	default:
+		return "other"
+	}
 }

@@ -23,11 +23,12 @@ Measured on real data, `kube-system` reported **0 GiB-hours** of memory waste wh
 50, and `team-search` was understated by 126%. The more under-requested a team's workloads were, the
 more efficient it looked.
 
-## Status: Phase 8 complete — there is a dashboard
+## Status: Phase 9 complete — it can be operated
 
 The collector produces cost data, the API serves it, the recommendation engine says what to change, a
-nightly rollup makes history cheap (**292.7x compression, measured**), and a Next.js dashboard reads
-all of it — with the API key held server-side so it never reaches a browser.
+nightly rollup makes history cheap (**292.7x compression, measured**), a Next.js dashboard reads all of
+it with the API key held server-side, and both binaries expose their own metrics with alerts that fire
+on the failures that actually destroy data.
 
 What works today:
 
@@ -64,6 +65,8 @@ What works today:
 - Three non-root, shell-less container images
 - A Next.js dashboard: five pages, server-rendered, with the API credential held by a
   server-side proxy and TypeScript types generated from the OpenAPI spec
+- RED metrics on the API, batch metrics on the collector, freshness gauges read from the
+  database, 9 alert rules and a Grafana dashboard — all as code, all verified by a script
 
 ### Endpoints
 
@@ -182,6 +185,7 @@ internal/
   pricing        rate catalogue, the CPU/memory split, pure cost arithmetic
   prom           PromQL usage queries (the container!="" filter matters -- see below)
   costing        the join: topology x usage x rates -> cost, with a bounded worker pool
+  metrics        our own instrumentation: RED, batch metrics, freshness gauges
   recommend      the rule engine: evidence gates, p95 right-sizing, severity by failure mode
   rollup         batch orchestration: transaction boundaries, failure isolation, backfill
   httpapi        server, router, JSON responses, handlers for every endpoint
@@ -190,7 +194,7 @@ internal/
 migrations       numbered SQL, applied with golang-migrate
 deploy/
   kind           cluster definition
-  monitoring     Helm values
+  monitoring     Helm values, scrape config, alert rules, Grafana dashboard, verify.sh
   demo-workloads fixture workloads
   rbac           read-only ClusterRole + a script that proves it
   pricing        the rate catalogue (edit this; the shipped prices are indicative)
@@ -385,6 +389,109 @@ node, no `replicas` field, and acting on it would have left a node with no netwo
 for $1.26 a month. The rule read `count(DISTINCT pod_name) = 3` without asking *why* there were
 three. The gate is an **allow-list** of kinds, so an unknown CRD defaults to silence rather than to
 confident advice about someone else's resource.
+
+## Observability
+
+`make observability-up` applies it; `make observability-verify` proves it works.
+
+### RED fits the API. It does not fit the collector.
+
+This is the decision the rest follows from. **A dead collector emits no metrics at all**, so
+`rate(kca_collector_cycles_total[5m]) == 0` never fires — the series just goes stale, and stale series
+are invisible. Alerting on a bad value only works when a process is alive enough to report one.
+
+So the collector's most important metric is a timestamp:
+
+```promql
+time() - kca_collector_last_success_timestamp_seconds > 900
+```
+
+`time()` keeps advancing whether or not anything is alive, so this fires for a crashed collector, a
+wedged one, a crash-looping one and a deleted one alike.
+
+### `retention: 7d` decides the severities
+
+Prometheus keeps 7 days. That single number splits the alerts:
+
+| Failure | Recoverable? | Severity |
+|---|---|---|
+| Collector stalled | **No** — past 7d the usage samples expire and that cost is unknowable forever | **critical** |
+| Rollup stalled | Yes — `make rollup-backfill` rebuilds from facts | warning |
+| API 5xx / slow | Yes | warning |
+| Half the CPU wasted | It's the finding, not a failure | info |
+
+Exactly one alert pages, and it's the one that destroys data rather than the one that annoys users.
+**Severity tracks recoverability, not impact.**
+
+### Cardinality, and a claim I had to withdraw
+
+The route label comes from `r.Pattern` (Go 1.23+) — the pattern the mux *matched*, so the ceiling is
+the number of registered routes, bounded by the router itself.
+
+I originally justified that by saying `r.URL.Path` would make every query string a new series. **That's
+false**, and a mutation test caught it: `net/http` parses a URL into `Path` and `RawQuery`, so
+`r.URL.Path` for `/api/v1/pods?namespace=x` is just `/api/v1/pods`. The test asserting otherwise was
+passing for no reason.
+
+The real unbounded sources are:
+
+- **Path parameters.** `/api/v1/pods/{name}` gives one series per pod under `r.URL.Path` — and every
+  rollout replaces all of them, so the label set turns over completely while Prometheus holds each dead
+  series in memory for hours. This API has no path parameters *yet*, which is exactly why the test
+  exists now: the first route that adds one would otherwise be the change that breaks Prometheus.
+- **Unmatched paths.** A scanner probing `/wp-admin`, `/.env` and a thousand friends. Labelling those
+  by path makes cardinality an **attacker-controlled quantity** — a denial of service against your own
+  monitoring, delivered through requests you already reject.
+
+Also deliberate: `status_class` is `2xx`/`4xx`/`5xx`, not the exact code (five values, not forty), and
+the duration histogram carries **no** status label — that asymmetry takes it from ~540 series to ~108.
+
+### You cannot scrape a process that has exited
+
+`cmd/rollup` runs, writes, and dies. The canonical answer is a Pushgateway: a whole component whose job
+is holding a metric for a dead process.
+
+There's a better answer, and it's better for a reason beyond avoiding a component. **The database
+already records what happened** — `max(rolled_up_at)` *is* the last successful rollup. So the API reads
+it and exposes it as a gauge.
+
+A Pushgateway reports *"the job said it finished"*. This reports *"the rows are there"*. Those come
+apart in exactly the failure a job's own success metric cannot see: a job that exits zero having
+written nothing.
+
+### You cannot probe one either
+
+The collector had no HTTP server at all, so instrumenting it would have been pointless — nothing could
+scrape it. That's the same problem as its missing liveness probe, so Phase 9 added the listener and
+closed a deferral carried since Phase 4. Without one, Kubernetes' only liveness signal is "the process
+has not exited", so a collector wedged on a hung query looks healthy forever — and a wedge that never
+restarts is worse than a crash, because a crash is visible in the restart count.
+
+### Cost alerts are gated on freshness
+
+A stale cluster reads as **zero cost** — verified: with the collector down 22 hours,
+`kca_cost_cluster_hourly` read 0 while nothing was actually free. So every cost alert carries:
+
+```promql
+and on() (kca:facts_age_seconds < 900)
+```
+
+Without it, one root cause produces five alerts and the on-call engineer has to work out which is the
+cause. That's how alert fatigue starts.
+
+### Two bugs found by reading real output
+
+**The API claimed a collector timestamp.** One shared registry meant the API registered the collector's
+metrics and never set them, serving `kca_collector_last_success_timestamp_seconds 0` — which is 1970, so
+the critical alert would have fired *permanently* from a process that doesn't collect. A metric a
+process never writes is not neutral; it's an assertion of zero, and zero is a value alerts act on.
+There are now two types, and the compiler enforces the boundary.
+
+**The cost gauge lagged by up to two hours.** It summed the last *complete* clock hour, on the reasoning
+that a partial hour sawtooths. True of a truncated-to-now range, false of a rolling one — and after
+restarting a collector, the freshness gauge updated within a minute while the cost gauge sat at zero for
+another hour. A cost gauge that reads zero after collection resumes cannot distinguish "just recovered"
+from "still broken".
 
 ## The dashboard
 
@@ -759,6 +866,7 @@ there is code that reads them.
 | **6** ✅ | Idle detection + recommendation engine (p95 right-sizing, evidence gates) |
 | **7** ✅ | Daily rollups, trends, immutable monthly statements, advisory-lock batch job |
 | **8** ✅ | Next.js dashboard — RSC/client split, server-side credential, generated types |
+| **9** ✅ | Observability — own metrics, recording/alert rules, Grafana dashboard as code |
 | 9 | Observability — own metrics, recording rules, Grafana dashboards as code |
 | 10 | Helm chart + GitHub Actions |
 | 11+ | Multi-cluster; AWS, GCP and Azure pricing |

@@ -230,6 +230,27 @@ type Prometheus struct {
 type Collector struct {
 	Interval time.Duration
 	Workers  int
+
+	// HTTPAddr is where the collector serves /metrics, /healthz and /readyz.
+	//
+	// WHY A BATCH-LIKE PROCESS NEEDS A LISTENER AT ALL
+	// -----------------------------------------------
+	// It has none of the usual reasons: it serves no users and answers no queries. It needs one anyway,
+	// for two things that are the same problem wearing different clothes.
+	//
+	// YOU CANNOT SCRAPE A PROCESS THAT DOES NOT LISTEN. Instrumenting the collection loop is pointless
+	// if Prometheus has nowhere to fetch the numbers from -- the metrics would exist in memory and be
+	// read by nobody.
+	//
+	// AND YOU CANNOT PROBE ONE EITHER. Without a listener, Kubernetes has no liveness signal beyond
+	// "the process has not exited", so a collector wedged on a hung Prometheus query looks perfectly
+	// healthy forever. A wedged process that never restarts is worse than a crashing one, because
+	// crashes are visible.
+	//
+	// :8081 rather than :8080, so the collector and the API can run side by side on one developer
+	// machine. That is not merely convenient: `make run-api` and `make run-collector` in two terminals
+	// is the normal local loop, and a port clash would make it impossible to observe both at once.
+	HTTPAddr string
 }
 
 // IsProduction reports whether we are running in production.
@@ -300,6 +321,7 @@ func Load() (*Config, error) {
 
 		Collector: Collector{
 			Interval: l.duration("COLLECTOR_INTERVAL", 5*time.Minute),
+			HTTPAddr: l.str("COLLECTOR_HTTP_ADDR", ":8081"),
 			Workers:  l.integer("COLLECTOR_WORKERS", 4),
 		},
 	}
@@ -485,6 +507,19 @@ func (c *Config) Validate() error {
 	if c.Collector.Workers <= 0 {
 		errs = append(errs, fmt.Errorf("COLLECTOR_WORKERS=%d: %w (must be positive)",
 			c.Collector.Workers, ErrInvalid))
+	}
+	if strings.TrimSpace(c.Collector.HTTPAddr) == "" {
+		// Blank would make net/http bind a RANDOM free port, so /metrics would be served somewhere
+		// nothing is configured to scrape and the probes would point at a port that changes on every
+		// restart. Silently unobservable is worse than refusing to start.
+		errs = append(errs, fmt.Errorf("COLLECTOR_HTTP_ADDR: %w (must not be blank; a blank address binds a random port)", ErrInvalid))
+	}
+	if c.Collector.Interval > 0 && c.API.Addr == c.Collector.HTTPAddr {
+		// Both binaries reading one .env is the normal local setup, so an identical address is an easy
+		// mistake -- and the symptom is a confusing "address already in use" from whichever started
+		// second, rather than anything pointing at the config.
+		errs = append(errs, fmt.Errorf("COLLECTOR_HTTP_ADDR=%s: %w (must differ from API_HTTP_ADDR, or the two processes cannot run together)",
+			c.Collector.HTTPAddr, ErrInvalid))
 	}
 	if c.Collector.Interval <= 0 {
 		errs = append(errs, fmt.Errorf("COLLECTOR_INTERVAL=%s: %w (must be positive)",

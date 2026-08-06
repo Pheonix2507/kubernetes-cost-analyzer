@@ -6,6 +6,7 @@ import (
 
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/health"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/httpapi/middleware"
+	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/metrics"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/pricing"
 	"github.com/Pheonix2507/kubernetes-cost-analyzer/internal/recommend"
 )
@@ -28,6 +29,13 @@ type RouterOptions struct {
 	// Recommender is the rule engine. Injected rather than constructed here, so its thresholds are an
 	// operator's decision made once in main rather than a default buried in the HTTP layer.
 	Recommender *recommend.Engine
+
+	// Metrics is this process's own instrumentation. Injected rather than a package global, so a test
+	// gets a fresh registry and two tests cannot see each other's counts.
+	//
+	// Nil DISABLES instrumentation rather than panicking, which is what lets every existing handler test
+	// keep constructing a router without one. A metric nobody scrapes is not worth making mandatory.
+	Metrics *metrics.API
 
 	// APIKeys enables authentication. Empty disables it, which config.Validate permits only
 	// outside production.
@@ -62,6 +70,23 @@ func NewRouter(opts RouterOptions) http.Handler {
 	mux.HandleFunc("GET /healthz", handleLive())
 	mux.HandleFunc("GET /readyz", handleReady(readiness))
 	mux.HandleFunc("GET /version", handleVersion())
+
+	// /metrics: the Prometheus scrape endpoint.
+	//
+	// NOT UNDER /api/v1, deliberately. It is not part of the versioned contract a client consumes -- it is
+	// an operational surface whose shape is Prometheus's exposition format, and versioning it would imply
+	// we might offer a v2 of a format we do not define.
+	//
+	// It is also NOT in middleware.UnauthenticatedPaths. Metric names and label values describe internal
+	// topology -- route patterns, and how many namespaces failed -- so an unauthenticated /metrics on a
+	// public ingress is reconnaissance. Prometheus can present a bearer token via a ServiceMonitor, so
+	// there is no kubelet-style excuse for exempting it.
+	if opts.Metrics != nil {
+		// The handler comes from the registry, which owns how it is exposed -- see metrics.Registry.Handler.
+		// Both binaries serve /metrics, and building the handler twice would be two places for the
+		// ErrorHandling choice to diverge.
+		mux.Handle("GET "+middleware.MetricsPath(), opts.Metrics.Handler(log))
+	}
 
 	// Versioned from the very first endpoint. Adding /v1 later means either breaking
 	// every client or maintaining an unversioned alias forever, and "we will version it
@@ -108,9 +133,22 @@ func NewRouter(opts RouterOptions) http.Handler {
 	// Both RateLimit and APIKeyAuth exempt /healthz and /readyz. That is not convenience: the
 	// kubelet cannot present a key, and a 401 or 429 on a probe reads as a failure and kills the
 	// container -- so either control would take the service down the moment it was enabled.
-	return middleware.Chain(mux,
+	chain := []middleware.Middleware{
 		middleware.RequestID,
 		middleware.RequestLogger(log),
+	}
+	// Metrics sits INSIDE RequestLogger and OUTSIDE Recover, and the position is load-bearing.
+	//
+	// Outside Recover, so a panicking request is recorded as the 5xx that Recover writes. Inside it and a
+	// panic would never reach the counter -- so the error rate would be lowest exactly when the service
+	// was at its worst, which is the most dangerous possible direction for a metric to be wrong.
+	//
+	// Inside RateLimit and APIKeyAuth, so a rejected request IS counted: a flood of 429s and a wave of
+	// 401s are both things you want visible as traffic rather than silently dropped before measurement.
+	if opts.Metrics != nil {
+		chain = append(chain, middleware.Metrics(opts.Metrics))
+	}
+	chain = append(chain,
 		middleware.RateLimit(middleware.RateLimitConfig{
 			RequestsPerSecond: opts.RateLimitPerSecond,
 			Burst:             opts.RateLimitBurst,
@@ -118,4 +156,6 @@ func NewRouter(opts RouterOptions) http.Handler {
 		middleware.APIKeyAuth(opts.APIKeys, log),
 		middleware.Recover(log),
 	)
+
+	return middleware.Chain(mux, chain...)
 }
