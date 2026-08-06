@@ -1,0 +1,213 @@
+@import "tailwindcss";
+
+/*
+ * Design tokens.
+ *
+ * WHY EVERY COLOUR IS A CSS VARIABLE AND NOTHING IS A RAW HEX IN A COMPONENT
+ * =========================================================================
+ * Light and dark are two SELECTED palettes, not an automatic inversion. The dark categorical steps
+ * are the same eight hues re-stepped for a dark surface, because a hue that clears 3:1 against
+ * #fcfcfb usually does not against #1a1a19 -- and filter: invert() on a chart produces colours nobody
+ * validated. Defining each role once here means a component says `var(--series-1)` and the mode
+ * swaps underneath it.
+ *
+ * These values are the reference palette from the dataviz skill, and they were VALIDATED rather than
+ * chosen by eye. Both modes pass the lightness band, chroma floor, adjacent-pair CVD separation and
+ * normal-vision floor:
+ *
+ *   light: worst adjacent CVD dE 9.1 (yellow<->aqua), worst normal-vision dE 19.6
+ *   dark:  worst adjacent CVD dE 8.4 (yellow<->aqua), worst normal-vision dE 19.3
+ *
+ * THE ONE OUTSTANDING WARNING, recorded because it constrains the components rather than being a
+ * footnote: on the LIGHT surface, aqua (2.74:1), yellow (2.11:1) and magenta (2.62:1) sit below 3:1.
+ * That obligates relief -- visible direct labels or a table view -- and it is not dismissable. So the
+ * trend chart ships direct end-labels AND a table toggle, and the costs page is itself the table view.
+ * A chart in this app is never the only way to read a number.
+ */
+
+:root {
+  color-scheme: light;
+
+  /* Surfaces and ink. */
+  --surface-1: #fcfcfb; /* chart surface */
+  --page: #f9f9f7; /* page plane, one step behind the chart */
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781; /* axis and tick labels */
+  --grid: #e1e0d9; /* hairline, solid, never dashed */
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.1);
+
+  /*
+   * Categorical slots, IN FIXED ORDER.
+   *
+   * The order is the CVD-safety mechanism, not decoration: candidate orderings were enumerated and
+   * only those clearing every adjacent gate kept. Assigning slot 4 before slot 3 would put yellow
+   * beside orange, which fails the floors. So slots are consumed in order and never reordered to
+   * suit a chart.
+   */
+  --series-1: #2a78d6; /* blue */
+  --series-2: #eb6834; /* orange */
+  --series-3: #1baf7a; /* aqua */
+  --series-4: #eda100; /* yellow */
+  --series-5: #e87ba4; /* magenta */
+  --series-6: #008300; /* green */
+
+  /*
+   * Sequential ramp, blue, light -> dark. For MAGNITUDE: the inline bars in the cost table and the
+   * coverage meter's track. One hue, more-is-darker, which is the safe default and hard to misread.
+   */
+  --seq-100: #cde2fb;
+  --seq-250: #86b6ef;
+  --seq-400: #3987e5;
+  --seq-550: #1c5cab;
+  --seq-700: #0d366b;
+
+  /*
+   * Status palette. FIXED -- never themed, never reused as a series colour.
+   *
+   * These steps are deliberately distinct from the categorical slots so a status colour cannot
+   * impersonate a series. On the light surface, warning (1.79:1) and serious (2.57:1) are sub-3:1 BY
+   * DESIGN: the mitigation is that a status colour never travels without an icon and a text label.
+   * See SeverityBadge, which enforces that pairing rather than trusting a caller to remember.
+   */
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+
+  /* Delta text. A saving is good news and reads green; the "up is good" direction is inverted for
+   * cost, so this is used for a REDUCTION rather than for an increase. */
+  --delta-good: #006300;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) {
+    color-scheme: dark;
+
+    --surface-1: #1a1a19;
+    --page: #0d0d0d;
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+    --grid: #2c2c2a;
+    --axis: #383835;
+    --border: rgba(255, 255, 255, 0.1);
+
+    /* The same six hues, re-stepped for the dark surface. All six clear 3:1 here, which is why the
+     * light mode's relief requirement does not apply in dark -- but the components ship the labels
+     * unconditionally, because a component that behaved differently per mode would be a component
+     * whose accessibility depended on a media query. */
+    --series-1: #3987e5;
+    --series-2: #d95926;
+    --series-3: #199e70;
+    --series-4: #c98500;
+    --series-5: #d55181;
+    --series-6: #008300;
+
+    /* The sequential ramp reverses direction in dark: the step nearest the surface must still read,
+     * so "more" runs toward the LIGHTER end. */
+    --seq-100: #0d366b;
+    --seq-250: #184f95;
+    --seq-400: #3987e5;
+    --seq-550: #86b6ef;
+    --seq-700: #cde2fb;
+
+    /* Status is mode-invariant by design -- the same four steps clear 3:1 on the dark surface. */
+    --status-good: #0ca30c;
+    --status-warning: #fab219;
+    --status-serious: #ec835a;
+    --status-critical: #d03b3b;
+
+    --delta-good: #0ca30c;
+  }
+}
+
+/* The viewer's own toggle, which must beat the OS setting in both directions. The :not() guard above
+ * lets a light stamp win over OS-dark; this scope lets a dark stamp win over OS-light. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --surface-1: #1a1a19;
+  --page: #0d0d0d;
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+  --grid: #2c2c2a;
+  --axis: #383835;
+  --border: rgba(255, 255, 255, 0.1);
+  --series-1: #3987e5;
+  --series-2: #d95926;
+  --series-3: #199e70;
+  --series-4: #c98500;
+  --series-5: #d55181;
+  --series-6: #008300;
+  --seq-100: #0d366b;
+  --seq-250: #184f95;
+  --seq-400: #3987e5;
+  --seq-550: #86b6ef;
+  --seq-700: #cde2fb;
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+  --delta-good: #0ca30c;
+}
+
+/*
+ * Expose the tokens to Tailwind so `bg-surface` and `text-muted` work in class names.
+ *
+ * @theme inline rather than @theme: `inline` makes Tailwind emit var() references instead of copying
+ * the values, which is what lets the dark-mode overrides above take effect. A non-inline @theme would
+ * bake the light values into every utility and dark mode would do nothing -- a subtle Tailwind v4
+ * trap worth naming.
+ */
+@theme inline {
+  --color-surface: var(--surface-1);
+  --color-page: var(--page);
+  --color-ink: var(--text-primary);
+  --color-ink-secondary: var(--text-secondary);
+  --color-ink-muted: var(--text-muted);
+  --color-hairline: var(--border);
+  --color-grid: var(--grid);
+
+  --font-sans: system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+body {
+  background: var(--page);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  /* Proportional figures by default. tabular-nums is applied selectively to COLUMNS that must align
+   * vertically -- table cells and axis ticks -- because at display sizes tabular figures give every
+   * digit the width of a zero and a number like 121 looks loose. */
+  font-variant-numeric: normal;
+}
+
+/* Columns of numbers, where vertical alignment matters more than even spacing. */
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+/*
+ * The texture channel: the backup for full CVD, greyscale print and forced-colors.
+ *
+ * Diagonal at 45 degrees and its 135 mirror only -- never horizontal or vertical, which read as
+ * gridlines or bars. Opt-in via the media queries below rather than decorative, so it appears exactly
+ * when hue has stopped working.
+ */
+@media print, (forced-colors: active) {
+  .series-fill-alt {
+    background-image: repeating-linear-gradient(
+      135deg,
+      currentColor 0 1px,
+      transparent 1px 5px
+    );
+  }
+  .series-fill {
+    background-image: repeating-linear-gradient(
+      45deg,
+      currentColor 0 1px,
+      transparent 1px 5px
+    );
+  }
+}

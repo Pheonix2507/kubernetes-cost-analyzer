@@ -633,11 +633,39 @@ components:
           items: { $ref: "#/components/schemas/CostSummaryRow" }
         totals:
           type: object
-          required: [total_cost, cpu_cost, memory_cost, estimated_rates, truncated]
+          required:
+            [
+              total_cost,
+              cpu_cost,
+              memory_cost,
+              cpu_billable_core_hours,
+              memory_billable_gib_hours,
+              wasted_cpu_core_hours,
+              wasted_memory_gib_hours,
+              estimated_rates,
+              truncated,
+            ]
+          description: |
+            The aggregate across every RETURNED row, computed server-side.
+
+            **A client must not sum the rows itself**, for two independent reasons. These are exact
+            decimals of up to 26 significant digits, so adding them in JavaScript means `parseFloat`
+            and a silent truncation to a double that compounds across rows — the whole reason money
+            crosses the wire as a string. And when `truncated` is true the returned rows are not the
+            complete answer, so no amount of client-side care can produce the real figure.
           properties:
             total_cost: { $ref: "#/components/schemas/Money" }
             cpu_cost: { $ref: "#/components/schemas/Money" }
             memory_cost: { $ref: "#/components/schemas/Money" }
+            cpu_billable_core_hours: { $ref: "#/components/schemas/Money" }
+            memory_billable_gib_hours: { $ref: "#/components/schemas/Money" }
+            wasted_cpu_core_hours:
+              allOf: [{ $ref: "#/components/schemas/Money" }]
+              description: |
+                The headline figure this API exists to report. Summed from per-row values that were each
+                floored in SQL — never computed as a difference of totals, which would let an
+                under-requested group credit against a wasteful one.
+            wasted_memory_gib_hours: { $ref: "#/components/schemas/Money" }
             estimated_rates:
               type: boolean
               description: True if any returned group was priced from a fallback guess.

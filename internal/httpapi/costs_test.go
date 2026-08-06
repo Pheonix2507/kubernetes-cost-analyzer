@@ -519,3 +519,105 @@ func TestCostEndpoints_RepositoryErrorIs500(t *testing.T) {
 		}
 	}
 }
+
+// TestCostSummary_TotalsIncludeWasteAndQuantities covers fields added in Phase 8, and the reason they
+// were added is the interesting part.
+//
+// The dashboard needed total waste as a headline figure and COULD NOT HONESTLY COMPUTE IT. Two
+// independent reasons, either sufficient: these are exact decimals of up to 26 significant digits, so
+// summing them in JavaScript means parseFloat and a silent truncation that compounds across rows -- and
+// when Truncated is true the returned rows are not the whole answer, so no client-side care produces the
+// real figure.
+//
+// It was found by the frontend's TypeScript build refusing to compile against a field the OpenAPI spec
+// did not declare. That is the drift chain working in the direction it was built for: SQL to Go to spec
+// to TypeScript, with the last link failing loudly at compile time rather than rendering "undefined" to
+// a user.
+func TestCostSummary_TotalsIncludeWasteAndQuantities(t *testing.T) {
+	t.Parallel()
+
+	reports := &stubReports{summary: []postgres.CostSummaryRow{
+		{
+			Namespace: "team-a",
+			TotalCost: dec("1.5"), CPUCost: dec("1.0"), MemoryCost: dec("0.5"),
+			CPUCoreHours: dec("10"), MemGiBHours: dec("20"),
+			WastedCPUCoreHours: dec("4"), WastedMemGiBHours: dec("8"),
+		},
+		{
+			Namespace: "team-b",
+			TotalCost: dec("2.5"), CPUCost: dec("2.0"), MemoryCost: dec("0.5"),
+			CPUCoreHours: dec("30"), MemGiBHours: dec("40"),
+			WastedCPUCoreHours: dec("6"), WastedMemGiBHours: dec("12"),
+		},
+	}}
+
+	rec := httptest.NewRecorder()
+	routerWithReports(reports).ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/costs/summary", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body: %s", rec.Code, rec.Body.String())
+	}
+
+	var got summaryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	checks := []struct{ name, got, want string }{
+		{"cpu_billable_core_hours", got.Totals.CPUCoreHours, "40"},
+		{"memory_billable_gib_hours", got.Totals.MemGiBHours, "60"},
+		{"wasted_cpu_core_hours", got.Totals.WastedCPUCoreHours, "10"},
+		{"wasted_memory_gib_hours", got.Totals.WastedMemGiBHours, "20"},
+	}
+	for _, c := range checks {
+		if !dec(c.got).Equal(dec(c.want)) {
+			t.Errorf("%s = %s, want %s", c.name, c.got, c.want)
+		}
+	}
+}
+
+// TestCostSummary_WasteIsSummedNotSubtracted pins the arithmetic that Phase 6 got wrong at the SQL level
+// and that this layer must not reintroduce.
+//
+// The rows arrive with waste already floored per fact row inside the query. Summing those is correct.
+// Computing `requested - used` from the TOTALS here would let an under-requested group credit against a
+// wasteful one -- the exact bug that reported kube-system as having zero memory waste while it held 50
+// GiB-hours of it. The fix has to hold at every level that aggregates, not just the first.
+func TestCostSummary_WasteIsSummedNotSubtracted(t *testing.T) {
+	t.Parallel()
+
+	// One wasteful group, and one whose USED exceeds its REQUESTED. If waste were derived at this level
+	// the second would subtract from the first; summed per-row floored values, it contributes its own
+	// floored figure and nothing else.
+	reports := &stubReports{summary: []postgres.CostSummaryRow{
+		{
+			Namespace:             "wasteful",
+			CPURequestedCoreHours: dec("100"), CPUUsedCoreHours: dec("10"),
+			WastedCPUCoreHours: dec("90"),
+			TotalCost:          dec("1"), CPUCost: dec("1"), MemoryCost: dec("0"),
+		},
+		{
+			Namespace:             "under-requested",
+			CPURequestedCoreHours: dec("10"), CPUUsedCoreHours: dec("1000"),
+			// Floored at zero by the query, never negative.
+			WastedCPUCoreHours: dec("0"),
+			TotalCost:          dec("1"), CPUCost: dec("1"), MemoryCost: dec("0"),
+		},
+	}}
+
+	rec := httptest.NewRecorder()
+	routerWithReports(reports).ServeHTTP(rec, httptest.NewRequest(http.MethodGet,
+		"/api/v1/costs/summary", nil))
+
+	var got summaryResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("invalid JSON: %v", err)
+	}
+
+	if !dec(got.Totals.WastedCPUCoreHours).Equal(dec("90")) {
+		t.Errorf("wasted_cpu_core_hours = %s, want 90.\n"+
+			"0 would mean the total was derived as sum(requested) - sum(used) at this level, so the "+
+			"under-requested group credited against real waste -- the Phase 6 bug, one layer up",
+			got.Totals.WastedCPUCoreHours)
+	}
+}

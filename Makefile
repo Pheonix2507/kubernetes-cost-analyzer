@@ -284,6 +284,30 @@ run-api: ## Run the API server locally
 run-collector: ## Run the collector locally
 	go run -ldflags '$(LDFLAGS)' ./cmd/collector
 
+# =============================================================================
+# Frontend (web/)
+# =============================================================================
+
+.PHONY: web-install
+web-install: ## Install frontend dependencies
+	cd web && pnpm install
+
+.PHONY: web-dev
+web-dev: ## Run the dashboard in development. Needs `make run-api` in another terminal
+	cd web && pnpm dev
+
+.PHONY: web-build
+web-build: ## Production build of the dashboard
+	cd web && pnpm build
+
+.PHONY: web-gen
+web-gen: ## Regenerate the frontend's TypeScript types from api/openapi.yaml
+	cd web && pnpm gen:api
+
+.PHONY: web-check
+web-check: ## Typecheck + lint + assert the generated types match the spec
+	cd web && pnpm check
+
 .PHONY: rollup
 rollup: ## Roll up yesterday (what the Phase 10 CronJob will run)
 	go run -ldflags '$(LDFLAGS)' ./cmd/rollup
@@ -337,7 +361,20 @@ tidy: ## Tidy go.mod / go.sum
 	go mod tidy
 
 .PHONY: check
-check: fmt vet lint test ## Everything CI will run
+check: fmt vet lint test ## Everything CI runs for Go. See check-all for the frontend too.
+
+.PHONY: check-all
+check-all: check web-check ## Go AND the frontend
+	# Separate from `check` deliberately. The Go loop is the one an engineer runs dozens of times an
+	# hour and it must stay fast; the frontend adds a TypeScript pass and an ESLint pass that are
+	# irrelevant to a change in internal/costing. CI runs check-all; a human usually runs check.
+	#
+	# web-check includes `check:api`, which regenerates the TypeScript types from api/openapi.yaml and
+	# fails if the result differs from what is committed. That is the last link in the drift chain:
+	# openapi_test.go asserts the spec matches the Go allow-lists, and this asserts the TypeScript
+	# matches the spec. SQL -> Go -> spec -> TypeScript, every link checked by something that fails
+	# loudly.
+	@echo "Go and frontend checks passed."
 
 # =============================================================================
 # Docker

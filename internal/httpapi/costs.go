@@ -56,6 +56,32 @@ type summaryTotals struct {
 	// was returned. Without this flag a client cannot tell a complete total from a partial one,
 	// and a partial total presented as complete is a wrong number.
 	Truncated bool `json:"truncated"`
+
+	// The billed quantities and the WASTE, added in Phase 8 because the dashboard needed them and
+	// could not honestly compute them.
+	//
+	// WHY THE CLIENT CANNOT DO THIS ITSELF -- two independent reasons, and either alone is enough.
+	//
+	// These are exact decimals carrying up to 26 significant digits. Summing them in JavaScript means
+	// parseFloat, which truncates to a double at ~16 digits, and the error compounds across rows. The
+	// whole reason money crosses the wire as a string is to stop that happening; a client obliged to
+	// add the strings up would have to undo it.
+	//
+	// And Truncated above makes it impossible in principle rather than merely lossy: when `limit` cut
+	// the result short, the returned rows are not the whole answer, so no amount of client-side care
+	// produces the cluster's real waste. Only the server, which ran the query, can say.
+	//
+	// Same argument the Go side already makes for TotalCost. The frontend's TypeScript build caught the
+	// omission by refusing to compile against a field the spec did not declare, which is the drift
+	// chain working in the direction it was built for.
+	CPUCoreHours string `json:"cpu_billable_core_hours"`
+	MemGiBHours  string `json:"memory_billable_gib_hours"`
+	// WastedCPUCoreHours is the headline number this project exists to report -- the README opens with
+	// `waste = max(requested - used, 0)`. It is summed from per-row values that were each floored in
+	// SQL, never computed as a difference of totals here: doing the subtraction at this level would
+	// resurrect the Phase 6 bug where an under-requested container credits against real waste.
+	WastedCPUCoreHours string `json:"wasted_cpu_core_hours"`
+	WastedMemGiBHours  string `json:"wasted_memory_gib_hours"`
 }
 
 // handleCostSummary serves GET /api/v1/costs/summary.
@@ -100,10 +126,20 @@ func handleCostSummary(reports Reports) http.HandlerFunc {
 func totals(rows []postgres.CostSummaryRow, limit int) summaryTotals {
 	t := summaryTotals{Truncated: limit > 0 && len(rows) >= limit}
 	total, cpu, mem := zeroDecimal(), zeroDecimal(), zeroDecimal()
+	cpuHours, memHours := zeroDecimal(), zeroDecimal()
+	wastedCPU, wastedMem := zeroDecimal(), zeroDecimal()
 	for _, row := range rows {
 		total = total.Add(row.TotalCost)
 		cpu = cpu.Add(row.CPUCost)
 		mem = mem.Add(row.MemoryCost)
+		cpuHours = cpuHours.Add(row.CPUCoreHours)
+		memHours = memHours.Add(row.MemGiBHours)
+		// SUMMED from already-floored per-row values, never recomputed as requested minus used at this
+		// level. The rows arrive with waste floored per fact row inside the SQL; subtracting totals here
+		// would let an under-requested group credit against a wasteful one and reproduce the Phase 6
+		// bug that reported kube-system as having zero memory waste while it held 50 GiB-hours.
+		wastedCPU = wastedCPU.Add(row.WastedCPUCoreHours)
+		wastedMem = wastedMem.Add(row.WastedMemGiBHours)
 		if row.EstimatedRates {
 			t.EstimatedRates = true
 		}
@@ -113,6 +149,10 @@ func totals(rows []postgres.CostSummaryRow, limit int) summaryTotals {
 	t.TotalCost = total.String()
 	t.CPUCost = cpu.String()
 	t.MemCost = mem.String()
+	t.CPUCoreHours = cpuHours.String()
+	t.MemGiBHours = memHours.String()
+	t.WastedCPUCoreHours = wastedCPU.String()
+	t.WastedMemGiBHours = wastedMem.String()
 	return t
 }
 

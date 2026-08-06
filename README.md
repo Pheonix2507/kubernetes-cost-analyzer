@@ -23,12 +23,11 @@ Measured on real data, `kube-system` reported **0 GiB-hours** of memory waste wh
 50, and `team-search` was understated by 126%. The more under-requested a team's workloads were, the
 more efficient it looked.
 
-## Status: Phase 7 complete — history is now affordable to read
+## Status: Phase 8 complete — there is a dashboard
 
-The collector produces cost data, the API serves it, the recommendation engine says what to change,
-and a nightly rollup makes trends and monthly statements cheap: **292.7x compression, measured on
-real data**, with statements that freeze once signed off. **A frontend could be built against this
-today** — which is Phase 8.
+The collector produces cost data, the API serves it, the recommendation engine says what to change, a
+nightly rollup makes history cheap (**292.7x compression, measured**), and a Next.js dashboard reads
+all of it — with the API key held server-side so it never reaches a browser.
 
 What works today:
 
@@ -63,6 +62,8 @@ What works today:
   and mutually excluded by a Postgres advisory lock
 - Immutable monthly statements with honest coverage metadata, frozen by database trigger
 - Three non-root, shell-less container images
+- A Next.js dashboard: five pages, server-rendered, with the API credential held by a
+  server-side proxy and TypeScript types generated from the OpenAPI spec
 
 ### Endpoints
 
@@ -164,6 +165,10 @@ retention is finite. Postgres holds the allocation facts and the aggregates.
 ### Layout
 
 ```
+web/             the Next.js dashboard — see "The dashboard" below
+  src/app        App Router pages; api/kca is the credential-holding proxy
+  src/lib        typed client, generated schema, Money type, query keys, palette
+  src/components figures (tile/meter/bar/badge), the SVG line chart
 cmd/api          HTTP API — wiring only, no logic
 cmd/collector    the collection loop: aligned windows, cost engine, writer
 cmd/rollup       the batch job: nightly rollup, backfill, monthly statements
@@ -380,6 +385,118 @@ node, no `replicas` field, and acting on it would have left a node with no netwo
 for $1.26 a month. The rule read `count(DISTINCT pod_name) = 3` without asking *why* there were
 three. The gate is an **allow-list** of kinds, so an unknown CRD defaults to silence rather than to
 confident advice about someone else's resource.
+
+## The dashboard
+
+`web/` is a Next.js App Router app. `make web-dev` runs it; it needs `make run-api` alongside.
+
+### The decision that shaped everything: where the API key lives
+
+The API authenticates with `Authorization: Bearer <key>`. The instinctive approach is fatal:
+
+```ts
+// WRONG. NEXT_PUBLIC_* is INLINED INTO THE CLIENT BUNDLE at build time.
+fetch(url, { headers: { Authorization: `Bearer ${process.env.NEXT_PUBLIC_API_KEY}` } })
+```
+
+That key then sits in the JS bundle, every visitor's Network tab, and view-source. Phase 5 compared
+keys in constant time against a SHA-256 digest and refused anything under 16 characters; shipping the
+key to the browser makes all of it decorative.
+
+So the browser never talks to the Go API. It talks to a route handler that holds the credential:
+
+```
+Browser ──same-origin, no credential──> Next.js ──Bearer key──> Go API
+```
+
+Three things follow for free: CORS disappears, the Go API needs no public exposure at all, and there
+is one place to add per-session throttling later. **Verified**: with auth enabled the API returns 401
+unauthenticated while the dashboard renders, and the key appears in 0 of 28 files in the client
+bundle — while `.next/server` demonstrably reads it, so "not found" means "not shipped" rather than
+"not used".
+
+The proxy forwards only an **allow-list** of paths. A catch-all that attaches a credential to
+whatever arrives is an authenticated open relay: `/readyz` is excluded because it leaks dependency
+error strings, `/version` because build and commit are what an attacker fingerprints for CVEs.
+
+### Server vs client, and where the boundary goes
+
+| Route | Page JS | First Load | Why |
+|---|---|---|---|
+| `/recommendations` | **134 B** | 102 kB | pure Server Component — no JS at all |
+| `/reports` | **134 B** | 102 kB | same |
+| `/costs` | 1.97 kB | 115 kB | client table + TanStack Query |
+| `/trends` | 1.44 kB | 117 kB | client toggle; the plot is server-rendered |
+
+`"use client"` sits on the Query provider, not the layout. Putting it on the layout is one line
+shorter and would make every page a Client Component — the whole dashboard's JavaScript shipped so
+that static numbers could hydrate for nothing.
+
+The costs page is where Query earns its place: two selectors that re-query, and a reader flips between
+them constantly. `initialData` is the server's fetch handed down as a prop, so the first paint has
+rows rather than a spinner and no request is made on mount. Without it the sequence is
+render-empty → fetch → re-render, the double-fetch that makes RSC look pointless.
+
+### Money is a string, and the compiler enforces it
+
+The API sends `"3.41666666666666666666666686"` — 26 significant digits from a Postgres `numeric`.
+`parseFloat` turns that into `3.4166666666666665`, and the error compounds across rows.
+
+So `Money` is a **branded type**: structurally a string, but not assignable to a `number` parameter,
+which makes `Number(m)` unreachable by accident. One cast at the boundary (`asMoney`) and the rest of
+the codebase cannot get it wrong. Totals always come from the API, never from summing a column — the
+rows may be truncated, so no amount of client-side care could produce the right figure.
+
+### Types are generated from the spec
+
+`pnpm gen:api` runs `openapi-typescript` over `api/openapi.yaml`; `pnpm check:api` regenerates and
+fails if the result differs from what is committed. That closes the drift chain:
+
+```
+SQL ──> Go ──> openapi.yaml ──> TypeScript
+        ↑ openapi_test.go        ↑ check:api
+```
+
+It paid for itself immediately. The overview wanted total waste as a headline figure; the TypeScript
+build refused to compile against a `totals` field the spec did not declare. The spec was right and the
+page was wrong — so the fields were added to the Go handler, because a client cannot honestly compute
+them: 26-digit decimals do not survive `parseFloat`, and a truncated row set is not the whole answer.
+
+### Charts: what the screenshots found
+
+Colour, form and marks follow a validated palette — both light and dark pass the lightness band,
+chroma floor, adjacent-pair CVD separation and normal-vision floor. Light mode returns a contrast
+warning on three slots (aqua 2.74:1, yellow 2.11:1, magenta 2.62:1), which obligates relief, so every
+chart ships a legend, direct end-labels **and** a table view.
+
+**Colour follows the entity, never its rank.** `series.map((s, i) => PALETTE[i])` assigns by array
+position, so re-sorting by cost repaints every surviving series and a reader who learned "orange is
+team-search" silently finds orange means something else. Slots are derived from the sorted group
+*name* instead.
+
+Four defects were found by screenshotting the page, not by any check:
+
+- **A zero saving rendered as `−0.00`**, which reads as a tiny saving. `set_requests` findings save
+  nothing — they make cost *attributable*. Three states, not two: saving, cost, neither.
+- **End-labels collided** into `team-platfolatform` with six converging series. Nudging them apart
+  detaches a label from its line; the fix is to drop them wholesale and let the legend carry identity.
+- **A magnitude bar's track read as data.** In dark mode the `--seq-100` track is a solid dark blue,
+  so the cheapest namespace at 0.16% looked like a full bar. A track belongs on a *meter*, where the
+  unfilled remainder means something; a magnitude bar has no limit, so it is ink that is not data.
+- **Recharts animated its lines into existence** via `stroke-dasharray`, so the data was invisible
+  until the animation completed — and therefore in print, in PDF export, and potentially under
+  `prefers-reduced-motion`.
+
+That last one led somewhere embarrassing and worth recording. I concluded Recharts was broken under
+React 19 and replaced it with hand-written SVG. **The conclusion was wrong**: a stale `next start`
+held the port, so every `pnpm start` after the first failed with `EADDRINUSE` into a log nobody read,
+and every verification was served by a build from before the changes. Recharts was probably fine.
+
+The replacement stayed anyway, on the two observations that survived scrutiny: it was 105 kB of the
+route's 222 kB first load, and it needed hydration before drawing anything. The SVG version renders in
+the server HTML, works with JavaScript disabled, and makes the mark specs attributes rather than props
+to discover. But the *reason* in the commit had to be corrected, because "the library is broken" and
+"I was testing a stale build" are not the same claim.
 
 ## What the last audit found
 
@@ -641,7 +758,7 @@ there is code that reads them.
 | **5** ✅ | REST API v1 — pagination, filtering, auth, rate limiting, OpenAPI |
 | **6** ✅ | Idle detection + recommendation engine (p95 right-sizing, evidence gates) |
 | **7** ✅ | Daily rollups, trends, immutable monthly statements, advisory-lock batch job |
-| 8 | Next.js frontend |
+| **8** ✅ | Next.js dashboard — RSC/client split, server-side credential, generated types |
 | 9 | Observability — own metrics, recording rules, Grafana dashboards as code |
 | 10 | Helm chart + GitHub Actions |
 | 11+ | Multi-cluster; AWS, GCP and Azure pricing |
