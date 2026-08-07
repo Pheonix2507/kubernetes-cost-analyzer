@@ -323,7 +323,7 @@ jobs:
         run: pnpm install --frozen-lockfile
 
       - name: Check
-        # typecheck, then lint, then check:api -- and the last is the interesting one. It
+        # typecheck, then lint, then TEST, then check:api -- and the last is the interesting one. It
         # regenerates src/lib/api/schema.d.ts from api/openapi.yaml and fails if the result differs
         # from what is committed. That closes the final link of the drift chain: openapi_test.go
         # asserts the spec matches the Go handlers, and this asserts the TypeScript matches the spec.
