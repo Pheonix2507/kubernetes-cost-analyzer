@@ -4,9 +4,9 @@
   "private": true,
   "description": "Dashboard for the Kubernetes Cost Analyzer. Talks to the Go API through a server-side proxy so the API key never reaches a browser.",
   "scripts": {
-    "dev": "next dev",
+    "dev": "next dev -p 3000",
     "build": "next build",
-    "start": "next start",
+    "start": "next start -p 3000",
     "lint": "eslint .",
     "typecheck": "tsc --noEmit",
     "gen:api": "openapi-typescript ../api/openapi.yaml -o src/lib/api/schema.d.ts",

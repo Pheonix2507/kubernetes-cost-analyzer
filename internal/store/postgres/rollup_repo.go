@@ -392,6 +392,46 @@ func (r *RollupRepository) Trend(ctx context.Context, p TrendParams) ([]TrendSer
 	return r.trendFromRollup(ctx, p, cols)
 }
 
+// topGroups builds a CTE restricting a trend query to the highest-spending groups, and the extra
+// predicate that applies it.
+//
+// WHY THE LIMIT CANNOT BE APPLIED WHILE SCANNING, WHICH IS WHERE IT USED TO BE
+// ---------------------------------------------------------------------------
+// scanTrend stops once it has seen `limit` distinct groups, and the rows arrive ORDER BY group
+// columns because a series' points must be contiguous. So "the first N groups" meant the first N
+// ALPHABETICALLY, not the largest. `limit: 1` on the dashboard's headline chart asked for the most
+// expensive namespace and returned whichever one sorted first.
+//
+// It went unnoticed because on this cluster the alphabetically first namespace was `kube-system`,
+// which was also genuinely near the top. Deploying the app into its own `kca` namespace introduced a
+// name that sorts earlier, and the chart began plotting a namespace costing 0.09 while labelling it
+// the largest, next to one costing 1.01. Found by looking at a screenshot rather than by a test,
+// because every test asserted the SHAPE of the result and none asserted WHICH groups came back.
+//
+// Ranking has to happen in SQL, over the whole range, before any rows are returned. Doing it in Go
+// would mean reading every point of every group in order to discard most of them, which is precisely
+// what a limit exists to avoid.
+//
+// The tie-break on the group columns is not decoration: without it, two groups of equal cost could
+// swap places between identical requests, and a chart whose series changes on refresh looks broken.
+func topGroups(table, groupCols, whereSQL string, limit, argN int) (cte, predicate string) {
+	if limit <= 0 {
+		return "", ""
+	}
+	cte = fmt.Sprintf(`WITH ranked AS (
+		SELECT %[1]s
+		FROM %[2]s
+		WHERE %[3]s
+		GROUP BY %[1]s
+		ORDER BY COALESCE(sum(total_cost), 0) DESC, %[1]s
+		LIMIT $%[4]d
+	)
+`, groupCols, table, whereSQL, argN)
+	// A row comparison, so one form works whether the grouping is one column or three.
+	predicate = fmt.Sprintf(" AND (%[1]s) IN (SELECT %[1]s FROM ranked)", groupCols)
+	return cte, predicate
+}
+
 // trendFromRollup reads pre-aggregated days. The common path.
 func (r *RollupRepository) trendFromRollup(ctx context.Context, p TrendParams, cols []string) ([]TrendSeries, TrendSource, error) {
 	args := []any{p.From, p.To}
@@ -413,7 +453,14 @@ func (r *RollupRepository) trendFromRollup(ctx context.Context, p TrendParams, c
 	// rollup-servable intervals is one thing to get right rather than three.
 	bucket := fmt.Sprintf("date_trunc('%s', day::timestamptz)", intervalTrunc[p.Interval])
 
-	query := fmt.Sprintf(`
+	groupCols := strings.Join(cols, ", ")
+	whereSQL := strings.Join(where, " AND ")
+	cte, topPredicate := topGroups("container_allocations_daily", groupCols, whereSQL, p.Limit, len(args)+1)
+	if cte != "" {
+		args = append(args, p.Limit)
+	}
+
+	query := cte + fmt.Sprintf(`
 		SELECT %[1]s AS bucket_start, %[2]s,
 		       COALESCE(sum(cpu_cost), 0)                  AS cpu_cost,
 		       COALESCE(sum(memory_cost), 0)               AS memory_cost,
@@ -425,10 +472,10 @@ func (r *RollupRepository) trendFromRollup(ctx context.Context, p TrendParams, c
 		       COALESCE(sum(window_count), 0)              AS windows,
 		       bool_or(estimated_rates)                    AS estimated_rates
 		FROM container_allocations_daily
-		WHERE %[3]s
+		WHERE %[3]s%[4]s
 		GROUP BY %[1]s, %[2]s
 		ORDER BY %[2]s, %[1]s`,
-		bucket, strings.Join(cols, ", "), strings.Join(where, " AND "))
+		bucket, groupCols, whereSQL, topPredicate)
 
 	return r.scanTrend(ctx, query, args, cols, TrendSourceRollup, p.Limit)
 }
@@ -456,7 +503,14 @@ func (r *RollupRepository) trendFromFacts(ctx context.Context, p TrendParams, co
 
 	bucket := fmt.Sprintf("date_trunc('%s', window_start)", intervalTrunc[p.Interval])
 
-	query := fmt.Sprintf(`
+	groupCols := strings.Join(cols, ", ")
+	whereSQL := strings.Join(where, " AND ")
+	cte, topPredicate := topGroups("container_allocations", groupCols, whereSQL, p.Limit, len(args)+1)
+	if cte != "" {
+		args = append(args, p.Limit)
+	}
+
+	query := cte + fmt.Sprintf(`
 		SELECT %[1]s AS bucket_start, %[2]s,
 		       COALESCE(sum(cpu_cost), 0)    AS cpu_cost,
 		       COALESCE(sum(memory_cost), 0) AS memory_cost,
@@ -468,13 +522,13 @@ func (r *RollupRepository) trendFromFacts(ctx context.Context, p TrendParams, co
 		       count(*)                      AS windows,
 		       bool_or(rate_source = 'fallback') AS estimated_rates
 		FROM container_allocations
-		WHERE %[3]s
+		WHERE %[3]s%[8]s
 		GROUP BY %[1]s, %[2]s
 		ORDER BY %[2]s, %[1]s`,
-		bucket, strings.Join(cols, ", "), strings.Join(where, " AND "),
+		bucket, groupCols, whereSQL,
 		coreHours("cpu_millicores_billable"), gibHours("memory_bytes_billable"),
 		wastedCoreHours("cpu_millicores_requested", "cpu_millicores_used"),
-		wastedGibHours("memory_bytes_requested", "memory_bytes_used"))
+		wastedGibHours("memory_bytes_requested", "memory_bytes_used"), topPredicate)
 
 	return r.scanTrend(ctx, query, args, cols, TrendSourceFacts, p.Limit)
 }

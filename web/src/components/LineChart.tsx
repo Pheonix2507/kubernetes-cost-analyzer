@@ -1,6 +1,7 @@
 import type { TrendSeries } from "@/lib/api/client";
 import { MAX_SERIES, assignSlots, seriesLabel } from "@/lib/viz/palette";
 import { asMoney, formatMoney, toPlotValue } from "@/lib/money";
+import { niceTicks } from "@/lib/viz/scale";
 
 /**
  * A hand-written SVG line chart.
@@ -102,22 +103,6 @@ export function buildSeries(raw: TrendSeries[]): { series: Series[]; buckets: st
   return { series, buckets, hidden: raw.length - shown.length };
 }
 
-/**
- * niceTicks picks round y-axis values.
- *
- * Round numbers, because the ticks carry every value that is not directly labelled -- 0 / 0.05 / 0.10
- * is readable and 0 / 0.0417 / 0.0834 is not, even though both are correct. The 1/2/5 progression is
- * the standard choice: those are the multipliers whose multiples humans read without arithmetic.
- */
-function niceTicks(max: number, count = 4): number[] {
-  if (max <= 0) return [0];
-  const rough = max / count;
-  const mag = 10 ** Math.floor(Math.log10(rough));
-  const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => s >= rough) ?? 10 * mag;
-  const out: number[] = [];
-  for (let v = 0; v <= max + step / 2; v += step) out.push(Number(v.toFixed(10)));
-  return out;
-}
 
 export function LineChartSVG({
   series,

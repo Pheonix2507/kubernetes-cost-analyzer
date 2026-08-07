@@ -615,3 +615,100 @@ func TestTrend_RejectsUnknownIntervalAndGrouping(t *testing.T) {
 		}
 	}
 }
+
+// TestTrend_LimitPicksTheLARGESTGroups is a regression test for a bug that shipped and was found by
+// looking at a screenshot rather than by any test.
+//
+// `limit` was applied in scanTrend, which stops after it has seen N distinct groups. The rows arrive
+// ORDER BY the grouping columns, because a series' points have to be contiguous to be assembled --
+// so "the first N groups" meant the first N ALPHABETICALLY. The dashboard's headline chart asks for
+// `limit: 1` under the title "largest namespace" and got whichever namespace sorted first.
+//
+// It hid for as long as it did because the alphabetically first namespace on this cluster,
+// kube-system, was also genuinely near the top. Deploying the app into its own `kca` namespace
+// introduced a name sorting earlier still, and the chart started plotting 0.09 while labelling it the
+// largest, beside a namespace costing 1.01.
+//
+// The lesson is in what the existing trend tests DID assert: source routing, point ordering within a
+// series, and rollup-versus-facts agreement. All of them checked the SHAPE of the result. None
+// checked WHICH groups came back, so the selection could be arbitrary and every test stayed green.
+func TestTrend_LimitPicksTheLARGESTGroups(t *testing.T) {
+	ctx, tx := withTx(t)
+	repo := NewRollupRepository(tx)
+
+	day := isolatedDay
+	cluster := "limit-test-" + t.Name()
+
+	// Names chosen so alphabetical order and cost order are OPPOSITE. If they agreed, the broken
+	// implementation would pass and the test would prove nothing -- which is exactly how the real
+	// bug survived.
+	rows := []struct {
+		namespace string
+		cost      string
+	}{
+		{"aaa-cheapest", "0.01"},
+		{"mmm-middle", "1.00"},
+		{"zzz-dearest", "9.99"},
+	}
+	for _, r := range rows {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO container_allocations_daily (
+				day, cluster_name, namespace_name, container_name,
+				window_count, observed_seconds,
+				cpu_requested_core_hours, cpu_used_core_hours, cpu_billable_core_hours,
+				wasted_cpu_core_hours,
+				memory_requested_gib_hours, memory_used_gib_hours, memory_billable_gib_hours,
+				wasted_memory_gib_hours,
+				cpu_cost, memory_cost
+			) VALUES ($1::date, $2, $3, 'app',
+				1, 300,
+				1, 1, 1, 0,
+				1, 1, 1, 0,
+				$4::numeric, 0)`, // total_cost is a GENERATED column: cpu_cost + memory_cost
+			day.Time(), cluster, r.namespace, r.cost)
+		if err != nil {
+			t.Fatalf("seeding %s: %v", r.namespace, err)
+		}
+	}
+
+	get := func(limit int) []string {
+		series, _, err := repo.Trend(ctx, TrendParams{
+			From:     day.Time(),
+			To:       day.AddDays(1).Time(),
+			Interval: IntervalDay,
+			GroupBy:  GroupByNamespace,
+			Filters:  Filters{Cluster: cluster},
+			Limit:    limit,
+		})
+		if err != nil {
+			t.Fatalf("Trend(limit=%d): %v", limit, err)
+		}
+		out := make([]string, 0, len(series))
+		for _, s := range series {
+			out = append(out, s.Group["namespace_name"])
+		}
+		return out
+	}
+
+	got := get(1)
+	if len(got) != 1 || got[0] != "zzz-dearest" {
+		t.Errorf("limit=1 returned %v, want [zzz-dearest]; the most EXPENSIVE namespace, not the "+
+			"alphabetically first", got)
+	}
+
+	// Two groups must be the two dearest, and the cheapest must not appear at all.
+	two := get(2)
+	if len(two) != 2 {
+		t.Fatalf("limit=2 returned %d series, want 2: %v", len(two), two)
+	}
+	for _, name := range two {
+		if name == "aaa-cheapest" {
+			t.Errorf("limit=2 included the cheapest namespace: %v", two)
+		}
+	}
+
+	// A limit above the group count returns everything rather than erroring or truncating.
+	if all := get(10); len(all) != 3 {
+		t.Errorf("limit=10 returned %d series, want all 3: %v", len(all), all)
+	}
+}
