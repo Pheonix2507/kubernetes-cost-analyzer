@@ -1,9 +1,89 @@
 # Kubernetes Cost Analyzer
 
-Attributes Kubernetes spend to the teams, namespaces and workloads that cause it, and
-recommends what to change.
+[![CI](https://github.com/Pheonix2507/kubernetes-cost-analyzer/actions/workflows/ci.yml/badge.svg)](https://github.com/Pheonix2507/kubernetes-cost-analyzer/actions/workflows/ci.yml)
+[![Go](https://img.shields.io/badge/go-1.26-00ADD8)](go.mod)
+[![License](https://img.shields.io/badge/license-MIT-blue)](LICENSE)
 
-The core idea is one subtraction. Kubernetes bills you for what you **reserve**
+Attributes Kubernetes spend to the teams, namespaces and workloads that cause it, and recommends
+what to change. Go collector and API, PostgreSQL star schema, Next.js dashboard, Helm chart,
+Prometheus alerts, all reproducible from this repository with one command.
+
+![The overview page](docs/screenshots/overview.png)
+
+```bash
+make reset      # kind cluster, monitoring stack, fixture workloads, Postgres, schema
+make run-api    # :8080
+make run-collector
+cd web && pnpm dev   # :3000
+```
+
+## What it does
+
+| | |
+|---|---|
+| **Measures** | Every container's requests and usage on aligned 5-minute windows, from Prometheus and the Kubernetes API |
+| **Prices** | Nodes by instance type, spot-aware and region-aware, split across CPU and memory with exact decimal arithmetic |
+| **Attributes** | Cost and waste to namespace, team, cost centre, environment, workload, node, instance type |
+| **Recommends** | p95-based right-sizing with evidence gates, severity, and savings that are allowed to be negative |
+| **Keeps** | A daily rollup compressing history 246-293x (measured, varies with the data), and immutable monthly statements frozen by a database trigger |
+
+## Five decisions worth reading
+
+Judgement is the interesting part of this repository, so here are the load-bearing calls with links
+to the code that makes them.
+
+1. **[Waste is floored per row, inside the sum](#the-core-idea-is-one-subtraction).**
+   `GREATEST(sum(req) - sum(used), 0)` reads as equivalent and is not. On real data `kube-system`
+   reported **0 GiB-hours** of memory waste while holding 50, and the more under-requested a team's
+   workloads were, the more efficient it looked.
+2. **[Not every aggregate rolls up](#the-rule-that-decided-the-whole-design-not-every-aggregate-rolls-up).**
+   Sums, minima, maxima and counts survive a daily rollup; averages survive only as sum divided by
+   count; **percentiles do not survive at all**. That one fact decided which questions the 246x
+   cheaper table is allowed to answer, and which must still read raw facts.
+3. **[Readiness fails closed on an unmigrated schema](#the-readiness-probe-that-stalls-a-rollout-on-purpose).**
+   Probing `SELECT 1` tests the process; this tests the contract. An unmigrated database now stalls
+   a rollout while the old pod keeps serving, instead of letting Kubernetes kill a healthy pod and
+   replace it with one that answers 500s while showing green.
+4. **[`go test` exits 0 on a skip](#the-trap-a-green-build-that-tested-nothing).**
+   A CI job that lost its database printed skip lines nobody reads and reported success with the
+   entire persistence layer untested. `KCA_REQUIRE_DB` turns that into a failure, and CI runs the
+   suite with the database deliberately hidden to prove the guard still bites.
+5. **[Money is a string all the way to the browser](#money-is-a-string-and-the-compiler-enforces-it).**
+   `numeric(20,10)` in Postgres, `decimal.Decimal` in Go, a branded `Money` type in TypeScript that
+   makes `Number(m)` unreachable. Float arithmetic on a figure someone reconciles against an invoice
+   is a credibility problem, not a rounding curiosity.
+
+## What this deliberately does not do
+
+Scope honesty, because the numbers should be believed only as far as they are true.
+
+- **Compute only.** Nodes are priced by instance type and split across CPU and memory. Storage, load
+  balancers and egress are not modelled, and on a real bill those are commonly 30-50% of spend.
+- **List prices only.** The rate catalogue has no reserved instances, savings plans, committed use
+  discounts or enterprise agreements, so computed cost runs above what an account actually pays.
+- **One cluster.** The schema, API and collector are multi-cluster aware and a central ingest
+  boundary is not built yet, so today one collector serves one cluster.
+- **Not deployed anywhere.** The Helm chart installs into kind and is verified by 15 assertions
+  against a running release; there is no registry, ingress or managed database story.
+
+The gap between "this computes a number" and "finance trusts this number" is mostly the first two
+items, and pretending otherwise would be the least interesting thing this repository could do.
+
+## Screenshots
+
+| Costs | Trends |
+|---|---|
+| ![Costs](docs/screenshots/costs.png) | ![Trends](docs/screenshots/trends.png) |
+
+| Recommendations | Monthly reports |
+|---|---|
+| ![Recommendations](docs/screenshots/recommendations.png) | ![Reports](docs/screenshots/reports.png) |
+
+---
+
+## The core idea is one subtraction
+
+Kubernetes bills you for what you **reserve**
 (resource requests), not for what you **use** — the scheduler holds a request against a
 node whether or not the container ever touches it. The gap between the two is waste, and
 in most clusters that has never been measured it is the majority of the bill.
